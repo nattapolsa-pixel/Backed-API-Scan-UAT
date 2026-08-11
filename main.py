@@ -1,0 +1,1824 @@
+from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi.middleware.gzip import GZipMiddleware
+from pydantic import BaseModel
+from typing import List, Optional       # ✅ แก้ไข #1: เพิ่ม Optional
+from google.cloud import bigquery
+import csv
+import json
+import base64
+import io
+import math
+import os
+import re
+import time
+import copy
+import uuid
+import datetime
+import urllib.parse
+import urllib.request
+from threading import Lock
+from concurrent.futures import ThreadPoolExecutor
+from fastapi.middleware.cors import CORSMiddleware
+
+app = FastAPI()
+
+# ✅ GZip Compression: ลด payload size สำหรับ response ขนาดใหญ่ (Wave data)
+app.add_middleware(GZipMiddleware, minimum_size=1000)
+
+# ✅ จำกัด CORS: อนุญาตเฉพาะหน้าเว็บบน GitHub Pages (*.github.io) + localhost สำหรับทดสอบ
+#    ถ้าใช้โดเมนอื่น (custom domain) ให้เพิ่ม origin นั้นใน ALLOWED_ORIGINS ด้วย
+ALLOWED_ORIGINS = [
+    "http://localhost:3000",
+    "http://localhost:5500",
+    "http://127.0.0.1:5500",
+]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_origin_regex=r"https://[a-z0-9-]+\.github\.io",
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+if not os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
+    local_key_path = os.path.join(os.path.dirname(__file__), "bq-key.json")
+    if os.path.exists(local_key_path):
+        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = local_key_path
+
+client = bigquery.Client(
+    project=os.environ.get("GOOGLE_CLOUD_PROJECT", "pro-analytics-db")
+)
+
+# ✅ BigQuery Job Timeout: ป้องกัน query ค้างนานโดยไม่จำกัด
+BQ_JOB_TIMEOUT_SECONDS = 30
+
+NUMERIC_BRANCH_MASTER_SPREADSHEET_ID = "1zI5YAq0JvlM-WsaCfDVYVZgiCn5pWx_HVJjQMiTFwoI"
+NUMERIC_BRANCH_MASTER_SHEET_NAME = "Master"
+NUMERIC_BRANCH_MASTER_GID = "606346592"
+NUMERIC_BRANCH_MASTER_CACHE_TTL_SECONDS = 30 * 60
+numeric_branch_master_cache = {"expires_at": 0.0, "data": {}}
+numeric_branch_master_lock = Lock()
+
+DIRECT_QTY_PREFIXES = ("PP", "SP")
+PACK_CASE_MAP_PATH = os.path.join(os.path.dirname(__file__), "pack_case_map.json")
+pack_case_map_cache = None
+pack_case_map_lock = Lock()
+
+def is_direct_qty_lpn_value(lpn: str) -> bool:
+    return str(lpn or "").strip().upper().startswith(DIRECT_QTY_PREFIXES)
+
+def load_pack_case_map() -> dict:
+    """สร้างแมป 'จำนวนชิ้นต่อลัง (CASECNT)' จาก BigQuery (แคชไว้จนกว่าจะรีสตาร์ท)
+    - key แบบ 'OWNER|SKU'  -> casecnt  (ผ่าน master_picktype_native: Owner+SKU -> PACKKEY -> CASECNT)
+    - key แบบ 'PRODUCT_CODE' -> casecnt  (ทางตรง: Product_Code = PACKKEY)
+    calculate_direct_total_qty จะลองหา OWNER|CODE ก่อน ไม่เจอค่อยใช้ CODE ตรงๆ
+    """
+    global pack_case_map_cache
+    if pack_case_map_cache is not None:
+        return pack_case_map_cache
+
+    with pack_case_map_lock:
+        if pack_case_map_cache is not None:
+            return pack_case_map_cache
+        case_map = {}
+        try:
+            # 1) master_product_native: PACKKEY (string_field_1) -> CASECNT (string_field_7)
+            product_case = {}
+            prod_sql = """
+                SELECT UPPER(TRIM(CAST(string_field_1 AS STRING))) AS packkey,
+                       SAFE_CAST(string_field_7 AS FLOAT64) AS casecnt
+                FROM `pro-analytics-db.logistics_db.master_product_native`
+                WHERE string_field_1 NOT IN ('PACKKEY', 'Pack')
+            """
+            for r in client.query(prod_sql).result(timeout=BQ_JOB_TIMEOUT_SECONDS):
+                pk = str(get_row_value(r, "packkey", "") or "").strip().upper()
+                cc = to_float(get_row_value(r, "casecnt", 0))
+                if pk and cc > 0:
+                    product_case[pk] = cc
+                    case_map[pk] = cc  # ทางตรง: Product_Code = PACKKEY
+
+            # 2) master_picktype_native: (Owner=field_1, SKU=field_2) -> PACKKEY (field_4)
+            pick_sql = """
+                SELECT UPPER(TRIM(CAST(string_field_1 AS STRING))) AS owner,
+                       UPPER(TRIM(CAST(string_field_2 AS STRING))) AS sku,
+                       UPPER(TRIM(CAST(string_field_4 AS STRING))) AS packkey
+                FROM `pro-analytics-db.logistics_db.master_picktype_native`
+                WHERE string_field_1 NOT IN ('STORERKEY', 'Owner')
+            """
+            for r in client.query(pick_sql).result(timeout=BQ_JOB_TIMEOUT_SECONDS):
+                owner = str(get_row_value(r, "owner", "") or "").strip().upper()
+                sku = str(get_row_value(r, "sku", "") or "").strip().upper()
+                pk = str(get_row_value(r, "packkey", "") or "").strip().upper()
+                cc = product_case.get(pk)
+                if owner and sku and cc:
+                    case_map[f"{owner}|{sku}"] = cc
+
+            pack_case_map_cache = case_map
+            print(f"✅ Loaded case-size map from BigQuery: {len(case_map)} keys")
+        except Exception as e:
+            print(f"⚠️ Case-size map load failed, falling back to Total_Qty: {e}")
+            pack_case_map_cache = {}
+        return pack_case_map_cache
+
+def get_row_value(row, key: str, default=None):
+    try:
+        return row[key]
+    except Exception:
+        return default
+
+def clean_branch_display_name(value) -> str:
+    """Return a short operational branch name instead of a legal-entity name."""
+    name = str(value or "").strip()
+    if not name or name.lower() in {"unknown", "null", "none"} or name in {"-", "ไม่ระบุ"}:
+        return "Unknown"
+
+    name = re.sub(
+        r"^\s*(?:ห้างหุ้นส่วนสามัญนิติบุคคล|ห้างหุ้นส่วนจำกัด|หจก\.?|บริษัทจำกัด|บริษัท|บจก\.?)\s*",
+        "",
+        name,
+        flags=re.IGNORECASE,
+    )
+    name = re.sub(
+        r"\s*(?:จำกัด\s*\(มหาชน\)|จำกัด|\(มหาชน\)|มหาชน|บจก\.?|หจก\.?)\s*$",
+        "",
+        name,
+        flags=re.IGNORECASE,
+    )
+    name = re.sub(r"\s+", " ", name).strip(" -")
+    return name or "Unknown"
+
+def is_numeric_branch_code(value) -> bool:
+    branch_code = str(value or "").strip()
+    return bool(branch_code) and branch_code[0].isdigit()
+
+def _build_numeric_branch_map(rows) -> dict:
+    branch_map = {}
+    for row in rows or []:
+        if not row or len(row) < 2:
+            continue
+        branch_code = str(row[0] or "").strip()
+        branch_name = clean_branch_display_name(row[1])
+        if is_numeric_branch_code(branch_code) and branch_name != "Unknown":
+            # Master อาจมีรหัสซ้ำ ให้แถวล่าสุดในชีตเป็นค่าหลัก
+            branch_map[branch_code] = branch_name
+    return branch_map
+
+def load_numeric_branch_master() -> dict:
+    """Load numeric branch names from Master!B:C and cache them for 30 minutes."""
+    now = time.time()
+    with numeric_branch_master_lock:
+        cached_data = numeric_branch_master_cache.get("data") or {}
+        if cached_data and numeric_branch_master_cache.get("expires_at", 0) > now:
+            return cached_data
+
+        branch_map = {}
+        try:
+            sheet_name = urllib.parse.quote(NUMERIC_BRANCH_MASTER_SHEET_NAME)
+            csv_url = (
+                f"https://docs.google.com/spreadsheets/d/{NUMERIC_BRANCH_MASTER_SPREADSHEET_ID}/gviz/tq"
+                f"?tqx=out:csv&gid={NUMERIC_BRANCH_MASTER_GID}&sheet={sheet_name}&range=B:C"
+            )
+            request = urllib.request.Request(csv_url, headers={"User-Agent": "Pro-LPN-Scanner/1.0"})
+            with urllib.request.urlopen(request, timeout=15) as response:
+                csv_text = response.read().decode("utf-8-sig")
+            branch_map = _build_numeric_branch_map(csv.reader(io.StringIO(csv_text)))
+        except Exception as public_error:
+            print(f"Numeric branch Master public CSV unavailable: {public_error}")
+
+        if not branch_map:
+            try:
+                from google.oauth2 import service_account
+                from google.auth.transport.requests import Request as GoogleAuthRequest
+
+                credentials = service_account.Credentials.from_service_account_file(
+                    "bq-key.json",
+                    scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"],
+                )
+                credentials.refresh(GoogleAuthRequest())
+                range_name = urllib.parse.quote(f"{NUMERIC_BRANCH_MASTER_SHEET_NAME}!B:C", safe="")
+                api_url = (
+                    f"https://sheets.googleapis.com/v4/spreadsheets/{NUMERIC_BRANCH_MASTER_SPREADSHEET_ID}"
+                    f"/values/{range_name}?majorDimension=ROWS&valueRenderOption=FORMATTED_VALUE"
+                )
+                request = urllib.request.Request(
+                    api_url,
+                    headers={"Authorization": f"Bearer {credentials.token}"},
+                )
+                with urllib.request.urlopen(request, timeout=15) as response:
+                    payload = json.loads(response.read().decode("utf-8"))
+                branch_map = _build_numeric_branch_map(payload.get("values", []))
+            except Exception as auth_error:
+                print(f"Numeric branch Master authenticated read unavailable: {auth_error}")
+
+        if branch_map:
+            numeric_branch_master_cache["data"] = branch_map
+            numeric_branch_master_cache["expires_at"] = now + NUMERIC_BRANCH_MASTER_CACHE_TTL_SECONDS
+            return branch_map
+
+        # ถ้าชีตขัดข้องชั่วคราว ให้ใช้แคชเดิมแทนและลองโหลดใหม่เร็วขึ้น
+        numeric_branch_master_cache["expires_at"] = now + 60
+        return cached_data
+
+def to_float(value, default: float = 0.0) -> float:
+    try:
+        if value is None or value == "":
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+def calculate_direct_total_qty(lpn: str, detail_rows, fallback_total) -> int:
+    fallback_qty = max(1, int(math.ceil(to_float(fallback_total, 1))))
+    if not is_direct_qty_lpn_value(lpn):
+        return fallback_qty
+
+    pack_case_map = load_pack_case_map()
+    total_qty = 0
+
+    for detail in detail_rows or []:
+        owner = str(get_row_value(detail, "owner", "") or "").strip().upper()
+        product_code = str(get_row_value(detail, "product_code", "") or "").strip().upper()
+        pieces = to_float(get_row_value(detail, "total_pieces", 0))
+        row_total_qty = to_float(get_row_value(detail, "row_total_qty", 0))
+        case_count = pack_case_map.get(f"{owner}|{product_code}") or pack_case_map.get(product_code)
+
+        if case_count and pieces > 0:
+            total_qty += max(1, int(math.ceil(pieces / case_count)))
+        elif row_total_qty > 0:
+            total_qty += max(1, int(math.ceil(row_total_qty)))
+        else:
+            total_qty += 1
+
+    return total_qty if total_qty > 0 else fallback_qty
+
+PENDING_WAVES_CACHE_TTL_SECONDS = 300
+PENDING_WAVES_BOOTSTRAP = [
+    {"wave_no": "0000054949"},
+    {"wave_no": "0000054978"},
+    {"wave_no": "0000055026"},
+    {"wave_no": "0000055027"},
+    {"wave_no": "0000055031"},
+    {"wave_no": "0000055002"},
+    {"wave_no": "0000054992"},
+]
+pending_waves_cache = {
+    "data": {"success": True, "waves": PENDING_WAVES_BOOTSTRAP, "cached": True, "bootstrap": True},
+    "expires_at": 0
+}
+pending_waves_cache_lock = Lock()
+is_refreshing_pending_waves = False
+is_refreshing_pending_waves_lock = Lock()
+
+# Valid LPNs Validation Cache to prevent slow BigQuery queries on every scan
+VALID_LPNS_CACHE_TTL = 600  # 10 minutes cache
+valid_lpns_cache = {}  # wave_no -> {"lpns": set((lpn, branch_code)), "expires_at": float}
+valid_lpns_cache_lock = Lock()
+
+# --- ULTRA-FAST WAVE AND BOOKING SEARCH CACHE ---
+WAVE_CACHE_TTL = 600  # 10 minutes cache
+wave_cache = {}  # wave_detail_str -> {"data": dict, "expires_at": float}
+wave_cache_lock = Lock()
+wave_query_locks = {}
+wave_query_locks_guard = Lock()
+
+BOOKING_WAVES_CACHE_TTL = 600  # 10 minutes cache
+booking_waves_cache = {}  # booking_clean -> {"mapping": dict, "expires_at": float}
+booking_waves_cache_lock = Lock()
+
+# Local scans overlay to ensure instant read-after-write across all users.
+# Key: wave_clean -> {(lpn_upper, branch_upper): latest scan state including qty/color/pallet_no}
+local_scans_overlay = {}
+local_scans_lock = Lock()
+pallet_allocation_lock = Lock()
+pallet_counter_cache = {}
+pallet_shared_state = {}
+pallet_shared_state_lock = Lock()
+
+def record_shared_pallet_state(wave_ids, branch_code: str, pallet_no: int, color: str = "", submitted: bool = False):
+    """Keep pallet color/submission visible to every handheld before BigQuery cache catches up."""
+    branch = str(branch_code or "").strip().upper()
+    no = int(pallet_no or 0)
+    if not branch or no <= 0:
+        return
+    with pallet_shared_state_lock:
+        for wave in wave_ids:
+            try:
+                wave_clean = str(int(str(wave).strip()))
+            except ValueError:
+                continue
+            branch_state = pallet_shared_state.setdefault(wave_clean, {}).setdefault(branch, {
+                "colors": {},
+                "submitted": set(),
+                "closed_at": "",
+                "closed_by": "",
+                "updated_at": 0.0,
+            })
+            if color:
+                branch_state["colors"][no] = str(color).strip().title()
+            if submitted:
+                branch_state["submitted"].add(no)
+            branch_state["updated_at"] = time.time()
+
+def record_shared_branch_closed(wave_no: str, branch_code: str, completed_at: str, emp_id: str):
+    try:
+        wave_clean = str(int(str(wave_no).strip()))
+    except ValueError:
+        return
+    branch = str(branch_code or "").strip().upper()
+    if not branch:
+        return
+    with pallet_shared_state_lock:
+        branch_state = pallet_shared_state.setdefault(wave_clean, {}).setdefault(branch, {
+            "colors": {}, "submitted": set(), "closed_at": "", "closed_by": "", "updated_at": 0.0
+        })
+        branch_state["closed_at"] = completed_at or datetime.datetime.now(datetime.timezone.utc).isoformat()
+        branch_state["closed_by"] = str(emp_id or "").strip()
+        branch_state["updated_at"] = time.time()
+
+def record_local_scan(wave_no: str, lpn: str, branch_code: str, qty: int, scan_type: str, color: str, pallet_no: int = 0):
+    try:
+        wave_clean = str(int(wave_no.strip()))
+    except ValueError:
+        return
+
+    lpn_upper = lpn.strip().upper()
+    branch_upper = branch_code.strip().upper()
+
+    status = "Pending"
+    if qty == 0 or scan_type in ("RESET_BOX", "CANCEL_COMBINE"):
+        status = "Pending"
+        qty = 0
+    else:
+        status = "Scanned"
+
+    with local_scans_lock:
+        if wave_clean not in local_scans_overlay:
+            local_scans_overlay[wave_clean] = {}
+
+        lpn_key = (lpn_upper, branch_upper)
+        if status == "Pending":
+            local_scans_overlay[wave_clean][lpn_key] = {
+                "qty": 0,
+                "scan_type": scan_type,
+                "color": color,
+                "color_breakdown": [],
+                "status": status,
+                "pallet_no": 0,
+                "timestamp": time.time()
+            }
+            return
+
+        current = local_scans_overlay[wave_clean].get(lpn_key, {})
+        breakdown_map = {}
+        for part in current.get("color_breakdown", []):
+            part_color = str(part.get("color", "")).strip()
+            part_qty = int(part.get("qty", 0) or 0)
+            if part_color and part_qty > 0:
+                breakdown_map[part_color.upper()] = {
+                    "color": part_color,
+                    "qty": part_qty,
+                    "type": part.get("type") or part.get("scan_type") or current.get("scan_type") or "TOTE"
+                }
+
+        breakdown_map[color.upper()] = {"color": color, "qty": qty, "type": scan_type}
+        color_breakdown = list(breakdown_map.values())
+        total_qty = sum(part["qty"] for part in color_breakdown)
+
+        local_scans_overlay[wave_clean][lpn_key] = {
+            "qty": total_qty,
+            "scan_type": scan_type if len(color_breakdown) == 1 else "TOTE_MULTI",
+            "color": color if len(color_breakdown) == 1 else "Multiple",
+            "color_breakdown": color_breakdown,
+            "status": status,
+            "pallet_no": int(pallet_no or 0),
+            "timestamp": time.time()
+        }
+
+def apply_local_overlay(wave_detail_str: str, raw_data: dict) -> dict:
+    try:
+        search_wave_id = int(wave_detail_str.strip())
+        wave_clean = str(search_wave_id)
+        wave_detail_str = f"{search_wave_id:010d}"
+    except ValueError:
+        return raw_data
+
+    with local_scans_lock:
+        scans_copy = dict(local_scans_overlay.get(wave_clean) or {})
+    with pallet_shared_state_lock:
+        shared_pallet_copy = copy.deepcopy(pallet_shared_state.get(wave_clean) or {})
+    if not scans_copy and not shared_pallet_copy:
+        return raw_data
+
+    data = copy.deepcopy(raw_data)
+    lpn_list = data.get("lpn_list", [])
+
+    for item in lpn_list:
+        lpn_key = (item["lpn"].strip().upper(), item["branch"].strip().upper())
+        if lpn_key in scans_copy:
+            scan_info = scans_copy[lpn_key]
+            item["status"] = scan_info["status"]
+            item["qty"] = scan_info["qty"]
+            item["scan_type"] = scan_info["scan_type"]
+            item["color"] = scan_info["color"]
+            item["color_breakdown"] = scan_info.get("color_breakdown", [])
+            item["pallet_no"] = int(scan_info.get("pallet_no", 0) or 0)
+
+        branch = str(item.get("branch") or "").strip().upper()
+        pallet_state = shared_pallet_copy.get(branch) or {}
+        pallet_no = int(item.get("pallet_no") or 0)
+        shared_color = (pallet_state.get("colors") or {}).get(pallet_no)
+        if shared_color:
+            item["pallet_color"] = shared_color
+        shared_submitted = set(item.get("branch_submitted_pallet_nos") or [])
+        shared_submitted.update(pallet_state.get("submitted") or set())
+        item["branch_submitted_pallet_nos"] = sorted(int(no) for no in shared_submitted if int(no) > 0)
+        if pallet_state.get("closed_at"):
+            item["branch_closed_at"] = pallet_state["closed_at"]
+            item["branch_closed_by"] = pallet_state.get("closed_by") or ""
+
+    # Recalculate zone_summary
+    zones_calc = {}
+    for item in lpn_list:
+        z = item.get("zone") or "N/A"
+        if z not in zones_calc:
+            zones_calc[z] = {"zone": z, "scanned": 0, "total": 0}
+        zones_calc[z]["total"] += 1
+        if item["status"] == "Scanned":
+            zones_calc[z]["scanned"] += 1
+
+    data["zone_summary"] = list(zones_calc.values())
+    return data
+
+def fetch_wave_data_from_bq(search_wave_id: int) -> dict:
+    wave_scan_str = str(search_wave_id)
+    wave_detail_str = f"{search_wave_id:010d}"
+
+    query = f"""
+        WITH ScanRows AS (
+            SELECT
+                TRIM(CAST(Wave_Number AS STRING)) AS Wave_Number,
+                SAFE_CAST(REGEXP_REPLACE(TRIM(CAST(Wave_Number AS STRING)), r'[^0-9]', '') AS INT64) AS Scan_Wave_ID,
+                TRIM(UPPER(LPN)) AS Clean_LPN,
+                Qty,
+                Scan_Type,
+                Color,
+                TRIM(UPPER(IFNULL(Branch_Code, ''))) AS Scan_Branch,
+                TRIM(IFNULL(Emp_ID, '')) AS Emp_ID,
+                IFNULL(Pallet_No, 0) AS Pallet_No,
+                Timestamp,
+                IF(Qty = 0 OR Scan_Type IN ('RESET_BOX', 'CANCEL_COMBINE'), 1, 0) AS Is_Reset
+            FROM `pro-analytics-db.logistics_db.app_scan_transactions`
+            -- Wave_Number อาจถูกเก็บเป็น 58903, 0000058903 หรือ WAVE-58903
+            WHERE SAFE_CAST(REGEXP_REPLACE(TRIM(CAST(Wave_Number AS STRING)), r'[^0-9]', '') AS INT64) = {search_wave_id}
+        ),
+        LatestReset AS (
+            SELECT Scan_Wave_ID, Clean_LPN, MAX(Timestamp) AS Reset_Timestamp
+            FROM ScanRows
+            WHERE Is_Reset = 1
+            GROUP BY Scan_Wave_ID, Clean_LPN
+        ),
+        ValidScanRows AS (
+            SELECT r.*
+            FROM ScanRows AS r
+            LEFT JOIN LatestReset AS lr
+              ON r.Scan_Wave_ID = lr.Scan_Wave_ID
+             AND r.Clean_LPN = lr.Clean_LPN
+            WHERE r.Is_Reset = 0
+              AND IFNULL(r.Qty, 0) > 0
+              AND (lr.Reset_Timestamp IS NULL OR r.Timestamp > lr.Reset_Timestamp)
+        ),
+        LatestColorScan AS (
+            SELECT * EXCEPT(rn)
+            FROM (
+                SELECT
+                    *,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY Scan_Wave_ID, Clean_LPN, UPPER(IFNULL(Color, 'None'))
+                        ORDER BY Timestamp DESC, Qty DESC
+                    ) AS rn
+                FROM ValidScanRows
+            )
+            WHERE rn = 1
+        ),
+        ScanHistory AS (
+            SELECT
+                Scan_Wave_ID,
+                Clean_LPN,
+                SUM(Qty) AS Scanned_Qty,
+                MAX(Pallet_No) AS Scanned_Pallet_No,
+                ARRAY_AGG(Scan_Type ORDER BY Timestamp DESC LIMIT 1)[OFFSET(0)] AS Scan_Type,
+                ARRAY_AGG(Color ORDER BY Timestamp DESC LIMIT 1)[OFFSET(0)] AS Color,
+                STRING_AGG(CONCAT(IFNULL(Color, 'None'), '~', CAST(Qty AS STRING), '~', IFNULL(Scan_Type, '')), '|') AS Color_Breakdown
+            FROM LatestColorScan
+            GROUP BY Scan_Wave_ID, Clean_LPN
+        ),
+        PalletSummary AS (
+            SELECT
+                Scan_Branch,
+                ARRAY_AGG(DISTINCT Pallet_No ORDER BY Pallet_No) AS Pallet_Nos
+            FROM ValidScanRows
+            -- นับเฉพาะพาเลทที่ยังมี LPN อยู่จริงในสถานะล่าสุด
+            -- ไม่รวมเลขที่เคยจองแล้วถูกยกเลิกหรือพาเลทที่ถูกแก้จนว่าง
+            WHERE IFNULL(Qty, 0) > 0 AND Pallet_No > 0 AND Scan_Branch != ''
+            GROUP BY Scan_Branch
+        ),
+        PalletColorSummary AS (
+            SELECT
+                Scan_Branch,
+                Pallet_No,
+                ARRAY_AGG(Color IGNORE NULLS ORDER BY Timestamp DESC LIMIT 1)[SAFE_OFFSET(0)] AS Pallet_Color
+            FROM ScanRows
+            WHERE Scan_Type = 'PALLET_START' AND Pallet_No > 0 AND Scan_Branch != ''
+            GROUP BY Scan_Branch, Pallet_No
+        ),
+        SubmittedPalletSummary AS (
+            SELECT
+                Scan_Branch,
+                ARRAY_AGG(DISTINCT Pallet_No ORDER BY Pallet_No) AS Submitted_Pallet_Nos
+            FROM ScanRows
+            WHERE Scan_Type = 'PALLET_SUBMIT' AND Pallet_No > 0 AND Scan_Branch != ''
+            GROUP BY Scan_Branch
+        ),
+        BranchCloseSummary AS (
+            SELECT
+                Scan_Branch,
+                MAX(Timestamp) AS Branch_Closed_At,
+                ARRAY_AGG(Emp_ID ORDER BY Timestamp DESC LIMIT 1)[SAFE_OFFSET(0)] AS Branch_Closed_By
+            FROM ScanRows
+            WHERE Scan_Type = 'CLOSE_JOB' AND Scan_Branch != ''
+            GROUP BY Scan_Branch
+        ),
+        WaveMonitoringFiltered AS (
+            SELECT
+                Branch_Code,
+                MAX(Branch_Name) AS Branch_Name,
+                Detail_Wave
+            FROM (
+                SELECT
+                    TRIM(Branch_Code) AS Branch_Code,
+                    TRIM(Branch_Name) AS Branch_Name,
+                    LPAD(CAST(SAFE_CAST(REGEXP_REPLACE(TRIM(CAST(Wave_Number AS STRING)), r'[^0-9]', '') AS INT64) AS STRING), 10, '0') AS Detail_Wave
+                FROM `pro-analytics-db.logistics_db.wave_monitoring`
+                WHERE SAFE_CAST(REGEXP_REPLACE(TRIM(CAST(Wave_Number AS STRING)), r'[^0-9]', '') AS INT64) = {search_wave_id}
+            )
+            GROUP BY Branch_Code, Detail_Wave
+        ),
+        WaveBranches AS (
+            SELECT DISTINCT TRIM(UPPER(Branch_Code)) AS Branch_Code
+            FROM `pro-analytics-db.logistics_db.wave_lpn_detail_record`
+            WHERE SAFE_CAST(REGEXP_REPLACE(TRIM(CAST(Wave_Number AS STRING)), r'[^0-9]', '') AS INT64) = {search_wave_id}
+              AND NULLIF(TRIM(Branch_Code), '') IS NOT NULL
+        ),
+        BranchNameHistory AS (
+            SELECT
+                TRIM(UPPER(w.Branch_Code)) AS Branch_Code,
+                ARRAY_AGG(
+                    NULLIF(TRIM(w.Branch_Name), '') IGNORE NULLS
+                    ORDER BY w.Created_At DESC
+                    LIMIT 1
+                )[SAFE_OFFSET(0)] AS Branch_Name
+            FROM `pro-analytics-db.logistics_db.wave_monitoring` AS w
+            INNER JOIN WaveBranches AS b
+              ON TRIM(UPPER(w.Branch_Code)) = b.Branch_Code
+            WHERE NULLIF(TRIM(w.Branch_Name), '') IS NOT NULL
+              AND LOWER(TRIM(w.Branch_Name)) != 'unknown'
+            GROUP BY Branch_Code
+        )
+        SELECT 
+            d.LPN, 
+            d.Zone, 
+            d.Wave_Number AS Full_Wave, 
+            TRIM(d.Branch_Code) AS Branch_Code, 
+            COALESCE(
+                MAX(IF(
+                    LOWER(TRIM(IFNULL(m.Branch_Name, ''))) IN ('', 'unknown', 'null', 'none'),
+                    NULL,
+                    TRIM(m.Branch_Name)
+                )),
+                MAX(h.Branch_Name),
+                'Unknown'
+            ) AS Branch_Name,
+            -- PP/SP LPNs can contain multiple product rows; show the total carton target for the whole LPN.
+            IF(
+                REGEXP_CONTAINS(UPPER(TRIM(d.LPN)), r'^(PP|SP)'),
+                SUM(IFNULL(d.Total_Qty, 1)),
+                MAX(IFNULL(d.Total_Qty, 1))
+            ) AS Total_Qty, 
+            IF(COALESCE(MAX(s.Scanned_Qty), 0) > 0, 'Scanned', 'Pending') AS status,
+            MAX(s.Scanned_Qty) AS qty,
+            MAX(s.Scan_Type) AS scan_type,
+            COALESCE(MAX(s.Scanned_Pallet_No), 0) AS pallet_no,
+            COALESCE(MAX(TRIM(d.Owner)), 'Unknown') AS owner,
+            MAX(s.Color) AS color,
+            MAX(s.Color_Breakdown) AS color_breakdown,
+            ANY_VALUE(ps.Pallet_Nos) AS branch_pallet_nos,
+            MAX(pc.Pallet_Color) AS pallet_color,
+            ANY_VALUE(sps.Submitted_Pallet_Nos) AS branch_submitted_pallet_nos,
+            ANY_VALUE(bcs.Branch_Closed_At) AS branch_closed_at,
+            ANY_VALUE(bcs.Branch_Closed_By) AS branch_closed_by,
+            ARRAY_AGG(STRUCT(
+                TRIM(d.Owner) AS owner,
+                TRIM(d.Product_Code) AS product_code,
+                d.Total_Pieces AS total_pieces,
+                d.Total_Qty AS row_total_qty
+            )) AS detail_rows
+        FROM `pro-analytics-db.logistics_db.wave_lpn_detail_record` AS d
+        LEFT JOIN WaveMonitoringFiltered AS m 
+          ON TRIM(d.Branch_Code) = m.Branch_Code
+         AND m.Detail_Wave = LPAD(
+             CAST(SAFE_CAST(REGEXP_REPLACE(TRIM(CAST(d.Wave_Number AS STRING)), r'[^0-9]', '') AS INT64) AS STRING),
+             10,
+             '0'
+         )
+        LEFT JOIN BranchNameHistory AS h
+          ON TRIM(UPPER(d.Branch_Code)) = h.Branch_Code
+        LEFT JOIN ScanHistory AS s
+          ON s.Scan_Wave_ID = {search_wave_id}
+         AND TRIM(UPPER(d.LPN)) = s.Clean_LPN
+        LEFT JOIN PalletSummary AS ps
+          ON TRIM(UPPER(d.Branch_Code)) = ps.Scan_Branch
+        LEFT JOIN PalletColorSummary AS pc
+          ON TRIM(UPPER(d.Branch_Code)) = pc.Scan_Branch
+         AND COALESCE(s.Scanned_Pallet_No, 0) = pc.Pallet_No
+        LEFT JOIN SubmittedPalletSummary AS sps
+          ON TRIM(UPPER(d.Branch_Code)) = sps.Scan_Branch
+        LEFT JOIN BranchCloseSummary AS bcs
+          ON TRIM(UPPER(d.Branch_Code)) = bcs.Scan_Branch
+        WHERE SAFE_CAST(REGEXP_REPLACE(TRIM(CAST(d.Wave_Number AS STRING)), r'[^0-9]', '') AS INT64) = {search_wave_id}
+        GROUP BY d.LPN, d.Zone, d.Branch_Code, d.Wave_Number
+    """
+
+    meta_query = f"""
+        SELECT 
+            COALESCE(MAX(TRIM(Vehicle_Booking_No)), '') AS booking_no,
+            COALESCE(MAX(TRIM(License_Plate)), '') AS license_plate
+        FROM `pro-analytics-db.logistics_db.wave_monitoring`
+        WHERE SAFE_CAST(REGEXP_REPLACE(TRIM(CAST(Wave_Number AS STRING)), r'[^0-9]', '') AS INT64) = {search_wave_id}
+    """
+
+    job_config = bigquery.QueryJobConfig(use_query_cache=True)
+    meta_job = client.query(meta_query, job_config=job_config)
+    query_job = client.query(query, job_config=job_config)
+
+    meta_rows = list(meta_job.result(timeout=BQ_JOB_TIMEOUT_SECONDS))
+    booking_no = ""
+    license_plate = ""
+    if len(meta_rows) > 0:
+        booking_no = meta_rows[0]["booking_no"] or ""
+        license_plate = meta_rows[0]["license_plate"] or ""
+
+    results = query_job.result(timeout=BQ_JOB_TIMEOUT_SECONDS)
+
+    lpn_list = []
+    zones_calc = {}
+    row_count = 0
+    real_wave_no = f"{search_wave_id:010d}"
+    numeric_branch_map = None
+
+    for row in results:
+        row_count += 1
+        real_wave_no = row["Full_Wave"]
+        z = row["Zone"] if row["Zone"] else "N/A"
+        raw_code = row["Branch_Code"]
+        br_code_str = str(raw_code).strip() if raw_code else "Unknown"
+        if is_numeric_branch_code(br_code_str):
+            if numeric_branch_map is None:
+                numeric_branch_map = load_numeric_branch_master()
+            br_name = clean_branch_display_name(
+                numeric_branch_map.get(br_code_str) or row["Branch_Name"]
+            )
+        else:
+            br_name = clean_branch_display_name(row["Branch_Name"])
+        total_qty = calculate_direct_total_qty(row["LPN"], row["detail_rows"], row["Total_Qty"])
+
+        lpn_list.append({
+            "lpn": row["LPN"],
+            "zone": z,
+            "branch": br_code_str,
+            "branch_name": br_name,
+            "status": row["status"],
+            "total_qty": total_qty,
+            "qty": row["qty"] if row["qty"] is not None else 0,
+            "scan_type": row["scan_type"],
+            "owner": row["owner"] or "Unknown",
+            "color": row["color"] or "None",
+            "color_breakdown": row["color_breakdown"] or "",
+            "pallet_no": row["pallet_no"] if row["pallet_no"] is not None else 0,
+            "branch_pallet_nos": list(row["branch_pallet_nos"] or []),
+            "pallet_color": row["pallet_color"] or "",
+            "branch_submitted_pallet_nos": list(row["branch_submitted_pallet_nos"] or []),
+            "branch_closed_at": row["branch_closed_at"].isoformat() if row["branch_closed_at"] else "",
+            "branch_closed_by": row["branch_closed_by"] or "",
+            "wave_no": str(row["Full_Wave"]).strip()
+        })
+
+        if z not in zones_calc:
+            zones_calc[z] = {"zone": z, "scanned": 0, "total": 0}
+        zones_calc[z]["total"] += 1
+        if row["status"] == "Scanned":
+            zones_calc[z]["scanned"] += 1
+
+    if row_count == 0:
+        raise HTTPException(status_code=404, detail=f"ไม่พบข้อมูล Wave [{search_wave_id}]")
+
+    return {
+        "wave_no": real_wave_no,
+        "booking_no": booking_no,
+        "license_plate": license_plate,
+        "lpn_list": lpn_list,
+        "zone_summary": list(zones_calc.values())
+    }
+
+def get_wave_data_internal(wave_no: str, force_refresh: bool = False) -> dict:
+    try:
+        search_wave_id = int(wave_no.strip())
+    except ValueError:
+        raise HTTPException(status_code=400, detail="รหัส Wave ต้องเป็นตัวเลขเท่านั้น")
+
+    wave_detail_str = f"{search_wave_id:010d}"
+    now = time.time()
+
+    if not force_refresh:
+        with wave_cache_lock:
+            cached = wave_cache.get(wave_detail_str)
+            if cached and cached["expires_at"] > now:
+                return cached["data"]
+
+    # ป้องกันหลาย Handheld ยิง Query Wave เดียวกันพร้อมกันตอน cache หมดอายุ
+    with wave_query_locks_guard:
+        query_lock = wave_query_locks.setdefault(wave_detail_str, Lock())
+    with query_lock:
+        if not force_refresh:
+            with wave_cache_lock:
+                cached = wave_cache.get(wave_detail_str)
+                if cached and cached["expires_at"] > time.time():
+                    return cached["data"]
+
+        data = fetch_wave_data_from_bq(search_wave_id)
+        with wave_cache_lock:
+            wave_cache[wave_detail_str] = {
+                "data": data,
+                "expires_at": time.time() + WAVE_CACHE_TTL
+            }
+        return data
+
+active_wave_refreshes = set()
+active_wave_refreshes_lock = Lock()
+
+def background_refresh_wave(wave_no: str):
+    try:
+        search_wave_id = int(wave_no.strip())
+        wave_detail_str = f"{search_wave_id:010d}"
+        wave_clean = str(search_wave_id)
+    except ValueError:
+        return
+
+    # Skip if this wave is already actively refreshing in a background task
+    with active_wave_refreshes_lock:
+        if wave_detail_str in active_wave_refreshes:
+            return
+        active_wave_refreshes.add(wave_detail_str)
+
+    try:
+        # Wait a short duration to let BigQuery ingest the stream
+        time.sleep(2.5)
+        get_wave_data_internal(wave_clean, force_refresh=True)
+    except Exception as e:
+        print(f"Background refresh error for wave {wave_clean}: {e}")
+    finally:
+        with active_wave_refreshes_lock:
+            active_wave_refreshes.discard(wave_detail_str)
+
+def get_valid_lpns_for_wave(wave_no: str) -> set:
+    import time
+    now = time.time()
+    try:
+        wave_clean = str(int(wave_no.strip()))
+        wave_detail_str = f"{int(wave_no.strip()):010d}"
+    except ValueError:
+        return set()
+
+    # Try to read from wave_cache first for near-instant validation
+    with wave_cache_lock:
+        cached = wave_cache.get(wave_detail_str)
+        if cached and cached["expires_at"] > now:
+            lpns = set()
+            for item in cached["data"].get("lpn_list", []):
+                lpns.add((item["lpn"].strip().upper(), item["branch"].strip().upper()))
+            return lpns
+    
+    with valid_lpns_cache_lock:
+        cache_entry = valid_lpns_cache.get(wave_clean)
+        if cache_entry and cache_entry["expires_at"] > now:
+            return cache_entry["lpns"]
+            
+    # Query BigQuery
+    query = f"""
+        SELECT DISTINCT TRIM(UPPER(CAST(LPN AS STRING))) AS LPN, TRIM(UPPER(CAST(Branch_Code AS STRING))) AS Branch_Code
+        FROM `pro-analytics-db.logistics_db.wave_lpn_detail_record`
+        WHERE SAFE_CAST(REGEXP_REPLACE(TRIM(CAST(Wave_Number AS STRING)), r'[^0-9]', '') AS INT64) = {wave_clean}
+    """
+    try:
+        query_job = client.query(query, job_config=bigquery.QueryJobConfig(use_query_cache=True))
+        rows = query_job.result(timeout=BQ_JOB_TIMEOUT_SECONDS)
+        lpns = set()
+        for row in rows:
+            lpn_val = str(row["LPN"]).strip().upper() if row["LPN"] else ""
+            branch_val = str(row["Branch_Code"]).strip().upper() if row["Branch_Code"] else ""
+            if lpn_val:
+                lpns.add((lpn_val, branch_val))
+        
+        if lpns:
+            with valid_lpns_cache_lock:
+                valid_lpns_cache[wave_clean] = {
+                    "lpns": lpns,
+                    "expires_at": now + VALID_LPNS_CACHE_TTL
+                }
+        return lpns
+    except Exception as e:
+        print(f"🚨 CACHE QUERY ERROR for Wave {wave_clean}: {str(e)}")
+        return set()
+
+
+def fetch_booking_waves_from_bq(booking_no: str) -> dict:
+    clean_booking = booking_no.strip().upper()
+    raw_booking = booking_no.strip()
+    # ✅ ใช้ query parameters แทนการต่อสตริง (อุด SQL injection ผ่านเลข Booking)
+    query = """
+        SELECT DISTINCT
+            TRIM(Wave_Number) AS monitor_wave,
+            REGEXP_REPLACE(TRIM(Wave_Number), r'^WAVE-', '') AS detail_wave,
+            CAST(SAFE_CAST(REGEXP_REPLACE(TRIM(Wave_Number), r'[^0-9]', '') AS INT64) AS STRING) AS scan_wave,
+            TRIM(License_Plate) AS License_Plate
+        FROM `pro-analytics-db.logistics_db.wave_monitoring`
+        WHERE (Vehicle_Booking_No = @clean_booking OR Vehicle_Booking_No = @raw_booking)
+          AND Wave_Number IS NOT NULL
+          AND Wave_Number != ''
+    """
+    booking_config = bigquery.QueryJobConfig(
+        use_query_cache=True,
+        query_parameters=[
+            bigquery.ScalarQueryParameter("clean_booking", "STRING", clean_booking),
+            bigquery.ScalarQueryParameter("raw_booking", "STRING", raw_booking),
+        ],
+    )
+    query_job = client.query(query, job_config=booking_config)
+    results = list(query_job.result(timeout=BQ_JOB_TIMEOUT_SECONDS))
+    if not results:
+        raise HTTPException(status_code=404, detail=f"ไม่พบข้อมูลสำหรับ Booking No. [{booking_no}]")
+    
+    waves = []
+    license_plate = ""
+    for row in results:
+        detail_wave = str(row["detail_wave"]).strip()
+        if detail_wave:
+            waves.append(detail_wave)
+        if row["License_Plate"] and not license_plate:
+            license_plate = str(row["License_Plate"]).strip()
+            
+    return {
+        "waves": waves,
+        "license_plate": license_plate
+    }
+
+def get_booking_waves_mapping(booking_no: str, force_refresh: bool = False) -> dict:
+    clean_booking = booking_no.strip().upper()
+    now = time.time()
+    if not force_refresh:
+        with booking_waves_cache_lock:
+            cached = booking_waves_cache.get(clean_booking)
+            if cached and cached["expires_at"] > now:
+                return cached["mapping"]
+                
+    mapping = fetch_booking_waves_from_bq(booking_no)
+    with booking_waves_cache_lock:
+        booking_waves_cache[clean_booking] = {
+            "mapping": mapping,
+            "expires_at": now + BOOKING_WAVES_CACHE_TTL
+        }
+    return mapping
+
+def get_booking_data_internal(booking_no: str, force_refresh: bool = False) -> dict:
+    mapping = get_booking_waves_mapping(booking_no, force_refresh)
+    waves = mapping["waves"]
+    license_plate = mapping["license_plate"]
+    
+    lpn_list = []
+    waves_included = set()
+    wave_results = []
+    
+    # Fetch all waves in parallel using ThreadPoolExecutor to prevent slow sequential BigQuery queries
+    with ThreadPoolExecutor(max_workers=max(1, len(waves))) as executor:
+        futures = {executor.submit(get_wave_data_internal, wave, force_refresh): wave for wave in waves}
+        for future in futures:
+            wave = futures[future]
+            try:
+                wave_data = future.result()
+                wave_data_overlaid = apply_local_overlay(wave, wave_data)
+                wave_results.append(wave_data_overlaid)
+            except Exception as e:
+                print(f"🚨 Error fetching wave {wave} in booking {booking_no}: {e}")
+                raise
+                
+    for wave_data_overlaid in wave_results:
+        lpn_list.extend(wave_data_overlaid.get("lpn_list", []))
+        waves_included.add(wave_data_overlaid["wave_no"])
+        
+    zones_calc = {}
+    for item in lpn_list:
+        z = item.get("zone") or "N/A"
+        if z not in zones_calc:
+            zones_calc[z] = {"zone": z, "scanned": 0, "total": 0}
+        zones_calc[z]["total"] += 1
+        if item["status"] == "Scanned":
+            zones_calc[z]["scanned"] += 1
+            
+    return {
+        "booking_no": booking_no,
+        "license_plate": license_plate,
+        "waves": list(waves_included),
+        "lpn_list": lpn_list,
+        "zone_summary": list(zones_calc.values())
+    }
+
+
+# ==================== DATA MODELS ====================
+class ScanData(BaseModel):
+    wave_no: str
+    branch_code: Optional[str] = None
+    branch_name: Optional[str] = None
+    lpn: str
+    type: str
+    color: str
+    qty: int = 1
+    emp_id: Optional[str] = None
+    pallet_no: Optional[int] = 0   # ✅ เลขพาเลทที่ LPN นี้อยู่ (sync ข้ามเครื่อง)
+    expected_previous_qty: Optional[int] = None  # optimistic concurrency: กันหลายเครื่องเขียน LPN เดียวกันทับกัน
+
+ScanData.model_rebuild()   # ← เพิ่มบรรทัดนี้
+
+class ScanBatchData(BaseModel):
+    scans: List[ScanData]
+
+ScanBatchData.model_rebuild()
+
+
+class CombineData(BaseModel):
+    master_lpn: str
+    child_lpns: List[str]
+
+class CloseData(BaseModel):
+    wave_no: str
+    branch_code: str = "ALL"
+    close_type: str
+
+class CloseJobData(BaseModel):
+    wave: str
+    branch: str
+    emp_id: Optional[str] = None
+    completed_at: Optional[str] = None
+
+class PalletStartData(BaseModel):
+    waves: List[str]
+    booking_no: Optional[str] = None
+    branch_code: str
+    branch_name: Optional[str] = None
+    color: str
+    emp_id: Optional[str] = None
+
+class PalletSubmitData(BaseModel):
+    waves: List[str]
+    booking_no: Optional[str] = None
+    branch_code: str
+    branch_name: Optional[str] = None
+    pallet_no: int
+    color: Optional[str] = None
+    emp_id: Optional[str] = None
+
+class CorrectionData(BaseModel):
+    correction_id: Optional[str] = None
+    wave_no: str
+    branch_code: str
+    branch_name: Optional[str] = None
+    lpn: str
+    new_qty: int
+    reason: str
+    note: Optional[str] = None
+    emp_id: Optional[str] = None
+    pallet_no: Optional[int] = 0
+    scan_type: Optional[str] = "Carton"
+    color: Optional[str] = "None"
+
+# ==================== ROUTES & APIs ====================
+
+@app.get("/")
+async def read_root():
+    return {"status": "ok", "message": "Scanner API is running perfectly!"}
+
+# ✅ Health Check Endpoint: ตอบสนองเร็ว <5ms สำหรับ keep-alive heartbeat
+@app.get("/api/health")
+async def health_check():
+    return {"status": "ok", "timestamp": time.time()}
+
+# 🚀 [API 1] โหลดข้อมูล Wave
+# 🚀 [API 1] โหลดข้อมูล Wave
+@app.get("/api/check-wave")
+def check_wave(wave_no: str, force: bool = False):
+    try:
+        # Load wave data (either from cache or by querying BigQuery if not cached)
+        raw_data = get_wave_data_internal(wave_no, force_refresh=force)
+        # Apply the in-memory scan overlays dynamically
+        overlaid_data = apply_local_overlay(wave_no, raw_data)
+        return overlaid_data
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"🚨 CHECK WAVE ERROR: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# 🚀 [API 1.5] โหลดข้อมูล Booking
+@app.get("/api/check-booking")
+def check_booking(booking_no: str, force: bool = False):
+    try:
+        booking_data = get_booking_data_internal(booking_no, force_refresh=force)
+        return booking_data
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"🚨 CHECK BOOKING ERROR: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/start-pallet")
+def start_pallet(data: PalletStartData):
+    """Allocate one branch-wide pallet number so multiple handhelds cannot reuse the same number."""
+    wave_ids = {int(str(w).strip()) for w in data.waves if str(w).strip().isdigit()}
+    if (data.booking_no or "").strip():
+        try:
+            mapping = get_booking_waves_mapping((data.booking_no or "").strip())
+            wave_ids.update(int(str(w).strip()) for w in mapping.get("waves", []) if str(w).strip().isdigit())
+        except Exception:
+            pass
+    wave_ids = sorted(wave_ids)
+    branch = (data.branch_code or "").strip().upper()
+    branch_name = (data.branch_name or "").strip()
+    color = (data.color or "").strip().title()
+    emp_id = (data.emp_id or "").strip()
+    if not wave_ids or not branch:
+        raise HTTPException(status_code=400, detail="ข้อมูล Wave หรือสาขาไม่ครบ")
+    if color not in ("Green", "Blue", "Red"):
+        raise HTTPException(status_code=400, detail="สีพาเลทไม่ถูกต้อง")
+
+    cache_key = (tuple(wave_ids), branch)
+    with pallet_allocation_lock:
+        cached_max = int(pallet_counter_cache.get(cache_key, 0) or 0)
+        if cached_max > 0:
+            next_no = cached_max + 1
+        else:
+            max_query = """
+                SELECT COALESCE(MAX(SAFE_CAST(Pallet_No AS INT64)), 0) AS max_no
+                FROM `pro-analytics-db.logistics_db.app_scan_transactions`
+                WHERE SAFE_CAST(REGEXP_REPLACE(TRIM(CAST(Wave_Number AS STRING)), r'[^0-9]', '') AS INT64) IN UNNEST(@wave_ids)
+                  AND TRIM(UPPER(IFNULL(Branch_Code, ''))) = @branch
+                  AND SAFE_CAST(Pallet_No AS INT64) > 0
+            """
+            max_config = bigquery.QueryJobConfig(query_parameters=[
+                bigquery.ArrayQueryParameter("wave_ids", "INT64", wave_ids),
+                bigquery.ScalarQueryParameter("branch", "STRING", branch),
+            ])
+            row = next(iter(client.query(max_query, job_config=max_config).result(timeout=BQ_JOB_TIMEOUT_SECONDS)))
+            next_no = int(row["max_no"] or 0) + 1
+        marker_lpn = f"PALLET_{branch}_{next_no}"
+        marker_time = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        markers = [{
+            "Wave_Number": str(wave_id),
+            "LPN": marker_lpn,
+            "Scan_Type": "PALLET_START",
+            "Color": color,
+            "Qty": 0,
+            "Timestamp": marker_time,
+            "Branch_Code": branch,
+            "Branch_Name": branch_name,
+            "Emp_ID": emp_id,
+            "Pallet_No": next_no,
+        } for wave_id in wave_ids]
+        errors = client.insert_rows_json(
+            client.dataset("logistics_db").table("app_scan_transactions"),
+            markers,
+            row_ids=[f"pallet:{wave_id}:{branch}:{next_no}" for wave_id in wave_ids],
+        )
+        if errors:
+            raise HTTPException(status_code=500, detail=f"จองเลขพาเลทไม่สำเร็จ: {errors}")
+        pallet_counter_cache[cache_key] = next_no
+
+    record_shared_pallet_state(wave_ids, branch, next_no, color=color, submitted=False)
+
+    return {
+        "status": "success",
+        "pallet_no": next_no,
+        "color": color,
+        "allocated_by": emp_id,
+    }
+
+@app.post("/api/submit-pallet")
+def submit_pallet(data: PalletSubmitData):
+    """Share a completed pallet with every handheld while keeping an auditable marker in BigQuery."""
+    wave_ids = {int(str(w).strip()) for w in data.waves if str(w).strip().isdigit()}
+    if (data.booking_no or "").strip():
+        try:
+            mapping = get_booking_waves_mapping((data.booking_no or "").strip())
+            wave_ids.update(int(str(w).strip()) for w in mapping.get("waves", []) if str(w).strip().isdigit())
+        except Exception:
+            pass
+    wave_ids = sorted(wave_ids)
+    branch = (data.branch_code or "").strip().upper()
+    branch_name = (data.branch_name or "").strip()
+    pallet_no = int(data.pallet_no or 0)
+    color = (data.color or "").strip().title()
+    emp_id = (data.emp_id or "").strip()
+    if not wave_ids or not branch or pallet_no <= 0:
+        raise HTTPException(status_code=400, detail="ข้อมูล Wave สาขา หรือเลขพาเลทไม่ครบ")
+
+    marker_time = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    markers = [{
+        "Wave_Number": str(wave_id),
+        "LPN": f"PALLET_SUBMIT_{branch}_{pallet_no}",
+        "Scan_Type": "PALLET_SUBMIT",
+        "Color": color or "None",
+        "Qty": 0,
+        "Timestamp": marker_time,
+        "Branch_Code": branch,
+        "Branch_Name": branch_name,
+        "Emp_ID": emp_id,
+        "Pallet_No": pallet_no,
+    } for wave_id in wave_ids]
+    errors = client.insert_rows_json(
+        client.dataset("logistics_db").table("app_scan_transactions"),
+        markers,
+        row_ids=[f"pallet-submit:{wave_id}:{branch}:{pallet_no}" for wave_id in wave_ids],
+    )
+    if errors:
+        raise HTTPException(status_code=500, detail=f"ส่งสถานะพาเลทไม่สำเร็จ: {errors}")
+    record_shared_pallet_state(wave_ids, branch, pallet_no, color=color, submitted=True)
+    return {"status": "success", "pallet_no": pallet_no, "submitted_by": emp_id}
+
+def encode_correction_audit(payload: dict) -> str:
+    raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+def decode_correction_audit(scan_type: str) -> Optional[dict]:
+    try:
+        encoded = str(scan_type or "").split("|", 1)[1]
+        encoded += "=" * (-len(encoded) % 4)
+        return json.loads(base64.urlsafe_b64decode(encoded.encode("ascii")).decode("utf-8"))
+    except Exception:
+        return None
+
+@app.post("/api/correct-lpn")
+def correct_lpn(data: CorrectionData, background_tasks: BackgroundTasks):
+    try:
+        wave_clean = str(int((data.wave_no or "").strip()))
+    except ValueError:
+        raise HTTPException(status_code=400, detail="รหัส Wave ไม่ถูกต้อง")
+
+    branch = (data.branch_code or "").strip().upper()
+    lpn = (data.lpn or "").strip().upper()
+    reason = (data.reason or "").strip()
+    note = (data.note or "").strip()
+    emp_id = (data.emp_id or "").strip()
+    correction_id = (data.correction_id or str(uuid.uuid4())).strip()
+    new_qty = int(data.new_qty or 0)
+    pallet_no = int(data.pallet_no or 0)
+    scan_type = (data.scan_type or "Carton").strip()
+    color = (data.color or "None").strip()
+    if not branch or not lpn or not reason:
+        raise HTTPException(status_code=400, detail="กรุณาระบุ LPN สาขา และเหตุผลการแก้ไข")
+    if new_qty < 0:
+        raise HTTPException(status_code=400, detail="ยอดใหม่ต้องเป็น 0 ขึ้นไป")
+    valid_pairs = get_valid_lpns_for_wave(wave_clean)
+    if valid_pairs and (lpn, branch) not in valid_pairs:
+        raise HTTPException(status_code=400, detail=f"ไม่พบ LPN [{lpn}] ใน Wave/Branch นี้")
+
+    audit_color = f"AUDIT:{correction_id}"
+    duplicate_query = """
+        SELECT COUNT(*) AS found
+        FROM `pro-analytics-db.logistics_db.app_scan_transactions`
+        WHERE SAFE_CAST(REGEXP_REPLACE(TRIM(CAST(Wave_Number AS STRING)), r'[^0-9]', '') AS INT64) = @wave
+          AND TRIM(UPPER(LPN)) = @lpn
+          AND Color = @audit_color
+    """
+    duplicate_config = bigquery.QueryJobConfig(query_parameters=[
+        bigquery.ScalarQueryParameter("wave", "INT64", int(wave_clean)),
+        bigquery.ScalarQueryParameter("lpn", "STRING", lpn),
+        bigquery.ScalarQueryParameter("audit_color", "STRING", audit_color),
+    ])
+    duplicate_row = next(iter(client.query(duplicate_query, job_config=duplicate_config).result(timeout=BQ_JOB_TIMEOUT_SECONDS)))
+    if int(duplicate_row["found"] or 0) > 0:
+        return {"status": "success", "correction_id": correction_id, "duplicate": True}
+
+    fresh = apply_local_overlay(wave_clean, get_wave_data_internal(wave_clean, force_refresh=True))
+    current = next((item for item in fresh.get("lpn_list", [])
+                    if str(item.get("lpn", "")).strip().upper() == lpn
+                    and str(item.get("branch", "")).strip().upper() == branch), None)
+    if not current:
+        raise HTTPException(status_code=404, detail=f"ไม่พบข้อมูลปัจจุบันของ LPN [{lpn}]")
+
+    old_snapshot = {
+        "qty": int(current.get("qty") or 0),
+        "status": current.get("status") or "Pending",
+        "scan_type": current.get("scan_type") or "",
+        "color": current.get("color") or "None",
+        "pallet_no": int(current.get("pallet_no") or 0),
+        "color_breakdown": current.get("color_breakdown") or [],
+    }
+    new_snapshot = {
+        "qty": new_qty,
+        "status": "Scanned" if new_qty > 0 else "Pending",
+        "scan_type": scan_type if new_qty > 0 else "RESET_BOX",
+        "color": color if new_qty > 0 else "None",
+        "pallet_no": pallet_no if new_qty > 0 else 0,
+    }
+    now = datetime.datetime.now(datetime.timezone.utc)
+    audit_payload = {
+        "correction_id": correction_id,
+        "wave_no": wave_clean,
+        "branch": branch,
+        "lpn": lpn,
+        "old": old_snapshot,
+        "new": new_snapshot,
+        "reason": reason,
+        "note": note,
+        "emp_id": emp_id,
+        "corrected_at": now.isoformat(),
+    }
+    audit_type = "CORRECTION|" + encode_correction_audit(audit_payload)
+    insert_query = """
+        INSERT INTO `pro-analytics-db.logistics_db.app_scan_transactions`
+        (Wave_Number, LPN, Scan_Type, Color, Qty, Timestamp, Branch_Code, Branch_Name, Emp_ID, Pallet_No)
+        SELECT @wave_str, @lpn, @audit_type, @audit_color, 0, @audit_time, @branch, @branch_name, @emp_id, @old_pallet
+        UNION ALL
+        SELECT @wave_str, @lpn, @new_type, @new_color, @new_qty, @new_time, @branch, @branch_name, @emp_id, @new_pallet
+        WHERE @new_qty > 0
+    """
+    config = bigquery.QueryJobConfig(query_parameters=[
+        bigquery.ScalarQueryParameter("wave_str", "STRING", wave_clean),
+        bigquery.ScalarQueryParameter("lpn", "STRING", lpn),
+        bigquery.ScalarQueryParameter("audit_type", "STRING", audit_type),
+        bigquery.ScalarQueryParameter("audit_color", "STRING", audit_color),
+        bigquery.ScalarQueryParameter("audit_time", "TIMESTAMP", now),
+        bigquery.ScalarQueryParameter("branch", "STRING", branch),
+        bigquery.ScalarQueryParameter("branch_name", "STRING", (data.branch_name or "").strip()),
+        bigquery.ScalarQueryParameter("emp_id", "STRING", emp_id),
+        bigquery.ScalarQueryParameter("old_pallet", "INT64", int(old_snapshot["pallet_no"] or 0)),
+        bigquery.ScalarQueryParameter("new_type", "STRING", scan_type),
+        bigquery.ScalarQueryParameter("new_color", "STRING", color),
+        bigquery.ScalarQueryParameter("new_qty", "INT64", new_qty),
+        bigquery.ScalarQueryParameter("new_time", "TIMESTAMP", now + datetime.timedelta(milliseconds=1)),
+        bigquery.ScalarQueryParameter("new_pallet", "INT64", pallet_no),
+    ])
+    client.query(insert_query, job_config=config).result(timeout=BQ_JOB_TIMEOUT_SECONDS)
+
+    record_local_scan(wave_clean, lpn, branch, 0, audit_type, audit_color, 0)
+    if new_qty > 0:
+        record_local_scan(wave_clean, lpn, branch, new_qty, scan_type, color, pallet_no)
+    # ไม่ refresh BigQuery ซ้ำทุกครั้ง: local overlay อัปเดตทุกเครื่องได้ทันทีอยู่แล้ว
+    return {"status": "success", "correction_id": correction_id, "audit": audit_payload}
+
+@app.get("/api/corrections")
+def get_corrections(waves: str, branch: str, lpn: Optional[str] = None):
+    wave_ids = sorted({int(part.strip()) for part in str(waves or "").split(",") if part.strip().isdigit()})
+    branch_clean = (branch or "").strip().upper()
+    lpn_clean = (lpn or "").strip().upper()
+    if not wave_ids or not branch_clean:
+        raise HTTPException(status_code=400, detail="ข้อมูล Wave หรือสาขาไม่ครบ")
+    query = """
+        SELECT Scan_Type, Timestamp
+        FROM `pro-analytics-db.logistics_db.app_scan_transactions`
+        WHERE SAFE_CAST(REGEXP_REPLACE(TRIM(CAST(Wave_Number AS STRING)), r'[^0-9]', '') AS INT64) IN UNNEST(@wave_ids)
+          AND TRIM(UPPER(IFNULL(Branch_Code, ''))) = @branch
+          AND STARTS_WITH(Scan_Type, 'CORRECTION|')
+          AND (@lpn = '' OR TRIM(UPPER(LPN)) = @lpn)
+        ORDER BY Timestamp DESC
+        LIMIT 200
+    """
+    config = bigquery.QueryJobConfig(query_parameters=[
+        bigquery.ArrayQueryParameter("wave_ids", "INT64", wave_ids),
+        bigquery.ScalarQueryParameter("branch", "STRING", branch_clean),
+        bigquery.ScalarQueryParameter("lpn", "STRING", lpn_clean),
+    ])
+    history = []
+    for row in client.query(query, job_config=config).result(timeout=BQ_JOB_TIMEOUT_SECONDS):
+        decoded = decode_correction_audit(row["Scan_Type"])
+        if decoded:
+            history.append(decoded)
+    return {"status": "success", "history": history}
+
+# 🚀 [API 2] บันทึกข้อมูลสแกนทีละกล่อง
+# 🚀 [API 2] บันทึกข้อมูลสแกนทีละกล่อง
+@app.post("/api/scan")
+def process_scan(data: ScanData, background_tasks: BackgroundTasks):
+    try:
+        wave_clean = str(int(data.wave_no))
+    except ValueError:
+        raise HTTPException(status_code=400, detail="รหัส Wave ไม่ถูกต้อง")
+
+    lpn_val = (data.lpn or "").strip()
+    branch_val = (data.branch_code or "").strip()
+    branch_name_val = (data.branch_name or "").strip()
+    emp_val = (data.emp_id or "").strip()
+    type_val = (data.type or "").strip()
+    color_val = (data.color or "").strip()
+    try:
+        pallet_no_val = int(data.pallet_no or 0)
+    except (ValueError, TypeError):
+        pallet_no_val = 0
+
+    # Check cache first
+    valid_pairs = get_valid_lpns_for_wave(wave_clean)
+
+    if valid_pairs:
+        if (lpn_val.upper(), branch_val.upper()) not in valid_pairs:
+            print(f"🚫 REJECTED | LPN: {lpn_val} ไม่พบใน Wave {wave_clean} / Branch {branch_val}")
+            raise HTTPException(
+                status_code=400,
+                detail=f"ไม่พบ LPN [{data.lpn}] ใน Wave {wave_clean} สาขา {data.branch_code}"
+            )
+    else:
+        # Fallback to direct query only if cache is empty
+        # ✅ ใช้ query parameters แทนการต่อสตริง
+        check_query = """
+            SELECT COUNT(*) AS found
+            FROM `pro-analytics-db.logistics_db.wave_lpn_detail_record`
+            WHERE SAFE_CAST(REGEXP_REPLACE(TRIM(CAST(Wave_Number AS STRING)), r'[^0-9]', '') AS INT64) = @wave_id
+              AND TRIM(UPPER(CAST(LPN AS STRING))) = @lpn
+              AND TRIM(UPPER(CAST(Branch_Code AS STRING))) = @branch
+        """
+        check_config = bigquery.QueryJobConfig(query_parameters=[
+            bigquery.ScalarQueryParameter("wave_id", "INT64", int(wave_clean)),
+            bigquery.ScalarQueryParameter("lpn", "STRING", lpn_val.upper()),
+            bigquery.ScalarQueryParameter("branch", "STRING", branch_val.upper()),
+        ])
+        try:
+            check_result = client.query(check_query, job_config=check_config).result()
+            found = next(iter(check_result))["found"]
+            if found == 0:
+                print(f"🚫 REJECTED (DB Fallback) | LPN: {lpn_val} ไม่พบใน Wave {wave_clean} / Branch {branch_val}")
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"ไม่พบ LPN [{data.lpn}] ใน Wave {wave_clean} สาขา {data.branch_code}"
+                )
+        except HTTPException:
+            raise
+        except Exception as e:
+            print(f"🚨 CHECK FALLBACK ERROR | LPN: {lpn_val} | Error: {str(e)}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    # PP/SP ใช้ยอดสะสม: ตรวจว่าระหว่างนั้นไม่มีเครื่องอื่นแก้ยอดเดียวกัน
+    # ถ้าค่าเริ่มต้นไม่ตรง ให้ผู้ใช้โหลดค่าล่าสุดแทนการเขียนทับข้อมูลของอีกเครื่อง
+    if data.expected_previous_qty is not None and type_val not in ("RESET_BOX", "CANCEL_COMBINE"):
+        current_data = apply_local_overlay(wave_clean, get_wave_data_internal(wave_clean))
+        current_item = next((item for item in current_data.get("lpn_list", [])
+                             if str(item.get("lpn", "")).strip().upper() == lpn_val.upper()
+                             and str(item.get("branch", "")).strip().upper() == branch_val.upper()), None)
+        current_qty = int((current_item or {}).get("qty") or 0)
+        expected_qty = int(data.expected_previous_qty or 0)
+        if current_qty != expected_qty:
+            raise HTTPException(
+                status_code=409,
+                detail=f"LPN [{lpn_val}] ถูกอีกเครื่องอัปเดตแล้ว (ยอดล่าสุด {current_qty} กล่อง / เครื่องนี้เริ่มจาก {expected_qty}) กรุณารอหน้าจออัปเดตแล้วสแกนใหม่"
+            )
+
+    # ✅ ผ่านการตรวจแล้ว บันทึกลง overlay ในหน่วยความจำทันทีเพื่อให้ผู้ใช้คนอื่นเห็นผลลัพธ์ทันทีโดยไม่ติดดีเลย์ BigQuery
+    record_local_scan(wave_clean, lpn_val, branch_val, data.qty, type_val, color_val, pallet_no_val)
+    # Streaming insert + local overlay เพียงพอ ไม่ยิง BigQuery refresh ต่อท้ายทุก LPN
+
+    print(f"📦 SCAN | Wave: {wave_clean} | LPN: {lpn_val} | Branch: {branch_val} | Emp: {emp_val}")
+
+    # Write to BigQuery using insert_rows_json (Streaming API is near-instant, <100ms)
+    import datetime
+    table_id = "pro-analytics-db.logistics_db.app_scan_transactions"
+    row_to_insert = {
+        "Wave_Number": wave_clean,
+        "LPN": lpn_val,
+        "Scan_Type": type_val,
+        "Color": color_val,
+        "Qty": data.qty,
+        "Timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+        "Branch_Code": branch_val,
+        "Branch_Name": branch_name_val,
+        "Emp_ID": emp_val,
+        "Pallet_No": pallet_no_val
+    }
+
+    try:
+        errors = client.insert_rows_json(client.dataset("logistics_db").table("app_scan_transactions"), [row_to_insert])
+        if errors:
+            print(f"🚨 INSERT ROWS JSON ERROR | LPN: {lpn_val} | Errors: {errors}")
+            raise Exception(f"BigQuery streaming errors: {errors}")
+        print(f"✅ SAVED | LPN: {lpn_val}")
+        return {"status": "success", "message": "Saved"}
+    except Exception as e:
+        print(f"🚨 INSERT FALLBACK TO QUERY | LPN: {lpn_val} | Error: {str(e)}")
+        # Fallback to standard query insert if streaming insert fails for any reason
+        def esc(val):
+            return (val or "").replace("\\", "\\\\").replace("'", "\\'")
+        esc_lpn = esc(lpn_val)
+        esc_branch = esc(branch_val)
+        esc_branch_name = esc(branch_name_val)
+        esc_emp = esc(emp_val)
+        esc_type = esc(type_val)
+        esc_color = esc(color_val)
+        
+        insert_query = f"""
+            INSERT INTO `pro-analytics-db.logistics_db.app_scan_transactions`
+            (`Wave_Number`, `LPN`, `Scan_Type`, `Color`, `Qty`, `Timestamp`, `Branch_Code`, `Branch_Name`, `Emp_ID`, `Pallet_No`)
+            VALUES
+            ('{wave_clean}', '{esc_lpn}', '{esc_type}', '{esc_color}', {data.qty},
+             CURRENT_TIMESTAMP(), '{esc_branch}', '{esc_branch_name}', '{esc_emp}', {pallet_no_val})
+        """
+        try:
+            client.query(insert_query).result()
+            print(f"✅ SAVED (Fallback Query) | LPN: {lpn_val}")
+            return {"status": "success", "message": "Saved"}
+        except Exception as query_err:
+            print(f"🚨 DOUBLE INSERT ERROR | LPN: {lpn_val} | Error: {str(query_err)}")
+            raise HTTPException(status_code=500, detail=str(query_err))
+
+
+# 🚀 [API 2.5] บันทึกข้อมูลสแกนเป็นชุด (Batch)
+@app.post("/api/scan-batch")
+def process_scan_batch(data: ScanBatchData, background_tasks: BackgroundTasks):
+    if not data.scans:
+        return {"status": "success", "message": "No scans to process", "processed_count": 0}
+
+    import datetime
+    table_ref = client.dataset("logistics_db").table("app_scan_transactions")
+    rows_to_insert = []
+    failed_scans = []
+    for item in data.scans:
+        try:
+            wave_clean = str(int(item.wave_no))
+        except ValueError:
+            failed_scans.append({"lpn": item.lpn, "reason": "รหัส Wave ไม่ถูกต้อง"})
+            continue
+
+        lpn_val = (item.lpn or "").strip()
+        branch_val = (item.branch_code or "").strip()
+        branch_name_val = (item.branch_name or "").strip()
+        emp_val = (item.emp_id or "").strip()
+        type_val = (item.type or "").strip()
+        color_val = (item.color or "").strip()
+        try:
+            pallet_no_val = int(item.pallet_no or 0)
+        except (ValueError, TypeError):
+            pallet_no_val = 0
+
+        # Check cache first
+        valid_pairs = get_valid_lpns_for_wave(wave_clean)
+        
+        # If cache has items, perform the check
+        if valid_pairs:
+            if (lpn_val.upper(), branch_val.upper()) not in valid_pairs:
+                print(f"🚫 BATCH REJECTED | LPN: {lpn_val} ไม่พบใน Wave {wave_clean} / Branch {branch_val}")
+                failed_scans.append({"lpn": item.lpn, "reason": f"ไม่พบ LPN ใน Wave/Branch"})
+                continue
+        else:
+            # Fallback to direct query if cache is empty
+            # ✅ ใช้ query parameters แทนการต่อสตริง
+            check_query = """
+                SELECT COUNT(*) AS found
+                FROM `pro-analytics-db.logistics_db.wave_lpn_detail_record`
+                WHERE SAFE_CAST(REGEXP_REPLACE(TRIM(CAST(Wave_Number AS STRING)), r'[^0-9]', '') AS INT64) = @wave_id
+                  AND TRIM(UPPER(CAST(LPN AS STRING))) = @lpn
+                  AND TRIM(UPPER(CAST(Branch_Code AS STRING))) = @branch
+            """
+            check_config = bigquery.QueryJobConfig(query_parameters=[
+                bigquery.ScalarQueryParameter("wave_id", "INT64", int(wave_clean)),
+                bigquery.ScalarQueryParameter("lpn", "STRING", lpn_val.upper()),
+                bigquery.ScalarQueryParameter("branch", "STRING", branch_val.upper()),
+            ])
+            try:
+                check_result = client.query(check_query, job_config=check_config).result()
+                found = next(iter(check_result))["found"]
+                if found == 0:
+                    failed_scans.append({"lpn": item.lpn, "reason": f"ไม่พบ LPN ใน Wave/Branch (Fallback)"})
+                    continue
+            except Exception as e:
+                failed_scans.append({"lpn": item.lpn, "reason": f"Check error: {str(e)}"})
+                continue
+
+        # ✅ ผ่านการตรวจแล้ว บันทึกลง overlay ในหน่วยความจำทันที
+        record_local_scan(wave_clean, lpn_val, branch_val, item.qty, type_val, color_val, pallet_no_val)
+
+        rows_to_insert.append({
+            "Wave_Number": wave_clean,
+            "LPN": lpn_val,
+            "Scan_Type": type_val,
+            "Color": color_val,
+            "Qty": item.qty,
+            "Timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+            "Branch_Code": branch_val,
+            "Branch_Name": branch_name_val,
+            "Emp_ID": emp_val,
+            "Pallet_No": pallet_no_val
+        })
+
+    # Trigger background refreshes
+    # ไม่สร้าง BigQuery query เพิ่มตามจำนวน Wave หลัง batch; overlay ถูกบันทึกไว้แล้ว
+
+    if not rows_to_insert:
+        raise HTTPException(
+            status_code=400,
+            detail={"message": "ไม่มีข้อมูลสแกนที่ผ่านการตรวจสอบ", "errors": failed_scans}
+        )
+
+    try:
+        errors = client.insert_rows_json(table_ref, rows_to_insert)
+        if errors:
+            print(f"🚨 BATCH INSERT ROWS JSON ERROR | Errors: {errors}")
+            raise Exception(f"BigQuery streaming errors: {errors}")
+        
+        print(f"✅ BATCH SAVED | Processed: {len(rows_to_insert)} | Failed: {len(failed_scans)}")
+        return {
+            "status": "success", 
+            "message": "Saved", 
+            "processed_count": len(rows_to_insert), 
+            "failed_count": len(failed_scans),
+            "errors": failed_scans
+        }
+    except Exception as e:
+        print(f"🚨 BATCH INSERT FALLBACK | Error: {str(e)}")
+        # If streaming batch fails, fall back to inserting rows sequentially via query
+        success_count = 0
+        for row in rows_to_insert:
+            def esc(val):
+                return (val or "").replace("\\", "\\\\").replace("'", "\\'")
+            insert_query = f"""
+                INSERT INTO `pro-analytics-db.logistics_db.app_scan_transactions`
+                (`Wave_Number`, `LPN`, `Scan_Type`, `Color`, `Qty`, `Timestamp`, `Branch_Code`, `Branch_Name`, `Emp_ID`, `Pallet_No`)
+                VALUES
+                ('{row["Wave_Number"]}', '{esc(row["LPN"])}', '{esc(row["Scan_Type"])}', '{esc(row["Color"])}', {row["Qty"]},
+                 CURRENT_TIMESTAMP(), '{esc(row["Branch_Code"])}', '{esc(row["Branch_Name"])}', '{esc(row["Emp_ID"])}', {int(row.get("Pallet_No", 0) or 0)})
+            """
+            try:
+                client.query(insert_query).result()
+                success_count += 1
+            except Exception as query_err:
+                print(f"🚨 BATCH FALLBACK SINGLE INSERT ERROR | LPN: {row['LPN']} | Error: {str(query_err)}")
+        
+        return {
+            "status": "partial_success" if success_count > 0 else "failed",
+            "processed_count": success_count,
+            "failed_count": len(rows_to_insert) - success_count + len(failed_scans),
+            "errors": failed_scans
+        }
+
+
+def run_close_job_queries_in_background(wave_clean: str, branch: str, insert_zero_query: str, insert_close_marker: str):
+    try:
+        # Run BQ inserts
+        client.query(insert_zero_query).result()
+        client.query(insert_close_marker).result()
+        # After BQ queries finish, refresh cache
+        get_wave_data_internal(wave_clean, force_refresh=True)
+        print(f"✅ BACKGROUND CLOSE JOB COMPLETE | Wave: {wave_clean} | Branch: {branch}")
+    except Exception as e:
+        print(f"🚨 BACKGROUND CLOSE JOB ERROR | Wave: {wave_clean} | Branch: {branch} | Error: {str(e)}")
+
+
+# 🚀 [API 5] ปิดจบงานสาขา
+@app.post("/api/close-job")
+def close_job(data: CloseJobData, background_tasks: BackgroundTasks):
+    try:
+        wave_clean = str(int(data.wave.strip()))
+    except ValueError:
+        raise HTTPException(status_code=400, detail="รหัส Wave ไม่ถูกต้อง")
+
+    def esc(val):
+        return str(val or "").replace("\\", "\\\\").replace("'", "\\'")
+
+    branch = esc(data.branch.strip().upper())
+    emp_id = esc((data.emp_id or "").strip())
+    completed_at = esc((data.completed_at or "").strip())
+    timestamp_expr = "CURRENT_TIMESTAMP()"
+    if completed_at:
+        timestamp_expr = f"COALESCE(SAFE_CAST('{completed_at}' AS TIMESTAMP), CURRENT_TIMESTAMP())"
+
+    insert_zero_query = f"""
+        INSERT INTO `pro-analytics-db.logistics_db.app_scan_transactions`
+        (`Wave_Number`, `LPN`, `Scan_Type`, `Color`, `Qty`, `Timestamp`)
+        WITH Expected AS (
+            SELECT TRIM(UPPER(CAST(LPN AS STRING))) AS LPN
+            FROM `pro-analytics-db.logistics_db.wave_lpn_detail_record`
+            WHERE SAFE_CAST(REGEXP_REPLACE(TRIM(CAST(Wave_Number AS STRING)), r'[^0-9]', '') AS INT64) = {wave_clean}
+              AND TRIM(UPPER(CAST(Branch_Code AS STRING))) = '{branch}'
+        ),
+        Scanned AS (
+            SELECT TRIM(UPPER(CAST(LPN AS STRING))) AS LPN
+            FROM `pro-analytics-db.logistics_db.app_scan_transactions`
+            WHERE SAFE_CAST(REGEXP_REPLACE(TRIM(CAST(Wave_Number AS STRING)), r'[^0-9]', '') AS INT64) = {wave_clean}
+        )
+        SELECT '{wave_clean}', e.LPN, 'AUTO_NOT_FOUND', 'None', 0, CURRENT_TIMESTAMP()
+        FROM Expected e
+        LEFT JOIN Scanned s ON e.LPN = s.LPN
+        WHERE s.LPN IS NULL
+    """
+
+    insert_close_marker = f"""
+        INSERT INTO `pro-analytics-db.logistics_db.app_scan_transactions`
+        (`Wave_Number`, `LPN`, `Scan_Type`, `Color`, `Qty`, `Timestamp`, `Branch_Code`, `Emp_ID`)
+        VALUES ('{wave_clean}', 'BRANCH_{branch}', 'CLOSE_JOB', 'None', 0, {timestamp_expr}, '{branch}', '{emp_id}')
+    """
+
+    record_shared_branch_closed(wave_clean, branch, completed_at, emp_id)
+
+    # ตอบกลับทันที: งาน BigQuery ทั้งหมดทำเบื้องหลัง ไม่ query ซ้ำใน request ปิดสาขา
+    background_tasks.add_task(
+        run_close_job_queries_in_background,
+        wave_clean,
+        branch,
+        insert_zero_query,
+        insert_close_marker
+    )
+
+    return {
+        "status": "success",
+        "message": f"ปิดจบงานสาขา {branch} และบันทึกยอด 0 ให้กล่องที่ค้างสำเร็จ! (ระบบกำลังบันทึกเบื้องหลัง)",
+        "completed_at": data.completed_at
+    }
+
+
+def query_pending_waves_from_bigquery():
+    query = """
+        WITH Waves AS (
+            SELECT DISTINCT
+                SAFE_CAST(REGEXP_REPLACE(TRIM(CAST(Wave_Number AS STRING)), r'[^0-9]', '') AS INT64) AS Wave_ID
+            FROM `pro-analytics-db.logistics_db.wave_lpn_detail_record`
+            WHERE Wave_Number IS NOT NULL
+              AND TRIM(CAST(Wave_Number AS STRING)) != ''
+        )
+        SELECT LPAD(CAST(Wave_ID AS STRING), 10, '0') AS Wave_Number
+        FROM Waves
+        WHERE Wave_ID IS NOT NULL
+        ORDER BY Wave_ID DESC
+        LIMIT 50
+    """
+    query_job = client.query(
+        query,
+        job_config=bigquery.QueryJobConfig(use_query_cache=True)
+    )
+    results = query_job.result(timeout=BQ_JOB_TIMEOUT_SECONDS)
+    waves = [{"wave_no": str(row["Wave_Number"]).strip()} for row in results]
+    return {"success": True, "waves": waves, "cached": False}
+
+
+def _startup_warm_cache():
+    """ดึงรายการ Wave ล่วงหน้าตอน startup เพื่อให้พร้อมใช้งานทันที"""
+    try:
+        data = query_pending_waves_from_bigquery()
+        with pending_waves_cache_lock:
+            pending_waves_cache["data"] = data
+            pending_waves_cache["expires_at"] = time.time() + PENDING_WAVES_CACHE_TTL_SECONDS
+        print("✅ Startup cache warm-up complete")
+    except Exception as e:
+        print(f"⚠️ Startup cache warm-up failed (non-critical): {e}")
+
+
+@app.on_event("startup")
+async def startup_event():
+    """Pre-warm cache ตอน server เริ่มทำงาน เพื่อให้ response เร็วตั้งแต่ request แรก"""
+    import threading
+    threading.Thread(target=_startup_warm_cache, daemon=True).start()
+
+def run_pending_waves_refresh_in_background():
+    global is_refreshing_pending_waves
+    try:
+        data = query_pending_waves_from_bigquery()
+        with pending_waves_cache_lock:
+            pending_waves_cache["data"] = data
+            pending_waves_cache["expires_at"] = time.time() + PENDING_WAVES_CACHE_TTL_SECONDS
+    except Exception as e:
+        print(f"🚨 Background refresh pending waves error: {e}")
+    finally:
+        with is_refreshing_pending_waves_lock:
+            is_refreshing_pending_waves = False
+
+# 🚀 [API] โหลดรายการ Wave
+@app.get("/api/pending-waves")
+def get_pending_waves(background_tasks: BackgroundTasks, force: bool = False):
+    now = time.time()
+    with pending_waves_cache_lock:
+        cached_data = pending_waves_cache["data"]
+        is_fresh = pending_waves_cache["expires_at"] > now
+
+    if cached_data and not force:
+        response = {**cached_data, "cached": True, "stale": not is_fresh}
+        if not is_fresh:
+            should_spawn = False
+            with is_refreshing_pending_waves_lock:
+                if not is_refreshing_pending_waves:
+                    is_refreshing_pending_waves = True
+                    should_spawn = True
+            if should_spawn:
+                background_tasks.add_task(run_pending_waves_refresh_in_background)
+        return response
+
+    # Force load or no cache
+    with is_refreshing_pending_waves_lock:
+        is_refreshing_pending_waves = True
+    try:
+        data = query_pending_waves_from_bigquery()
+        with pending_waves_cache_lock:
+            pending_waves_cache["data"] = data
+            pending_waves_cache["expires_at"] = time.time() + PENDING_WAVES_CACHE_TTL_SECONDS
+        return data
+    except Exception as e:
+        if cached_data:
+            return {**cached_data, "cached": True, "stale": True, "error": str(e)}
+        return {"success": False, "error": str(e)}
+    finally:
+        with is_refreshing_pending_waves_lock:
+            is_refreshing_pending_waves = False
+
+
+# 🔍 [DEBUG] ตรวจการคำนวณจำนวนกล่องของ PP/SP รายตัว (read-only)
+# ใช้หาสาเหตุ "SP นับไม่ตรง": ดูว่าแต่ละบรรทัดสินค้าใน LPN เจอใน pack_case_map ไหม,
+# case_count เท่าไหร่, total_pieces เท่าไหร่, และใช้กติกา (A/B/C) ตัวไหนคำนวณ
+@app.get("/api/debug-carton")
+def debug_carton(wave_no: str, lpn: str):
+    try:
+        search_wave_id = int(wave_no.strip())
+    except ValueError:
+        raise HTTPException(status_code=400, detail="รหัส Wave ต้องเป็นตัวเลขเท่านั้น")
+
+    lpn_target = lpn.strip().upper()
+    wave_detail_str = f"{search_wave_id:010d}"
+
+    query = """
+        SELECT
+            TRIM(CAST(d.Owner AS STRING)) AS owner,
+            TRIM(CAST(d.Product_Code AS STRING)) AS product_code,
+            d.Total_Pieces AS total_pieces,
+            d.Total_Qty AS row_total_qty
+        FROM `pro-analytics-db.logistics_db.wave_lpn_detail_record` AS d
+        WHERE SAFE_CAST(REGEXP_REPLACE(TRIM(CAST(d.Wave_Number AS STRING)), r'[^0-9]', '') AS INT64) = @wave_id
+          AND TRIM(UPPER(CAST(d.LPN AS STRING))) = @lpn
+    """
+    config = bigquery.QueryJobConfig(
+        use_query_cache=True,
+        query_parameters=[
+            bigquery.ScalarQueryParameter("wave_id", "INT64", search_wave_id),
+            bigquery.ScalarQueryParameter("lpn", "STRING", lpn_target),
+        ],
+    )
+
+    try:
+        rows = list(client.query(query, job_config=config).result(timeout=BQ_JOB_TIMEOUT_SECONDS))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    if not rows:
+        raise HTTPException(status_code=404, detail=f"ไม่พบ LPN [{lpn_target}] ใน Wave [{search_wave_id}]")
+
+    pack_case_map = load_pack_case_map()
+    breakdown = []
+    total_qty = 0
+    for r in rows:
+        owner = str(get_row_value(r, "owner", "") or "").strip().upper()
+        product_code = str(get_row_value(r, "product_code", "") or "").strip().upper()
+        pieces = to_float(get_row_value(r, "total_pieces", 0))
+        row_total_qty = to_float(get_row_value(r, "row_total_qty", 0))
+        key = f"{owner}|{product_code}"
+        case_count = pack_case_map.get(key) or pack_case_map.get(product_code)
+
+        if case_count and pieces > 0:
+            cartons = max(1, int(math.ceil(pieces / case_count)))
+            rule = "A: ceil(total_pieces / case_count)"
+        elif row_total_qty > 0:
+            cartons = max(1, int(math.ceil(row_total_qty)))
+            rule = "B: fallback ceil(row_total_qty)"
+        else:
+            cartons = 1
+            rule = "C: default 1"
+        total_qty += cartons
+
+        breakdown.append({
+            "owner": owner,
+            "product_code": product_code,
+            "pack_case_map_key": key,
+            "in_pack_case_map": case_count is not None,
+            "case_count": case_count,
+            "total_pieces": pieces,
+            "row_total_qty": row_total_qty,
+            "cartons_counted": cartons,
+            "rule_used": rule,
+        })
+
+    return {
+        "wave_no": wave_detail_str,
+        "lpn": lpn_target,
+        "is_direct_qty_prefix": is_direct_qty_lpn_value(lpn_target),
+        "detail_row_count": len(rows),
+        "computed_total_qty": total_qty if total_qty > 0 else 1,
+        "rows": breakdown,
+    }

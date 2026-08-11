@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: dc-scanner-api-nattapol
+    runtime: python
+    plan: free
+    region: singapore
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT --workers 1
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      - key: GOOGLE_CLOUD_PROJECT
+        value: pro-analytics-db
+      - key: GOOGLE_APPLICATION_CREDENTIALS
+        value: /etc/secrets/bq-key.json
