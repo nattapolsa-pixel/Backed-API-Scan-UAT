@@ -290,6 +290,12 @@ booking_waves_cache_lock = Lock()
 # Key: wave_clean -> {(lpn_upper, branch_upper): latest scan state including qty/color/pallet_no}
 local_scans_overlay = {}
 local_scans_lock = Lock()
+processed_transaction_ids = {}
+processed_transaction_lock = Lock()
+device_pending_states = {}
+device_pending_states_lock = Lock()
+TRANSACTION_TTL_SECONDS = 86400
+DEVICE_STATE_TTL_SECONDS = 90
 pallet_allocation_lock = Lock()
 pallet_counter_cache = {}
 pallet_shared_state = {}
@@ -955,6 +961,7 @@ class ScanData(BaseModel):
     emp_id: Optional[str] = None
     pallet_no: Optional[int] = 0   # ✅ เลขพาเลทที่ LPN นี้อยู่ (sync ข้ามเครื่อง)
     expected_previous_qty: Optional[int] = None  # optimistic concurrency: กันหลายเครื่องเขียน LPN เดียวกันทับกัน
+    transaction_id: Optional[str] = None  # idempotency key จากเครื่องสแกน ป้องกัน request สำเร็จแต่ response หลุดแล้วบันทึกซ้ำ
 
 ScanData.model_rebuild()   # ← เพิ่มบรรทัดนี้
 
@@ -962,6 +969,14 @@ class ScanBatchData(BaseModel):
     scans: List[ScanData]
 
 ScanBatchData.model_rebuild()
+
+class DeviceStateData(BaseModel):
+    device_id: str
+    waves: List[str] = []
+    branch_code: Optional[str] = None
+    pending_count: int = 0
+    pending_lpns: List[str] = []
+    emp_id: Optional[str] = None
 
 
 class CombineData(BaseModel):
@@ -1019,7 +1034,62 @@ async def read_root():
 # ✅ Health Check Endpoint: ตอบสนองเร็ว <5ms สำหรับ keep-alive heartbeat
 @app.get("/api/health")
 async def health_check():
-    return {"status": "ok", "timestamp": time.time()}
+    return {"status": "ok", "version": "1.3.4", "timestamp": time.time()}
+
+def transaction_already_processed(transaction_id: str) -> bool:
+    tx_id = str(transaction_id or "").strip()
+    if not tx_id:
+        return False
+    now = time.time()
+    with processed_transaction_lock:
+        expired = [key for key, saved_at in processed_transaction_ids.items() if now - saved_at > TRANSACTION_TTL_SECONDS]
+        for key in expired:
+            processed_transaction_ids.pop(key, None)
+        return tx_id in processed_transaction_ids
+
+def mark_transaction_processed(transaction_id: str):
+    tx_id = str(transaction_id or "").strip()
+    if tx_id:
+        with processed_transaction_lock:
+            processed_transaction_ids[tx_id] = time.time()
+
+@app.post("/api/device-state")
+def update_device_state(data: DeviceStateData):
+    device_id = str(data.device_id or "").strip()
+    if not device_id:
+        raise HTTPException(status_code=400, detail="device_id is required")
+    waves = sorted({str(int(str(wave).strip())) for wave in data.waves if str(wave).strip().isdigit()})
+    with device_pending_states_lock:
+        device_pending_states[device_id] = {
+            "device_id": device_id,
+            "waves": waves,
+            "branch_code": str(data.branch_code or "").strip().upper(),
+            "pending_count": max(0, int(data.pending_count or 0)),
+            "pending_lpns": [str(lpn).strip().upper() for lpn in data.pending_lpns[:10] if str(lpn).strip()],
+            "emp_id": str(data.emp_id or "").strip(),
+            "updated_at": time.time(),
+        }
+    return {"status": "success"}
+
+@app.get("/api/device-states")
+def get_device_states(waves: str = "", branch_code: str = "", exclude_device_id: str = ""):
+    requested = {str(int(part.strip())) for part in waves.split(",") if part.strip().isdigit()}
+    requested_branch = str(branch_code or "").strip().upper()
+    now = time.time()
+    active = []
+    with device_pending_states_lock:
+        expired = [key for key, state in device_pending_states.items() if now - state.get("updated_at", 0) > DEVICE_STATE_TTL_SECONDS]
+        for key in expired:
+            device_pending_states.pop(key, None)
+        for state in device_pending_states.values():
+            if state["device_id"] == exclude_device_id or state["pending_count"] <= 0:
+                continue
+            if requested_branch and state["branch_code"] != requested_branch:
+                continue
+            if requested and not requested.intersection(state["waves"]):
+                continue
+            active.append(dict(state))
+    return {"status": "success", "devices": active}
 
 # 🚀 [API 1] โหลดข้อมูล Wave
 # 🚀 [API 1] โหลดข้อมูล Wave
@@ -1328,6 +1398,9 @@ def process_scan(data: ScanData, background_tasks: BackgroundTasks):
     emp_val = (data.emp_id or "").strip()
     type_val = (data.type or "").strip()
     color_val = (data.color or "").strip()
+    transaction_id = (data.transaction_id or "").strip()
+    if transaction_already_processed(transaction_id):
+        return {"status": "success", "message": "Already saved", "duplicate": True}
     try:
         pallet_no_val = int(data.pallet_no or 0)
     except (ValueError, TypeError):
@@ -1388,10 +1461,6 @@ def process_scan(data: ScanData, background_tasks: BackgroundTasks):
                 detail=f"LPN [{lpn_val}] ถูกอีกเครื่องอัปเดตแล้ว (ยอดล่าสุด {current_qty} กล่อง / เครื่องนี้เริ่มจาก {expected_qty}) กรุณารอหน้าจออัปเดตแล้วสแกนใหม่"
             )
 
-    # ✅ ผ่านการตรวจแล้ว บันทึกลง overlay ในหน่วยความจำทันทีเพื่อให้ผู้ใช้คนอื่นเห็นผลลัพธ์ทันทีโดยไม่ติดดีเลย์ BigQuery
-    record_local_scan(wave_clean, lpn_val, branch_val, data.qty, type_val, color_val, pallet_no_val)
-    # Streaming insert + local overlay เพียงพอ ไม่ยิง BigQuery refresh ต่อท้ายทุก LPN
-
     print(f"📦 SCAN | Wave: {wave_clean} | LPN: {lpn_val} | Branch: {branch_val} | Emp: {emp_val}")
 
     # Write to BigQuery using insert_rows_json (Streaming API is near-instant, <100ms)
@@ -1411,10 +1480,13 @@ def process_scan(data: ScanData, background_tasks: BackgroundTasks):
     }
 
     try:
-        errors = client.insert_rows_json(client.dataset("logistics_db").table("app_scan_transactions"), [row_to_insert])
+        insert_kwargs = {"row_ids": [transaction_id]} if transaction_id else {}
+        errors = client.insert_rows_json(client.dataset("logistics_db").table("app_scan_transactions"), [row_to_insert], **insert_kwargs)
         if errors:
             print(f"🚨 INSERT ROWS JSON ERROR | LPN: {lpn_val} | Errors: {errors}")
             raise Exception(f"BigQuery streaming errors: {errors}")
+        mark_transaction_processed(transaction_id)
+        record_local_scan(wave_clean, lpn_val, branch_val, data.qty, type_val, color_val, pallet_no_val)
         print(f"✅ SAVED | LPN: {lpn_val}")
         return {"status": "success", "message": "Saved"}
     except Exception as e:
@@ -1438,6 +1510,8 @@ def process_scan(data: ScanData, background_tasks: BackgroundTasks):
         """
         try:
             client.query(insert_query).result()
+            mark_transaction_processed(transaction_id)
+            record_local_scan(wave_clean, lpn_val, branch_val, data.qty, type_val, color_val, pallet_no_val)
             print(f"✅ SAVED (Fallback Query) | LPN: {lpn_val}")
             return {"status": "success", "message": "Saved"}
         except Exception as query_err:
@@ -1454,8 +1528,12 @@ def process_scan_batch(data: ScanBatchData, background_tasks: BackgroundTasks):
     import datetime
     table_ref = client.dataset("logistics_db").table("app_scan_transactions")
     rows_to_insert = []
+    accepted_scans = []
+    row_ids = []
     failed_scans = []
     for item in data.scans:
+        if transaction_already_processed(item.transaction_id or ""):
+            continue
         try:
             wave_clean = str(int(item.wave_no))
         except ValueError:
@@ -1507,9 +1585,6 @@ def process_scan_batch(data: ScanBatchData, background_tasks: BackgroundTasks):
                 failed_scans.append({"lpn": item.lpn, "reason": f"Check error: {str(e)}"})
                 continue
 
-        # ✅ ผ่านการตรวจแล้ว บันทึกลง overlay ในหน่วยความจำทันที
-        record_local_scan(wave_clean, lpn_val, branch_val, item.qty, type_val, color_val, pallet_no_val)
-
         rows_to_insert.append({
             "Wave_Number": wave_clean,
             "LPN": lpn_val,
@@ -1522,6 +1597,8 @@ def process_scan_batch(data: ScanBatchData, background_tasks: BackgroundTasks):
             "Emp_ID": emp_val,
             "Pallet_No": pallet_no_val
         })
+        accepted_scans.append((wave_clean, lpn_val, branch_val, item.qty, type_val, color_val, pallet_no_val, (item.transaction_id or "").strip()))
+        row_ids.append((item.transaction_id or "").strip() or str(uuid.uuid4()))
 
     # Trigger background refreshes
     # ไม่สร้าง BigQuery query เพิ่มตามจำนวน Wave หลัง batch; overlay ถูกบันทึกไว้แล้ว
@@ -1533,10 +1610,13 @@ def process_scan_batch(data: ScanBatchData, background_tasks: BackgroundTasks):
         )
 
     try:
-        errors = client.insert_rows_json(table_ref, rows_to_insert)
+        errors = client.insert_rows_json(table_ref, rows_to_insert, row_ids=row_ids)
         if errors:
             print(f"🚨 BATCH INSERT ROWS JSON ERROR | Errors: {errors}")
             raise Exception(f"BigQuery streaming errors: {errors}")
+        for scan in accepted_scans:
+            record_local_scan(*scan[:7])
+            mark_transaction_processed(scan[7])
         
         print(f"✅ BATCH SAVED | Processed: {len(rows_to_insert)} | Failed: {len(failed_scans)}")
         return {
@@ -1550,7 +1630,7 @@ def process_scan_batch(data: ScanBatchData, background_tasks: BackgroundTasks):
         print(f"🚨 BATCH INSERT FALLBACK | Error: {str(e)}")
         # If streaming batch fails, fall back to inserting rows sequentially via query
         success_count = 0
-        for row in rows_to_insert:
+        for row, scan in zip(rows_to_insert, accepted_scans):
             def esc(val):
                 return (val or "").replace("\\", "\\\\").replace("'", "\\'")
             insert_query = f"""
@@ -1562,6 +1642,8 @@ def process_scan_batch(data: ScanBatchData, background_tasks: BackgroundTasks):
             """
             try:
                 client.query(insert_query).result()
+                record_local_scan(*scan[:7])
+                mark_transaction_processed(scan[7])
                 success_count += 1
             except Exception as query_err:
                 print(f"🚨 BATCH FALLBACK SINGLE INSERT ERROR | LPN: {row['LPN']} | Error: {str(query_err)}")
