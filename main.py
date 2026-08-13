@@ -1193,6 +1193,41 @@ def preview_booking_branch(wave_no: str, branch_code: str):
         "closed_at": next((item.get("branch_closed_at") for item in items if item.get("branch_closed_at")), "")
     }
 
+@app.get("/api/wave-branch-options")
+def get_wave_branch_options(wave_no: str):
+    wave_clean = str(int(str(wave_no).strip()))
+    data = apply_local_overlay(wave_clean, get_wave_data_internal(wave_clean, force_refresh=True))
+    assignments = get_booking_branch_assignments()
+    grouped = {}
+    for item in data.get("lpn_list", []):
+        branch = str(item.get("branch") or "").strip().upper()
+        if not branch:
+            continue
+        row = grouped.setdefault(branch, {
+            "branch_code": branch, "branch_name": item.get("branch_name") or "Unknown",
+            "lpn_total": 0, "lpn_scanned": 0, "box_qty": 0, "pallet_nos": set(),
+            "closed_at": item.get("branch_closed_at") or ""
+        })
+        row["lpn_total"] += 1
+        if item.get("status") == "Scanned":
+            row["lpn_scanned"] += 1
+            row["box_qty"] += int(item.get("qty") or 0)
+            pallet_no = int(item.get("pallet_no") or 0)
+            if pallet_no > 0:
+                row["pallet_nos"].add(pallet_no)
+        if item.get("branch_closed_at"):
+            row["closed_at"] = item.get("branch_closed_at")
+    native_booking = str(data.get("booking_no") or "").strip().upper()
+    options = []
+    for branch, row in grouped.items():
+        assignment = assignments.get((wave_clean, branch))
+        row["current_booking"] = str((assignment or {}).get("Assigned_Booking") or native_booking).strip().upper()
+        row["pallet_count"] = len(row.pop("pallet_nos"))
+        row["is_closed"] = bool(row["closed_at"])
+        options.append(row)
+    options.sort(key=lambda item: item["branch_code"])
+    return {"status": "success", "wave_no": wave_clean, "branches": options}
+
 @app.post("/api/move-booking-branch")
 def move_booking_branch(data: BookingBranchMoveData):
     target = str(data.target_booking or "").strip().upper()
