@@ -907,7 +907,11 @@ def get_booking_waves_mapping(booking_no: str, force_refresh: bool = False) -> d
 
 def get_booking_data_internal(booking_no: str, force_refresh: bool = False) -> dict:
     mapping = get_booking_waves_mapping(booking_no, force_refresh)
-    waves = mapping["waves"]
+    booking_clean = booking_no.strip().upper()
+    assignments = get_booking_branch_assignments()
+    override_waves = [wave for (wave, branch), move in assignments.items()
+                      if str(move.get("Assigned_Booking") or "").strip().upper() == booking_clean]
+    waves = list(dict.fromkeys(list(mapping["waves"]) + override_waves))
     license_plate = mapping["license_plate"]
     
     lpn_list = []
@@ -928,7 +932,22 @@ def get_booking_data_internal(booking_no: str, force_refresh: bool = False) -> d
                 raise
                 
     for wave_data_overlaid in wave_results:
-        lpn_list.extend(wave_data_overlaid.get("lpn_list", []))
+        wave_key = str(int(str(wave_data_overlaid["wave_no"]).strip()))
+        for item in wave_data_overlaid.get("lpn_list", []):
+            assignment = assignments.get((wave_key, str(item.get("branch") or "").strip().upper()))
+            assigned_booking = str((assignment or {}).get("Assigned_Booking") or "").strip().upper()
+            native_booking = str(wave_data_overlaid.get("booking_no") or "").strip().upper()
+            effective_booking = assigned_booking or native_booking
+            if effective_booking == booking_clean:
+                if assignment:
+                    item["booking_override"] = {
+                        "previous_booking": assignment.get("Previous_Booking") or native_booking,
+                        "assigned_booking": assignment.get("Assigned_Booking") or booking_clean,
+                        "reason": assignment.get("Reason") or "",
+                        "emp_id": assignment.get("Emp_ID") or "",
+                        "created_at": assignment.get("Created_At").isoformat() if assignment.get("Created_At") else ""
+                    }
+                lpn_list.append(item)
         waves_included.add(wave_data_overlaid["wave_no"])
         
     zones_calc = {}
@@ -1025,6 +1044,40 @@ class CorrectionData(BaseModel):
     scan_type: Optional[str] = "Carton"
     color: Optional[str] = "None"
 
+class BookingBranchMoveData(BaseModel):
+    target_booking: str
+    wave_no: str
+    branch_code: str
+    reason: str
+    note: Optional[str] = None
+    emp_id: str
+
+def ensure_booking_override_table():
+    client.query("""
+        CREATE TABLE IF NOT EXISTS `pro-analytics-db.logistics_db.booking_branch_overrides` (
+            Event_ID STRING, Wave_Number STRING, Branch_Code STRING,
+            Previous_Booking STRING, Assigned_Booking STRING,
+            Reason STRING, Note STRING, Emp_ID STRING, Created_At TIMESTAMP
+        )
+    """).result(timeout=BQ_JOB_TIMEOUT_SECONDS)
+
+def get_booking_branch_assignments() -> dict:
+    try:
+        ensure_booking_override_table()
+        rows = client.query("""
+            SELECT Wave_Number, Branch_Code, Previous_Booking, Assigned_Booking,
+                   Reason, Note, Emp_ID, Created_At
+            FROM `pro-analytics-db.logistics_db.booking_branch_overrides`
+            QUALIFY ROW_NUMBER() OVER (
+                PARTITION BY TRIM(Wave_Number), UPPER(TRIM(Branch_Code))
+                ORDER BY Created_At DESC, Event_ID DESC
+            ) = 1
+        """).result(timeout=BQ_JOB_TIMEOUT_SECONDS)
+        return {(str(row["Wave_Number"]).strip(), str(row["Branch_Code"]).strip().upper()): dict(row.items()) for row in rows}
+    except Exception as exc:
+        print(f"BOOKING OVERRIDE READ ERROR: {exc}")
+        return {}
+
 # ==================== ROUTES & APIs ====================
 
 @app.get("/")
@@ -1118,6 +1171,64 @@ def check_booking(booking_no: str, force: bool = False):
     except Exception as e:
         print(f"🚨 CHECK BOOKING ERROR: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/booking-branch-preview")
+def preview_booking_branch(wave_no: str, branch_code: str):
+    wave_clean = str(int(str(wave_no).strip()))
+    branch = str(branch_code or "").strip().upper()
+    data = apply_local_overlay(wave_clean, get_wave_data_internal(wave_clean, force_refresh=True))
+    items = [item for item in data.get("lpn_list", []) if str(item.get("branch") or "").strip().upper() == branch]
+    if not items:
+        raise HTTPException(status_code=404, detail=f"ไม่พบสาขา {branch} ใน Wave {wave_clean}")
+    assignments = get_booking_branch_assignments()
+    assignment = assignments.get((wave_clean, branch))
+    current_booking = str((assignment or {}).get("Assigned_Booking") or data.get("booking_no") or "").strip().upper()
+    scanned = [item for item in items if item.get("status") == "Scanned"]
+    return {
+        "status": "success", "wave_no": wave_clean, "branch_code": branch,
+        "branch_name": items[0].get("branch_name") or "Unknown",
+        "current_booking": current_booking, "lpn_total": len(items),
+        "lpn_scanned": len(scanned), "box_qty": sum(int(item.get("qty") or 0) for item in scanned),
+        "pallet_count": len({int(item.get("pallet_no") or 0) for item in scanned if int(item.get("pallet_no") or 0) > 0}),
+        "closed_at": next((item.get("branch_closed_at") for item in items if item.get("branch_closed_at")), "")
+    }
+
+@app.post("/api/move-booking-branch")
+def move_booking_branch(data: BookingBranchMoveData):
+    target = str(data.target_booking or "").strip().upper()
+    wave_clean = str(int(str(data.wave_no).strip()))
+    branch = str(data.branch_code or "").strip().upper()
+    reason = str(data.reason or "").strip()
+    emp_id = str(data.emp_id or "").strip()
+    if not target or not branch or not reason or not emp_id:
+        raise HTTPException(status_code=400, detail="กรุณาระบุ Booking, สาขา, เหตุผล และผู้ดำเนินการให้ครบ")
+    preview = preview_booking_branch(wave_clean, branch)
+    previous = str(preview.get("current_booking") or "").strip().upper()
+    if previous == target:
+        raise HTTPException(status_code=409, detail=f"สาขา {branch} อยู่ใน Booking {target} แล้ว")
+    # ปลายทางต้องเป็น Booking จริงที่มีอยู่ เพื่อป้องกันพิมพ์ผิดแล้วสาขาหายจากเอกสาร
+    get_booking_waves_mapping(target, force_refresh=True)
+    ensure_booking_override_table()
+    query = """
+        INSERT INTO `pro-analytics-db.logistics_db.booking_branch_overrides`
+        (Event_ID, Wave_Number, Branch_Code, Previous_Booking, Assigned_Booking, Reason, Note, Emp_ID, Created_At)
+        VALUES (@event_id, @wave, @branch, @previous, @target, @reason, @note, @emp_id, CURRENT_TIMESTAMP())
+    """
+    config = bigquery.QueryJobConfig(query_parameters=[
+        bigquery.ScalarQueryParameter("event_id", "STRING", str(uuid.uuid4())),
+        bigquery.ScalarQueryParameter("wave", "STRING", wave_clean),
+        bigquery.ScalarQueryParameter("branch", "STRING", branch),
+        bigquery.ScalarQueryParameter("previous", "STRING", previous),
+        bigquery.ScalarQueryParameter("target", "STRING", target),
+        bigquery.ScalarQueryParameter("reason", "STRING", reason),
+        bigquery.ScalarQueryParameter("note", "STRING", str(data.note or "").strip()),
+        bigquery.ScalarQueryParameter("emp_id", "STRING", emp_id),
+    ])
+    client.query(query, job_config=config).result(timeout=BQ_JOB_TIMEOUT_SECONDS)
+    with booking_waves_cache_lock:
+        booking_waves_cache.pop(previous, None)
+        booking_waves_cache.pop(target, None)
+    return {"status": "success", "message": "ย้ายสาขาเรียบร้อย", "previous_booking": previous, "target_booking": target, "preview": preview}
 
 @app.post("/api/start-pallet")
 def start_pallet(data: PalletStartData):
