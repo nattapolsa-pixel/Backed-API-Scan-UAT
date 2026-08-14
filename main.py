@@ -342,7 +342,7 @@ def record_shared_branch_closed(wave_no: str, branch_code: str, completed_at: st
         branch_state["closed_by"] = str(emp_id or "").strip()
         branch_state["updated_at"] = time.time()
 
-def record_local_scan(wave_no: str, lpn: str, branch_code: str, qty: int, scan_type: str, color: str, pallet_no: int = 0):
+def record_local_scan(wave_no: str, lpn: str, branch_code: str, qty: int, scan_type: str, color: str, pallet_no: int = 0, base_pallet_breakdown=None):
     try:
         wave_clean = str(int(wave_no.strip()))
     except ValueError:
@@ -369,6 +369,7 @@ def record_local_scan(wave_no: str, lpn: str, branch_code: str, qty: int, scan_t
                 "scan_type": scan_type,
                 "color": color,
                 "color_breakdown": [],
+                "pallet_breakdown": [],
                 "status": status,
                 "pallet_no": 0,
                 "timestamp": time.time()
@@ -376,26 +377,27 @@ def record_local_scan(wave_no: str, lpn: str, branch_code: str, qty: int, scan_t
             return
 
         current = local_scans_overlay[wave_clean].get(lpn_key, {})
-        breakdown_map = {}
-        for part in current.get("color_breakdown", []):
-            part_color = str(part.get("color", "")).strip()
-            part_qty = int(part.get("qty", 0) or 0)
-            if part_color and part_qty > 0:
-                breakdown_map[part_color.upper()] = {
-                    "color": part_color,
-                    "qty": part_qty,
-                    "type": part.get("type") or part.get("scan_type") or current.get("scan_type") or "TOTE"
-                }
-
-        breakdown_map[color.upper()] = {"color": color, "qty": qty, "type": scan_type}
-        color_breakdown = list(breakdown_map.values())
-        total_qty = sum(part["qty"] for part in color_breakdown)
+        pallet_parts = list(current.get("pallet_breakdown") or base_pallet_breakdown or [])
+        if not pallet_parts and int(current.get("qty", 0) or 0) > 0:
+            pallet_parts = [{"pallet_no": int(current.get("pallet_no", 0) or 0), "color": current.get("color") or "None", "qty": int(current.get("qty") or 0), "type": current.get("scan_type") or "TOTE"}]
+        part_key = (int(pallet_no or 0), color.upper())
+        pallet_map = {(int(part.get("pallet_no", 0) or 0), str(part.get("color") or "None").upper()): part for part in pallet_parts}
+        pallet_map[part_key] = {"pallet_no": int(pallet_no or 0), "color": color, "qty": qty, "type": scan_type}
+        pallet_breakdown = list(pallet_map.values())
+        color_map = {}
+        for part in pallet_breakdown:
+            color_key = str(part.get("color") or "None").upper()
+            aggregate = color_map.setdefault(color_key, {"color": part.get("color") or "None", "qty": 0, "type": part.get("type") or "TOTE"})
+            aggregate["qty"] += int(part.get("qty", 0) or 0)
+        color_breakdown = list(color_map.values())
+        total_qty = sum(int(part.get("qty", 0) or 0) for part in pallet_breakdown)
 
         local_scans_overlay[wave_clean][lpn_key] = {
             "qty": total_qty,
             "scan_type": scan_type if len(color_breakdown) == 1 else "TOTE_MULTI",
             "color": color if len(color_breakdown) == 1 else "Multiple",
             "color_breakdown": color_breakdown,
+            "pallet_breakdown": pallet_breakdown,
             "status": status,
             "pallet_no": int(pallet_no or 0),
             "timestamp": time.time()
@@ -428,6 +430,7 @@ def apply_local_overlay(wave_detail_str: str, raw_data: dict) -> dict:
             item["scan_type"] = scan_info["scan_type"]
             item["color"] = scan_info["color"]
             item["color_breakdown"] = scan_info.get("color_breakdown", [])
+            item["pallet_breakdown"] = scan_info.get("pallet_breakdown", [])
             item["pallet_no"] = int(scan_info.get("pallet_no", 0) or 0)
 
         branch = str(item.get("branch") or "").strip().upper()
@@ -479,17 +482,18 @@ def fetch_wave_data_from_bq(search_wave_id: int) -> dict:
             WHERE SAFE_CAST(REGEXP_REPLACE(TRIM(CAST(Wave_Number AS STRING)), r'[^0-9]', '') AS INT64) = {search_wave_id}
         ),
         LatestReset AS (
-            SELECT Scan_Wave_ID, Clean_LPN, MAX(Timestamp) AS Reset_Timestamp
+            SELECT Scan_Wave_ID, Clean_LPN, Scan_Branch, MAX(Timestamp) AS Reset_Timestamp
             FROM ScanRows
             WHERE Is_Reset = 1
-            GROUP BY Scan_Wave_ID, Clean_LPN
+            GROUP BY Scan_Wave_ID, Clean_LPN, Scan_Branch
         ),
         ValidScanRows AS (
             SELECT r.*
             FROM ScanRows AS r
             LEFT JOIN LatestReset AS lr
-              ON r.Scan_Wave_ID = lr.Scan_Wave_ID
+             ON r.Scan_Wave_ID = lr.Scan_Wave_ID
              AND r.Clean_LPN = lr.Clean_LPN
+             AND r.Scan_Branch = lr.Scan_Branch
             WHERE r.Is_Reset = 0
               AND IFNULL(r.Qty, 0) > 0
               AND (lr.Reset_Timestamp IS NULL OR r.Timestamp > lr.Reset_Timestamp)
@@ -500,7 +504,7 @@ def fetch_wave_data_from_bq(search_wave_id: int) -> dict:
                 SELECT
                     *,
                     ROW_NUMBER() OVER (
-                        PARTITION BY Scan_Wave_ID, Clean_LPN, UPPER(IFNULL(Color, 'None'))
+                        PARTITION BY Scan_Wave_ID, Clean_LPN, Scan_Branch, Pallet_No, UPPER(IFNULL(Color, 'None'))
                         ORDER BY Timestamp DESC, Qty DESC
                     ) AS rn
                 FROM ValidScanRows
@@ -511,13 +515,15 @@ def fetch_wave_data_from_bq(search_wave_id: int) -> dict:
             SELECT
                 Scan_Wave_ID,
                 Clean_LPN,
+                Scan_Branch,
                 SUM(Qty) AS Scanned_Qty,
                 MAX(Pallet_No) AS Scanned_Pallet_No,
                 ARRAY_AGG(Scan_Type ORDER BY Timestamp DESC LIMIT 1)[OFFSET(0)] AS Scan_Type,
                 ARRAY_AGG(Color ORDER BY Timestamp DESC LIMIT 1)[OFFSET(0)] AS Color,
-                STRING_AGG(CONCAT(IFNULL(Color, 'None'), '~', CAST(Qty AS STRING), '~', IFNULL(Scan_Type, '')), '|') AS Color_Breakdown
+                STRING_AGG(CONCAT(IFNULL(Color, 'None'), '~', CAST(Qty AS STRING), '~', IFNULL(Scan_Type, '')), '|') AS Color_Breakdown,
+                STRING_AGG(CONCAT(CAST(Pallet_No AS STRING), '~', IFNULL(Color, 'None'), '~', CAST(Qty AS STRING), '~', IFNULL(Scan_Type, '')), '|' ORDER BY Pallet_No, Timestamp) AS Pallet_Breakdown
             FROM LatestColorScan
-            GROUP BY Scan_Wave_ID, Clean_LPN
+            GROUP BY Scan_Wave_ID, Clean_LPN, Scan_Branch
         ),
         PalletSummary AS (
             SELECT
@@ -618,6 +624,7 @@ def fetch_wave_data_from_bq(search_wave_id: int) -> dict:
             COALESCE(MAX(TRIM(d.Owner)), 'Unknown') AS owner,
             MAX(s.Color) AS color,
             MAX(s.Color_Breakdown) AS color_breakdown,
+            MAX(s.Pallet_Breakdown) AS pallet_breakdown,
             ANY_VALUE(ps.Pallet_Nos) AS branch_pallet_nos,
             MAX(pc.Pallet_Color) AS pallet_color,
             ANY_VALUE(sps.Submitted_Pallet_Nos) AS branch_submitted_pallet_nos,
@@ -640,8 +647,9 @@ def fetch_wave_data_from_bq(search_wave_id: int) -> dict:
         LEFT JOIN BranchNameHistory AS h
           ON TRIM(UPPER(d.Branch_Code)) = h.Branch_Code
         LEFT JOIN ScanHistory AS s
-          ON s.Scan_Wave_ID = {search_wave_id}
+         ON s.Scan_Wave_ID = {search_wave_id}
          AND TRIM(UPPER(d.LPN)) = s.Clean_LPN
+         AND TRIM(UPPER(d.Branch_Code)) = s.Scan_Branch
         LEFT JOIN PalletSummary AS ps
           ON TRIM(UPPER(d.Branch_Code)) = ps.Scan_Branch
         LEFT JOIN PalletColorSummary AS pc
@@ -697,6 +705,18 @@ def fetch_wave_data_from_bq(search_wave_id: int) -> dict:
         else:
             br_name = clean_branch_display_name(row["Branch_Name"])
         total_qty = calculate_direct_total_qty(row["LPN"], row["detail_rows"], row["Total_Qty"])
+        pallet_breakdown = []
+        for raw_part in str(row["pallet_breakdown"] or "").split("|"):
+            pieces = raw_part.split("~", 3)
+            if len(pieces) != 4:
+                continue
+            try:
+                part_pallet = int(pieces[0] or 0)
+                part_qty = int(pieces[2] or 0)
+            except (TypeError, ValueError):
+                continue
+            if part_qty > 0:
+                pallet_breakdown.append({"pallet_no": part_pallet, "color": pieces[1], "qty": part_qty, "type": pieces[3]})
 
         lpn_list.append({
             "lpn": row["LPN"],
@@ -710,6 +730,7 @@ def fetch_wave_data_from_bq(search_wave_id: int) -> dict:
             "owner": row["owner"] or "Unknown",
             "color": row["color"] or "None",
             "color_breakdown": row["color_breakdown"] or "",
+            "pallet_breakdown": pallet_breakdown,
             "pallet_no": row["pallet_no"] if row["pallet_no"] is not None else 0,
             "branch_pallet_nos": list(row["branch_pallet_nos"] or []),
             "pallet_color": row["pallet_color"] or "",
@@ -1087,7 +1108,7 @@ async def read_root():
 # ✅ Health Check Endpoint: ตอบสนองเร็ว <5ms สำหรับ keep-alive heartbeat
 @app.get("/api/health")
 async def health_check():
-    return {"status": "ok", "version": "1.3.4", "timestamp": time.time()}
+    return {"status": "ok", "version": "1.4.5", "timestamp": time.time()}
 
 def transaction_already_processed(transaction_id: str) -> bool:
     tx_id = str(transaction_id or "").strip()
@@ -1544,6 +1565,7 @@ def process_scan(data: ScanData, background_tasks: BackgroundTasks):
     emp_val = (data.emp_id or "").strip()
     type_val = (data.type or "").strip()
     color_val = (data.color or "").strip()
+    base_pallet_breakdown = []
     transaction_id = (data.transaction_id or "").strip()
     if transaction_already_processed(transaction_id):
         return {"status": "success", "message": "Already saved", "duplicate": True}
@@ -1600,6 +1622,7 @@ def process_scan(data: ScanData, background_tasks: BackgroundTasks):
                              if str(item.get("lpn", "")).strip().upper() == lpn_val.upper()
                              and str(item.get("branch", "")).strip().upper() == branch_val.upper()), None)
         current_qty = int((current_item or {}).get("qty") or 0)
+        base_pallet_breakdown = list((current_item or {}).get("pallet_breakdown") or [])
         expected_qty = int(data.expected_previous_qty or 0)
         if current_qty != expected_qty:
             raise HTTPException(
@@ -1632,7 +1655,7 @@ def process_scan(data: ScanData, background_tasks: BackgroundTasks):
             print(f"🚨 INSERT ROWS JSON ERROR | LPN: {lpn_val} | Errors: {errors}")
             raise Exception(f"BigQuery streaming errors: {errors}")
         mark_transaction_processed(transaction_id)
-        record_local_scan(wave_clean, lpn_val, branch_val, data.qty, type_val, color_val, pallet_no_val)
+        record_local_scan(wave_clean, lpn_val, branch_val, data.qty, type_val, color_val, pallet_no_val, base_pallet_breakdown)
         print(f"✅ SAVED | LPN: {lpn_val}")
         return {"status": "success", "message": "Saved"}
     except Exception as e:
@@ -1657,7 +1680,7 @@ def process_scan(data: ScanData, background_tasks: BackgroundTasks):
         try:
             client.query(insert_query).result()
             mark_transaction_processed(transaction_id)
-            record_local_scan(wave_clean, lpn_val, branch_val, data.qty, type_val, color_val, pallet_no_val)
+            record_local_scan(wave_clean, lpn_val, branch_val, data.qty, type_val, color_val, pallet_no_val, base_pallet_breakdown)
             print(f"✅ SAVED (Fallback Query) | LPN: {lpn_val}")
             return {"status": "success", "message": "Saved"}
         except Exception as query_err:
