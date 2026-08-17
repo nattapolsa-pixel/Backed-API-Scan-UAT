@@ -60,6 +60,108 @@ NUMERIC_BRANCH_MASTER_CACHE_TTL_SECONDS = 30 * 60
 numeric_branch_master_cache = {"expires_at": 0.0, "data": {}}
 numeric_branch_master_lock = Lock()
 
+MEMBER_HISTORY_SPREADSHEET_ID = "1EHn7riPUt600LmhKcTV16LaNAbFibRAEYf7-fnXZlF0"
+MEMBER_HISTORY_GID = "1628470483"
+MEMBER_HISTORY_CACHE_TTL_SECONDS = 10 * 60
+member_history_cache = {"expires_at": 0.0, "data": {}}
+member_history_lock = Lock()
+
+def _history_int(value) -> int:
+    try:
+        return max(0, int(float(str(value or "0").replace(",", "").strip() or 0)))
+    except (TypeError, ValueError):
+        return 0
+
+def load_member_history() -> dict:
+    """Member Data is a completed branch summary, keyed by numeric Wave + branch."""
+    now = time.time()
+    with member_history_lock:
+        cached = member_history_cache.get("data") or {}
+        if cached and member_history_cache.get("expires_at", 0) > now:
+            return cached
+    url = (
+        f"https://docs.google.com/spreadsheets/d/{MEMBER_HISTORY_SPREADSHEET_ID}"
+        f"/gviz/tq?tqx=out:csv&gid={MEMBER_HISTORY_GID}"
+    )
+    history = {}
+    try:
+        request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(request, timeout=45) as response:
+            rows = csv.reader(io.StringIO(response.read().decode("utf-8-sig")))
+            next(rows, None)
+            for row in rows:
+                row = list(row) + [""] * max(0, 16 - len(row))
+                wave_digits = re.sub(r"\D", "", row[2])
+                branch = str(row[3] or "").strip().upper()
+                if not wave_digits or not branch:
+                    continue
+                wave = str(int(wave_digits))
+                history[(wave, branch)] = {
+                    "date": str(row[0] or "").strip(), "time": str(row[1] or "").strip(),
+                    "wave": wave, "branch": branch, "branch_name": clean_branch_display_name(row[4]),
+                    "bu": str(row[5] or "").strip() or "Unknown", "label_count": _history_int(row[6]),
+                    "m": _history_int(row[8]), "red": _history_int(row[9]), "blue": _history_int(row[10]),
+                    "green": _history_int(row[11]), "black": _history_int(row[12]),
+                    "total": _history_int(row[13]), "pallet": _history_int(row[14])
+                }
+        with member_history_lock:
+            member_history_cache["data"] = history
+            member_history_cache["expires_at"] = now + MEMBER_HISTORY_CACHE_TTL_SECONDS
+        print(f"✅ Member Data history loaded: {len(history)} branch summaries")
+        return history
+    except Exception as exc:
+        print(f"⚠️ Member Data history load failed (non-critical): {exc}")
+        with member_history_lock:
+            member_history_cache["expires_at"] = now + 60
+        return cached
+
+def build_member_history_items(wave_no: str) -> list:
+    wave = str(int(str(wave_no).strip()))
+    rows = [row for (row_wave, _), row in load_member_history().items() if row_wave == wave]
+    items = []
+    for row in rows:
+        values = [("M", "None", "Carton", row["m"]), ("RED", "Red", "TOTE", row["red"]),
+                  ("BLUE", "Blue", "TOTE", row["blue"]), ("GREEN", "Green", "TOTE", row["green"]),
+                  ("BLACK", "Black", "TOTE", row["black"])]
+        component_total = sum(qty for _, _, _, qty in values)
+        if component_total == 0 and row["total"] > 0:
+            values[0] = ("M", "None", "Carton", row["total"])
+        pallet_nos = list(range(1, row["pallet"] + 1))
+        for category, color, scan_type, qty in values:
+            if qty <= 0:
+                continue
+            items.append({
+                "lpn": f"SUMMARY-{wave}-{row['branch']}-{category}", "zone": "HISTORY",
+                "branch": row["branch"], "branch_name": row["branch_name"] or row["branch"],
+                "status": "Scanned", "total_qty": qty, "qty": qty, "scan_type": scan_type,
+                "owner": row["bu"], "color": color,
+                "color_breakdown": [{"color": color, "qty": qty, "type": scan_type}],
+                "pallet_breakdown": [], "pallet_no": 0, "branch_pallet_nos": pallet_nos,
+                "pallet_color": "", "branch_submitted_pallet_nos": pallet_nos,
+                "branch_closed_at": f"{row['date']} {row['time']}".strip(), "branch_closed_by": "Member Data",
+                "wave_no": f"{int(wave):010d}", "historical_summary": True,
+                "historical_label_count": row["label_count"], "historical_date": row["date"]
+            })
+    return items
+
+def merge_member_history(raw_data: dict, wave_no: str) -> dict:
+    history_items = build_member_history_items(wave_no)
+    if not history_items:
+        return raw_data
+    result = copy.deepcopy(raw_data)
+    existing = list(result.get("lpn_list") or [])
+    history_branches = {item["branch"] for item in history_items}
+    live_branches = {
+        str(item.get("branch") or "").strip().upper() for item in existing
+        if item.get("status") == "Scanned" and not item.get("historical_summary")
+    }
+    replace_branches = history_branches - live_branches
+    existing = [item for item in existing if str(item.get("branch") or "").strip().upper() not in replace_branches]
+    existing.extend(item for item in history_items if item["branch"] in replace_branches)
+    result["lpn_list"] = existing
+    result["historical_summary_source"] = "Member Data"
+    return result
+
 DIRECT_QTY_PREFIXES = ("PP", "SP")
 PACK_CASE_MAP_PATH = os.path.join(os.path.dirname(__file__), "pack_case_map.json")
 pack_case_map_cache = None
@@ -946,7 +1048,7 @@ def get_booking_data_internal(booking_no: str, force_refresh: bool = False) -> d
             wave = futures[future]
             try:
                 wave_data = future.result()
-                wave_data_overlaid = apply_local_overlay(wave, wave_data)
+                wave_data_overlaid = merge_member_history(apply_local_overlay(wave, wave_data), wave)
                 wave_results.append(wave_data_overlaid)
             except Exception as e:
                 print(f"🚨 Error fetching wave {wave} in booking {booking_no}: {e}")
@@ -1108,7 +1210,7 @@ async def read_root():
 # ✅ Health Check Endpoint: ตอบสนองเร็ว <5ms สำหรับ keep-alive heartbeat
 @app.get("/api/health")
 async def health_check():
-    return {"status": "ok", "version": "1.4.5", "timestamp": time.time()}
+    return {"status": "ok", "version": "1.4.7", "timestamp": time.time()}
 
 def transaction_already_processed(transaction_id: str) -> bool:
     tx_id = str(transaction_id or "").strip()
@@ -1171,10 +1273,19 @@ def get_device_states(waves: str = "", branch_code: str = "", exclude_device_id:
 def check_wave(wave_no: str, force: bool = False):
     try:
         # Load wave data (either from cache or by querying BigQuery if not cached)
-        raw_data = get_wave_data_internal(wave_no, force_refresh=force)
+        try:
+            raw_data = get_wave_data_internal(wave_no, force_refresh=force)
+        except HTTPException as exc:
+            history_items = build_member_history_items(wave_no)
+            if exc.status_code != 404 or not history_items:
+                raise
+            raw_data = {
+                "wave_no": f"{int(str(wave_no).strip()):010d}", "booking_no": "",
+                "license_plate": "", "lpn_list": history_items, "zone_summary": []
+            }
         # Apply the in-memory scan overlays dynamically
         overlaid_data = apply_local_overlay(wave_no, raw_data)
-        return overlaid_data
+        return merge_member_history(overlaid_data, wave_no)
     except HTTPException:
         raise
     except Exception as e:
@@ -1933,6 +2044,9 @@ def _startup_warm_cache():
         print("✅ Startup cache warm-up complete")
     except Exception as e:
         print(f"⚠️ Startup cache warm-up failed (non-critical): {e}")
+
+    # โหลดประวัติกล่องจาก Member Data ไว้ล่วงหน้า ไม่ให้การค้นหา Wave แรกต้องรอ Google Sheet
+    load_member_history()
 
 
 @app.on_event("startup")
