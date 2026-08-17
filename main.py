@@ -2103,6 +2103,14 @@ def member_history_status():
             timeout=30
         )
         response.raise_for_status()
+        # เขียนค่า A1 เดิมกลับที่เดิม เพื่อยืนยันสิทธิ์ Editor โดยไม่เปลี่ยนข้อมูลจริง
+        first_value = ((response.json().get("values") or [[" วันที่"]])[0] or [" วันที่"])[0]
+        verify_target = urllib.parse.quote("Member Data!A1", safe="")
+        verify = session.put(
+            f"https://sheets.googleapis.com/v4/spreadsheets/{MEMBER_HISTORY_SPREADSHEET_ID}/values/{verify_target}?valueInputOption=RAW",
+            json={"values": [[first_value]]}, timeout=30
+        )
+        verify.raise_for_status()
         return {"status": "ready", "write_back": True}
     except Exception as exc:
         raise HTTPException(status_code=503, detail=f"Google Sheet ยังเขียนไม่ได้: {exc}")
