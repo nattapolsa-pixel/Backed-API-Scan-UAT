@@ -77,15 +77,32 @@ def write_member_history_summary(summary: dict):
     """Upsert one completed Wave+Branch row in Member Data."""
     session = get_sheets_session()
     sheet_range = urllib.parse.quote("Member Data!A:P", safe="")
+    lookup_range = urllib.parse.quote("Member Data!A:D", safe="")
     base = f"https://sheets.googleapis.com/v4/spreadsheets/{MEMBER_HISTORY_SPREADSHEET_ID}/values"
-    read_res = session.get(f"{base}/{sheet_range}", timeout=45)
+    # อ่านแค่ A:D เพราะคอลัมน์ Outbound ถูกลงสูตรยาวถึงท้ายชีต
+    # ถ้าอ่าน A:P จะเข้าใจผิดว่าแถวสูตรว่างคือข้อมูลจริง แล้ว append ไปไกลมาก
+    read_res = session.get(f"{base}/{lookup_range}", timeout=45)
     read_res.raise_for_status()
     values = read_res.json().get("values") or []
     target_wave = str(int(summary["wave"]))
     target_branch = str(summary["branch"]).strip().upper()
     row_no = 0
+    last_data_row = 1
+    blank_run = 0
+    misplaced_rows = []
     for index, row in enumerate(values[1:], start=2):
         row = list(row) + [""] * max(0, 4 - len(row))
+        has_core_data = bool(str(row[0]).strip() or str(row[2]).strip() or str(row[3]).strip())
+        if not has_core_data:
+            blank_run += 1
+            continue
+        # ช่องว่างยาวเป็นแถวที่เตรียมรูปแบบไว้ ไม่ใช่ข้อมูลจริง
+        if blank_run > 50:
+            if str(row[3]).strip().upper() == target_branch and re.sub(r"\D", "", str(row[2] or "")) == target_wave:
+                misplaced_rows.append(index)
+            continue
+        blank_run = 0
+        last_data_row = index
         wave_digits = re.sub(r"\D", "", str(row[2] or ""))
         if wave_digits and str(int(wave_digits)) == target_wave and str(row[3]).strip().upper() == target_branch:
             row_no = index
@@ -101,8 +118,14 @@ def write_member_history_summary(summary: dict):
         target_range = urllib.parse.quote(f"Member Data!A{row_no}:P{row_no}", safe="")
         response = session.put(f"{base}/{target_range}?valueInputOption=USER_ENTERED", json={"values": row_values}, timeout=45)
     else:
-        response = session.post(f"{base}/{sheet_range}:append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS", json={"values": row_values}, timeout=45)
+        next_row = last_data_row + 1
+        target_range = urllib.parse.quote(f"Member Data!A{next_row}:P{next_row}", safe="")
+        response = session.put(f"{base}/{target_range}?valueInputOption=USER_ENTERED", json={"values": row_values}, timeout=45)
     response.raise_for_status()
+    for bad_row in misplaced_rows:
+        clear_range = urllib.parse.quote(f"Member Data!A{bad_row}:P{bad_row}", safe="")
+        cleared = session.post(f"{base}/{clear_range}:clear", json={}, timeout=30)
+        cleared.raise_for_status()
     with member_history_lock:
         member_history_cache["expires_at"] = 0
     print(f"✅ Member Data updated | Wave {target_wave} | Branch {target_branch} | {summary['total']} boxes")
