@@ -141,8 +141,6 @@ def write_member_history_summary(summary: dict):
 
 def summarize_branch_for_member_data(wave_data: dict, branch: str) -> dict:
     items = [item for item in wave_data.get("lpn_list", []) if str(item.get("branch") or "").strip().upper() == branch]
-    masters = {str(item.get("scan_type") or "").split(":", 1)[1].strip().upper()
-               for item in items if str(item.get("scan_type") or "").upper().startswith("COMBINE:")}
     totals = {"m": 0, "red": 0, "blue": 0, "green": 0, "black": 0}
     def add(color, scan_type, qty, lpn=""):
         color = str(color or "None").upper(); scan_type = str(scan_type or "").upper(); prefix = str(lpn or "")[:2].upper()
@@ -156,9 +154,7 @@ def summarize_branch_for_member_data(wave_data: dict, branch: str) -> dict:
     for item in items:
         if item.get("status") != "Scanned": continue
         lpn = str(item.get("lpn") or "").strip().upper(); scan_type = str(item.get("scan_type") or "")
-        if scan_type.upper().startswith("COMBINE:"): continue
         qty = int(item.get("qty") or 0)
-        if lpn in masters: qty = 1
         breakdown = item.get("color_breakdown") or []
         if isinstance(breakdown, str):
             parsed = []
@@ -166,7 +162,9 @@ def summarize_branch_for_member_data(wave_data: dict, branch: str) -> dict:
                 bits = part.split("~", 2)
                 if len(bits) >= 2: parsed.append({"color": bits[0], "qty": _history_int(bits[1]), "type": bits[2] if len(bits) > 2 else scan_type})
             breakdown = parsed
-        if lpn in masters or not breakdown:
+        # COMBINE คือ LPN ที่สแกนจริงและมี 1 กล่อง ต้องนับตามสีของรายการนั้น
+        # ห้ามข้าม เพราะจะทำให้ยอดรวมขาด 1 กล่องต่อ Combine
+        if not breakdown:
             add(item.get("color"), scan_type, qty, lpn)
         else:
             for part in breakdown: add(part.get("color"), part.get("type"), _history_int(part.get("qty")), lpn)
