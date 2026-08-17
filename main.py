@@ -61,8 +61,9 @@ NUMERIC_BRANCH_MASTER_CACHE_TTL_SECONDS = 30 * 60
 numeric_branch_master_cache = {"expires_at": 0.0, "data": {}}
 numeric_branch_master_lock = Lock()
 
-MEMBER_HISTORY_SPREADSHEET_ID = "1EHn7riPUt600LmhKcTV16LaNAbFibRAEYf7-fnXZlF0"
-MEMBER_HISTORY_GID = "1628470483"
+# ไฟล์ Control Outbound ที่ใช้งานจริง (Member Data เป็นแท็บแรก)
+MEMBER_HISTORY_SPREADSHEET_ID = "1MO3lu1GssPZZvaruwQ5trUB045dzh4HUHdH35mbyOtc"
+MEMBER_HISTORY_GID = "0"
 MEMBER_HISTORY_CACHE_TTL_SECONDS = 10 * 60
 member_history_cache = {"expires_at": 0.0, "data": {}}
 member_history_lock = Lock()
@@ -72,6 +73,14 @@ def get_sheets_session():
     if hasattr(credentials, "with_scopes"):
         credentials = credentials.with_scopes(["https://www.googleapis.com/auth/spreadsheets"])
     return AuthorizedSession(credentials)
+
+def member_data_bu(owner) -> str:
+    """แปลงรหัส BU จากข้อมูล Wave ให้เป็นชื่อที่หน้างานใช้ใน Member Data."""
+    code = str(owner or "").strip().upper()
+    return {
+        "DP02": "PUNTHAI",
+        "DM02": "MAX MART",
+    }.get(code, code or "Unknown")
 
 def write_member_history_summary(summary: dict):
     """Upsert one completed Wave+Branch row in Member Data."""
@@ -165,7 +174,7 @@ def summarize_branch_for_member_data(wave_data: dict, branch: str) -> dict:
     pallet_nos = {int(no) for item in items for no in (item.get("branch_pallet_nos") or []) if int(no) > 0}
     if not pallet_nos: pallet_nos = {int(item.get("pallet_no") or 0) for item in items if int(item.get("pallet_no") or 0) > 0}
     return {"wave": str(int(str(wave_data.get("wave_no") or 0))), "branch": branch,
-            "branch_name": first.get("branch_name") or branch, "bu": first.get("owner") or "Unknown",
+            "branch_name": first.get("branch_name") or branch, "bu": member_data_bu(first.get("owner")),
             "label_count": len({str(item.get("lpn") or "") for item in items if item.get("lpn")}),
             **totals, "total": sum(totals.values()), "pallet": len(pallet_nos)}
 
@@ -1313,7 +1322,7 @@ async def read_root():
 # ✅ Health Check Endpoint: ตอบสนองเร็ว <5ms สำหรับ keep-alive heartbeat
 @app.get("/api/health")
 async def health_check():
-    return {"status": "ok", "version": "1.4.9", "timestamp": time.time()}
+    return {"status": "ok", "version": "1.5.0", "timestamp": time.time()}
 
 def transaction_already_processed(transaction_id: str) -> bool:
     tx_id = str(transaction_id or "").strip()
