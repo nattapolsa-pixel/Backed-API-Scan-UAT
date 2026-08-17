@@ -3,6 +3,7 @@ from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel
 from typing import List, Optional       # ✅ แก้ไข #1: เพิ่ม Optional
 from google.cloud import bigquery
+from google.auth.transport.requests import AuthorizedSession
 import csv
 import json
 import base64
@@ -65,6 +66,85 @@ MEMBER_HISTORY_GID = "1628470483"
 MEMBER_HISTORY_CACHE_TTL_SECONDS = 10 * 60
 member_history_cache = {"expires_at": 0.0, "data": {}}
 member_history_lock = Lock()
+
+def get_sheets_session():
+    credentials = client._credentials
+    if hasattr(credentials, "with_scopes"):
+        credentials = credentials.with_scopes(["https://www.googleapis.com/auth/spreadsheets"])
+    return AuthorizedSession(credentials)
+
+def write_member_history_summary(summary: dict):
+    """Upsert one completed Wave+Branch row in Member Data."""
+    session = get_sheets_session()
+    sheet_range = urllib.parse.quote("Member Data!A:P", safe="")
+    base = f"https://sheets.googleapis.com/v4/spreadsheets/{MEMBER_HISTORY_SPREADSHEET_ID}/values"
+    read_res = session.get(f"{base}/{sheet_range}", timeout=45)
+    read_res.raise_for_status()
+    values = read_res.json().get("values") or []
+    target_wave = str(int(summary["wave"]))
+    target_branch = str(summary["branch"]).strip().upper()
+    row_no = 0
+    for index, row in enumerate(values[1:], start=2):
+        row = list(row) + [""] * max(0, 4 - len(row))
+        wave_digits = re.sub(r"\D", "", str(row[2] or ""))
+        if wave_digits and str(int(wave_digits)) == target_wave and str(row[3]).strip().upper() == target_branch:
+            row_no = index
+            break
+    now_bkk = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=7)))
+    row_values = [[
+        now_bkk.strftime("%-d/%-m/%Y") if os.name != "nt" else f"{now_bkk.day}/{now_bkk.month}/{now_bkk.year}",
+        now_bkk.strftime("%H:%M"), target_wave, target_branch, summary["branch_name"], summary["bu"],
+        summary["label_count"], "", summary["m"], summary["red"], summary["blue"],
+        summary["green"], summary["black"], summary["total"], summary["pallet"], " Outbound"
+    ]]
+    if row_no:
+        target_range = urllib.parse.quote(f"Member Data!A{row_no}:P{row_no}", safe="")
+        response = session.put(f"{base}/{target_range}?valueInputOption=USER_ENTERED", json={"values": row_values}, timeout=45)
+    else:
+        response = session.post(f"{base}/{sheet_range}:append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS", json={"values": row_values}, timeout=45)
+    response.raise_for_status()
+    with member_history_lock:
+        member_history_cache["expires_at"] = 0
+    print(f"✅ Member Data updated | Wave {target_wave} | Branch {target_branch} | {summary['total']} boxes")
+
+def summarize_branch_for_member_data(wave_data: dict, branch: str) -> dict:
+    items = [item for item in wave_data.get("lpn_list", []) if str(item.get("branch") or "").strip().upper() == branch]
+    masters = {str(item.get("scan_type") or "").split(":", 1)[1].strip().upper()
+               for item in items if str(item.get("scan_type") or "").upper().startswith("COMBINE:")}
+    totals = {"m": 0, "red": 0, "blue": 0, "green": 0, "black": 0}
+    def add(color, scan_type, qty, lpn=""):
+        color = str(color or "None").upper(); scan_type = str(scan_type or "").upper(); prefix = str(lpn or "")[:2].upper()
+        if prefix in DIRECT_QTY_PREFIXES or scan_type == "CARTON" or color in ("REUSE", "NONE", ""):
+            totals["m"] += qty
+        elif color == "RED": totals["red"] += qty
+        elif color == "BLUE": totals["blue"] += qty
+        elif color == "GREEN": totals["green"] += qty
+        elif color == "BLACK": totals["black"] += qty
+        else: totals["m"] += qty
+    for item in items:
+        if item.get("status") != "Scanned": continue
+        lpn = str(item.get("lpn") or "").strip().upper(); scan_type = str(item.get("scan_type") or "")
+        if scan_type.upper().startswith("COMBINE:"): continue
+        qty = int(item.get("qty") or 0)
+        if lpn in masters: qty = 1
+        breakdown = item.get("color_breakdown") or []
+        if isinstance(breakdown, str):
+            parsed = []
+            for part in breakdown.split("|"):
+                bits = part.split("~", 2)
+                if len(bits) >= 2: parsed.append({"color": bits[0], "qty": _history_int(bits[1]), "type": bits[2] if len(bits) > 2 else scan_type})
+            breakdown = parsed
+        if lpn in masters or not breakdown:
+            add(item.get("color"), scan_type, qty, lpn)
+        else:
+            for part in breakdown: add(part.get("color"), part.get("type"), _history_int(part.get("qty")), lpn)
+    first = items[0] if items else {}
+    pallet_nos = {int(no) for item in items for no in (item.get("branch_pallet_nos") or []) if int(no) > 0}
+    if not pallet_nos: pallet_nos = {int(item.get("pallet_no") or 0) for item in items if int(item.get("pallet_no") or 0) > 0}
+    return {"wave": str(int(str(wave_data.get("wave_no") or 0))), "branch": branch,
+            "branch_name": first.get("branch_name") or branch, "bu": first.get("owner") or "Unknown",
+            "label_count": len({str(item.get("lpn") or "") for item in items if item.get("lpn")}),
+            **totals, "total": sum(totals.values()), "pallet": len(pallet_nos)}
 
 def _history_int(value) -> int:
     try:
@@ -1210,7 +1290,7 @@ async def read_root():
 # ✅ Health Check Endpoint: ตอบสนองเร็ว <5ms สำหรับ keep-alive heartbeat
 @app.get("/api/health")
 async def health_check():
-    return {"status": "ok", "version": "1.4.7", "timestamp": time.time()}
+    return {"status": "ok", "version": "1.4.8", "timestamp": time.time()}
 
 def transaction_already_processed(transaction_id: str) -> bool:
     tx_id = str(transaction_id or "").strip()
@@ -1942,7 +2022,11 @@ def run_close_job_queries_in_background(wave_clean: str, branch: str, insert_zer
         client.query(insert_zero_query).result()
         client.query(insert_close_marker).result()
         # After BQ queries finish, refresh cache
-        get_wave_data_internal(wave_clean, force_refresh=True)
+        refreshed = get_wave_data_internal(wave_clean, force_refresh=True)
+        try:
+            write_member_history_summary(summarize_branch_for_member_data(refreshed, branch))
+        except Exception as sheet_error:
+            print(f"⚠️ MEMBER DATA WRITE ERROR | Wave: {wave_clean} | Branch: {branch} | {sheet_error}")
         print(f"✅ BACKGROUND CLOSE JOB COMPLETE | Wave: {wave_clean} | Branch: {branch}")
     except Exception as e:
         print(f"🚨 BACKGROUND CLOSE JOB ERROR | Wave: {wave_clean} | Branch: {branch} | Error: {str(e)}")
@@ -2008,6 +2092,20 @@ def close_job(data: CloseJobData, background_tasks: BackgroundTasks):
         "message": f"ปิดจบงานสาขา {branch} และบันทึกยอด 0 ให้กล่องที่ค้างสำเร็จ! (ระบบกำลังบันทึกเบื้องหลัง)",
         "completed_at": data.completed_at
     }
+
+@app.get("/api/member-history-status")
+def member_history_status():
+    try:
+        session = get_sheets_session()
+        target = urllib.parse.quote("Member Data!A1:P2", safe="")
+        response = session.get(
+            f"https://sheets.googleapis.com/v4/spreadsheets/{MEMBER_HISTORY_SPREADSHEET_ID}/values/{target}",
+            timeout=30
+        )
+        response.raise_for_status()
+        return {"status": "ready", "write_back": True}
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Google Sheet ยังเขียนไม่ได้: {exc}")
 
 
 def query_pending_waves_from_bigquery():
