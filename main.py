@@ -68,11 +68,83 @@ MEMBER_HISTORY_CACHE_TTL_SECONDS = 10 * 60
 member_history_cache = {"expires_at": 0.0, "data": {}}
 member_history_lock = Lock()
 
+# รายการ LPN ที่ต้อง QC จากไฟล์ QA Focus Checking
+# โหลดไว้ใน backend เพื่อไม่ให้ Handheld ต้องเปิด Google Sheet ระหว่างสแกน
+QC_SHEET_SOURCES = (
+    ("MART", "1K_sy80STfw9JHeVWqxxK1O1KLqPASjnKy7oqJTFEsiw"),
+    ("PUN", "1VsLY1abGCi-PpMOSilhSYhZIDmSRvQxuiZHfhnrIX4g"),
+)
+QC_STATUS_CACHE_TTL_SECONDS = 15 * 60
+qc_status_cache = {"expires_at": 0.0, "sources": {}, "last_errors": []}
+qc_status_cache_lock = Lock()
+qc_status_refresh_lock = Lock()
+
 def get_sheets_session():
     credentials = client._credentials
     if hasattr(credentials, "with_scopes"):
         credentials = credentials.with_scopes(["https://www.googleapis.com/auth/spreadsheets"])
     return AuthorizedSession(credentials)
+
+def _merged_qc_status_map() -> dict:
+    merged = {}
+    with qc_status_cache_lock:
+        source_maps = list((qc_status_cache.get("sources") or {}).values())
+    for source_map in source_maps:
+        for lpn, detail in source_map.items():
+            # ถ้า LPN ซ้ำข้ามไฟล์ ให้ถือว่า "ต้อง QC" เมื่อไฟล์ใดไฟล์หนึ่งระบุไว้
+            merged[lpn] = detail
+    return merged
+
+def load_qc_status_map(force_refresh: bool = False) -> dict:
+    """โหลดเฉพาะ LPN ที่มี Status = ต้อง QC จากคอลัมน์ G:J ของทั้งสองไฟล์."""
+    now = time.time()
+    with qc_status_cache_lock:
+        is_fresh = qc_status_cache.get("expires_at", 0) > now
+    if is_fresh and not force_refresh:
+        return _merged_qc_status_map()
+
+    with qc_status_refresh_lock:
+        with qc_status_cache_lock:
+            refreshed_by_other_request = qc_status_cache.get("expires_at", 0) > time.time() and not force_refresh
+            previous_sources = copy.deepcopy(qc_status_cache.get("sources") or {})
+        if refreshed_by_other_request:
+            return _merged_qc_status_map()
+
+        session = get_sheets_session()
+        updated_sources = dict(previous_sources)
+        errors = []
+        success_count = 0
+        for source_name, spreadsheet_id in QC_SHEET_SOURCES:
+            try:
+                source_range = urllib.parse.quote("LPN!G8:J", safe="")
+                url = f"https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}/values/{source_range}"
+                response = session.get(url, params={"valueRenderOption": "FORMATTED_VALUE"}, timeout=45)
+                response.raise_for_status()
+                source_map = {}
+                for row in response.json().get("values") or []:
+                    row = list(row) + [""] * max(0, 4 - len(row))
+                    lpn = str(row[0] or "").strip().upper()
+                    status = str(row[3] or "").strip()
+                    if not lpn or status != "ต้อง QC":
+                        continue
+                    source_map[lpn] = {
+                        "qc_required": True,
+                        "qc_status": "ต้อง QC",
+                        "qc_risk": str(row[2] or "").strip(),
+                        "qc_source": source_name,
+                    }
+                updated_sources[source_name] = source_map
+                success_count += 1
+                print(f"✅ QC status loaded | {source_name}: {len(source_map)} LPNs")
+            except Exception as exc:
+                errors.append(f"{source_name}: {exc}")
+                print(f"⚠️ QC status load failed ({source_name}, non-critical): {exc}")
+
+        with qc_status_cache_lock:
+            qc_status_cache["sources"] = updated_sources
+            qc_status_cache["last_errors"] = errors
+            qc_status_cache["expires_at"] = time.time() + (QC_STATUS_CACHE_TTL_SECONDS if success_count else 60)
+        return _merged_qc_status_map()
 
 def member_data_bu(owner) -> str:
     """แปลงรหัส BU จากข้อมูล Wave ให้เป็นชื่อที่หน้างานใช้ใน Member Data."""
@@ -1222,6 +1294,9 @@ class ScanBatchData(BaseModel):
 
 ScanBatchData.model_rebuild()
 
+class QcLookupData(BaseModel):
+    lpns: List[str]
+
 class DeviceStateData(BaseModel):
     device_id: str
     waves: List[str] = []
@@ -1320,7 +1395,29 @@ async def read_root():
 # ✅ Health Check Endpoint: ตอบสนองเร็ว <5ms สำหรับ keep-alive heartbeat
 @app.get("/api/health")
 async def health_check():
-    return {"status": "ok", "version": "1.5.1", "timestamp": time.time()}
+    return {"status": "ok", "version": "1.5.2", "timestamp": time.time()}
+
+@app.post("/api/qc-status")
+def get_qc_status(data: QcLookupData):
+    """คืนธง QC แยกจาก Flow สแกน เพื่อให้ Google Sheet ช้าก็ไม่กระทบการบันทึก LPN."""
+    requested = []
+    seen = set()
+    for raw_lpn in data.lpns[:5000]:
+        lpn = str(raw_lpn or "").strip().upper()
+        if lpn and lpn not in seen:
+            requested.append(lpn)
+            seen.add(lpn)
+    qc_map = load_qc_status_map()
+    items = {lpn: qc_map[lpn] for lpn in requested if lpn in qc_map}
+    with qc_status_cache_lock:
+        errors = list(qc_status_cache.get("last_errors") or [])
+    return {
+        "status": "success",
+        "items": items,
+        "requested": len(requested),
+        "qc_required": len(items),
+        "stale": bool(errors),
+    }
 
 def transaction_already_processed(transaction_id: str) -> bool:
     tx_id = str(transaction_id or "").strip()
@@ -2183,6 +2280,9 @@ def _startup_warm_cache():
 
     # โหลดประวัติกล่องจาก Member Data ไว้ล่วงหน้า ไม่ให้การค้นหา Wave แรกต้องรอ Google Sheet
     load_member_history()
+
+    # โหลดธง QC ล่วงหน้าแบบ background; ถ้า Sheet ช้า/เข้าไม่ได้จะไม่กระทบการสแกน
+    load_qc_status_map()
 
 
 @app.on_event("startup")
