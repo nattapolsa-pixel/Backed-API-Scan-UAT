@@ -68,83 +68,11 @@ MEMBER_HISTORY_CACHE_TTL_SECONDS = 10 * 60
 member_history_cache = {"expires_at": 0.0, "data": {}}
 member_history_lock = Lock()
 
-# รายการ LPN ที่ต้อง QC จากไฟล์ QA Focus Checking
-# โหลดไว้ใน backend เพื่อไม่ให้ Handheld ต้องเปิด Google Sheet ระหว่างสแกน
-QC_SHEET_SOURCES = (
-    ("MART", "1K_sy80STfw9JHeVWqxxK1O1KLqPASjnKy7oqJTFEsiw"),
-    ("PUN", "1VsLY1abGCi-PpMOSilhSYhZIDmSRvQxuiZHfhnrIX4g"),
-)
-QC_STATUS_CACHE_TTL_SECONDS = 15 * 60
-qc_status_cache = {"expires_at": 0.0, "sources": {}, "last_errors": []}
-qc_status_cache_lock = Lock()
-qc_status_refresh_lock = Lock()
-
 def get_sheets_session():
     credentials = client._credentials
     if hasattr(credentials, "with_scopes"):
         credentials = credentials.with_scopes(["https://www.googleapis.com/auth/spreadsheets"])
     return AuthorizedSession(credentials)
-
-def _merged_qc_status_map() -> dict:
-    merged = {}
-    with qc_status_cache_lock:
-        source_maps = list((qc_status_cache.get("sources") or {}).values())
-    for source_map in source_maps:
-        for lpn, detail in source_map.items():
-            # ถ้า LPN ซ้ำข้ามไฟล์ ให้ถือว่า "ต้อง QC" เมื่อไฟล์ใดไฟล์หนึ่งระบุไว้
-            merged[lpn] = detail
-    return merged
-
-def load_qc_status_map(force_refresh: bool = False) -> dict:
-    """โหลดเฉพาะ LPN ที่มี Status = ต้อง QC จากคอลัมน์ G:J ของทั้งสองไฟล์."""
-    now = time.time()
-    with qc_status_cache_lock:
-        is_fresh = qc_status_cache.get("expires_at", 0) > now
-    if is_fresh and not force_refresh:
-        return _merged_qc_status_map()
-
-    with qc_status_refresh_lock:
-        with qc_status_cache_lock:
-            refreshed_by_other_request = qc_status_cache.get("expires_at", 0) > time.time() and not force_refresh
-            previous_sources = copy.deepcopy(qc_status_cache.get("sources") or {})
-        if refreshed_by_other_request:
-            return _merged_qc_status_map()
-
-        session = get_sheets_session()
-        updated_sources = dict(previous_sources)
-        errors = []
-        success_count = 0
-        for source_name, spreadsheet_id in QC_SHEET_SOURCES:
-            try:
-                source_range = urllib.parse.quote("LPN!G8:J", safe="")
-                url = f"https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}/values/{source_range}"
-                response = session.get(url, params={"valueRenderOption": "FORMATTED_VALUE"}, timeout=45)
-                response.raise_for_status()
-                source_map = {}
-                for row in response.json().get("values") or []:
-                    row = list(row) + [""] * max(0, 4 - len(row))
-                    lpn = str(row[0] or "").strip().upper()
-                    status = str(row[3] or "").strip()
-                    if not lpn or status != "ต้อง QC":
-                        continue
-                    source_map[lpn] = {
-                        "qc_required": True,
-                        "qc_status": "ต้อง QC",
-                        "qc_risk": str(row[2] or "").strip(),
-                        "qc_source": source_name,
-                    }
-                updated_sources[source_name] = source_map
-                success_count += 1
-                print(f"✅ QC status loaded | {source_name}: {len(source_map)} LPNs")
-            except Exception as exc:
-                errors.append(f"{source_name}: {exc}")
-                print(f"⚠️ QC status load failed ({source_name}, non-critical): {exc}")
-
-        with qc_status_cache_lock:
-            qc_status_cache["sources"] = updated_sources
-            qc_status_cache["last_errors"] = errors
-            qc_status_cache["expires_at"] = time.time() + (QC_STATUS_CACHE_TTL_SECONDS if success_count else 60)
-        return _merged_qc_status_map()
 
 def member_data_bu(owner) -> str:
     """แปลงรหัส BU จากข้อมูล Wave ให้เป็นชื่อที่หน้างานใช้ใน Member Data."""
@@ -748,7 +676,106 @@ def fetch_wave_data_from_bq(search_wave_id: int) -> dict:
     wave_detail_str = f"{search_wave_id:010d}"
 
     query = f"""
-        WITH ScanRows AS (
+        WITH QCRaw AS (
+            SELECT
+                TRIM(string_field_18) AS Order_Number,
+                TRIM(string_field_31) AS Product_Code,
+                ARRAY_AGG(
+                    NULLIF(TRIM(string_field_56), '') IGNORE NULLS
+                    ORDER BY string_field_66 DESC LIMIT 1
+                )[SAFE_OFFSET(0)] AS Picker,
+                MAX(SAFE_CAST(NULLIF(REGEXP_REPLACE(IFNULL(string_field_93, ''), r'[^0-9.-]', ''), '') AS FLOAT64)) AS Unit_Price
+            FROM `pro-analytics-db.logistics_db.transaction_raw`
+            WHERE SAFE_CAST(REGEXP_REPLACE(IFNULL(string_field_41, ''), r'[^0-9]', '') AS INT64) = {search_wave_id}
+            GROUP BY Order_Number, Product_Code
+        ),
+        QCBase AS (
+            SELECT
+                TRIM(UPPER(d.LPN)) AS Clean_LPN,
+                TRIM(UPPER(d.Branch_Code)) AS Branch_Code,
+                TRIM(UPPER(d.Owner)) AS Owner,
+                CASE
+                    WHEN TRIM(UPPER(d.Owner)) = 'DM02' THEN 'MART'
+                    WHEN TRIM(UPPER(d.Owner)) IN ('DP02', 'DG02', 'DS02', 'DO02') THEN 'PUN'
+                END AS QC_Group,
+                COALESCE(NULLIF(TRIM(UPPER(d.Zone)), ''), 'UNKNOWN') AS Zone,
+                COALESCE(NULLIF(TRIM(UPPER(d.Product_Code)), ''), 'UNKNOWN') AS Product_Code,
+                COALESCE(NULLIF(TRIM(UPPER(r.Picker)), ''), 'UNKNOWN') AS Picker,
+                COALESCE(r.Unit_Price, 0) AS Unit_Price,
+                GREATEST(COALESCE(d.Total_Qty, 1), 1) AS Workload
+            FROM `pro-analytics-db.logistics_db.wave_lpn_detail_record` AS d
+            LEFT JOIN QCRaw AS r
+              ON TRIM(d.Order_Number) = r.Order_Number
+             AND TRIM(d.Product_Code) = r.Product_Code
+            WHERE SAFE_CAST(REGEXP_REPLACE(TRIM(CAST(d.Wave_Number AS STRING)), r'[^0-9]', '') AS INT64) = {search_wave_id}
+        ),
+        QCZoneMetrics AS (
+            SELECT QC_Group, Zone, SUM(Workload) AS Metric
+            FROM QCBase WHERE QC_Group IS NOT NULL GROUP BY QC_Group, Zone
+        ),
+        QCZoneScores AS (
+            SELECT *, IF(Zone = 'UNKNOWN', 0.5, CUME_DIST() OVER (PARTITION BY QC_Group ORDER BY Metric)) AS Score
+            FROM QCZoneMetrics
+        ),
+        QCItemMetrics AS (
+            SELECT QC_Group, Product_Code, SUM(Workload) AS Metric, AVG(Unit_Price) AS Unit_Price
+            FROM QCBase WHERE QC_Group IS NOT NULL GROUP BY QC_Group, Product_Code
+        ),
+        QCItemScores AS (
+            SELECT *,
+                IF(Product_Code = 'UNKNOWN', 0.5, CUME_DIST() OVER (PARTITION BY QC_Group ORDER BY Metric)) AS Focus_Score,
+                IF(Unit_Price <= 0, 0.5, CUME_DIST() OVER (PARTITION BY QC_Group ORDER BY Unit_Price)) AS Price_Score
+            FROM QCItemMetrics
+        ),
+        QCPickerMetrics AS (
+            SELECT QC_Group, Picker, COUNT(*) AS Metric
+            FROM QCBase WHERE QC_Group IS NOT NULL GROUP BY QC_Group, Picker
+        ),
+        QCPickerScores AS (
+            SELECT *, IF(Picker = 'UNKNOWN', 0.5, CUME_DIST() OVER (PARTITION BY QC_Group ORDER BY Metric)) AS Score
+            FROM QCPickerMetrics
+        ),
+        QCStoreMetrics AS (
+            SELECT QC_Group, Branch_Code, SUM(Workload) AS Metric
+            FROM QCBase WHERE QC_Group IS NOT NULL GROUP BY QC_Group, Branch_Code
+        ),
+        QCStoreScores AS (
+            SELECT *, CUME_DIST() OVER (PARTITION BY QC_Group ORDER BY Metric) AS Score
+            FROM QCStoreMetrics
+        ),
+        QCLpnRisk AS (
+            SELECT
+                b.Clean_LPN,
+                b.Branch_Code,
+                b.QC_Group,
+                AVG(CASE
+                    WHEN b.QC_Group = 'MART' THEN (z.Score * 0.20) + (i.Focus_Score * 0.30) + (p.Score * 0.40) + (s.Score * 0.10)
+                    WHEN b.QC_Group = 'PUN' THEN (i.Focus_Score + i.Price_Score + p.Score) / 3
+                END) AS QC_Risk,
+                NOT (b.QC_Group = 'PUN' AND REGEXP_CONTAINS(b.Clean_LPN, r'^(BP|SP)')) AS QC_Eligible
+            FROM QCBase AS b
+            LEFT JOIN QCZoneScores AS z USING (QC_Group, Zone)
+            LEFT JOIN QCItemScores AS i USING (QC_Group, Product_Code)
+            LEFT JOIN QCPickerScores AS p USING (QC_Group, Picker)
+            LEFT JOIN QCStoreScores AS s USING (QC_Group, Branch_Code)
+            WHERE b.QC_Group IS NOT NULL
+            GROUP BY b.Clean_LPN, b.Branch_Code, b.QC_Group, QC_Eligible
+        ),
+        QCRanked AS (
+            SELECT *,
+                IF(QC_Eligible, ROW_NUMBER() OVER (
+                    PARTITION BY QC_Group
+                    ORDER BY IF(QC_Eligible, 0, 1), QC_Risk DESC, Clean_LPN, Branch_Code
+                ), NULL) AS QC_Rank,
+                COUNTIF(QC_Eligible) OVER (PARTITION BY QC_Group) AS Eligible_Count
+            FROM QCLpnRisk
+        ),
+        QCStatus AS (
+            SELECT *,
+                QC_Eligible AND QC_Rank <= GREATEST(1, CAST(CEIL(Eligible_Count * IF(QC_Group = 'MART', 0.50, 0.60)) AS INT64)) AS QC_Required
+            FROM QCRanked
+        ),
+        ScanRows AS (
             SELECT
                 TRIM(CAST(Wave_Number AS STRING)) AS Wave_Number,
                 SAFE_CAST(REGEXP_REPLACE(TRIM(CAST(Wave_Number AS STRING)), r'[^0-9]', '') AS INT64) AS Scan_Wave_ID,
@@ -914,6 +941,9 @@ def fetch_wave_data_from_bq(search_wave_id: int) -> dict:
             ANY_VALUE(sps.Submitted_Pallet_Nos) AS branch_submitted_pallet_nos,
             ANY_VALUE(bcs.Branch_Closed_At) AS branch_closed_at,
             ANY_VALUE(bcs.Branch_Closed_By) AS branch_closed_by,
+            COALESCE(MAX(qc.QC_Required), FALSE) AS qc_required,
+            ROUND(MAX(qc.QC_Risk), 4) AS qc_risk,
+            MAX(qc.QC_Group) AS qc_source,
             ARRAY_AGG(STRUCT(
                 TRIM(d.Owner) AS owner,
                 TRIM(d.Product_Code) AS product_code,
@@ -943,6 +973,9 @@ def fetch_wave_data_from_bq(search_wave_id: int) -> dict:
           ON TRIM(UPPER(d.Branch_Code)) = sps.Scan_Branch
         LEFT JOIN BranchCloseSummary AS bcs
           ON TRIM(UPPER(d.Branch_Code)) = bcs.Scan_Branch
+        LEFT JOIN QCStatus AS qc
+          ON TRIM(UPPER(d.LPN)) = qc.Clean_LPN
+         AND TRIM(UPPER(d.Branch_Code)) = qc.Branch_Code
         WHERE SAFE_CAST(REGEXP_REPLACE(TRIM(CAST(d.Wave_Number AS STRING)), r'[^0-9]', '') AS INT64) = {search_wave_id}
         GROUP BY d.LPN, d.Zone, d.Branch_Code, d.Wave_Number
     """
@@ -1021,6 +1054,10 @@ def fetch_wave_data_from_bq(search_wave_id: int) -> dict:
             "branch_submitted_pallet_nos": list(row["branch_submitted_pallet_nos"] or []),
             "branch_closed_at": row["branch_closed_at"].isoformat() if row["branch_closed_at"] else "",
             "branch_closed_by": row["branch_closed_by"] or "",
+            "qc_required": bool(row["qc_required"]),
+            "qc_status": "ต้อง QC" if row["qc_required"] else "",
+            "qc_risk": float(row["qc_risk"] or 0),
+            "qc_source": row["qc_source"] or "",
             "wave_no": str(row["Full_Wave"]).strip()
         })
 
@@ -1294,9 +1331,6 @@ class ScanBatchData(BaseModel):
 
 ScanBatchData.model_rebuild()
 
-class QcLookupData(BaseModel):
-    lpns: List[str]
-
 class DeviceStateData(BaseModel):
     device_id: str
     waves: List[str] = []
@@ -1395,29 +1429,7 @@ async def read_root():
 # ✅ Health Check Endpoint: ตอบสนองเร็ว <5ms สำหรับ keep-alive heartbeat
 @app.get("/api/health")
 async def health_check():
-    return {"status": "ok", "version": "1.5.2", "timestamp": time.time()}
-
-@app.post("/api/qc-status")
-def get_qc_status(data: QcLookupData):
-    """คืนธง QC แยกจาก Flow สแกน เพื่อให้ Google Sheet ช้าก็ไม่กระทบการบันทึก LPN."""
-    requested = []
-    seen = set()
-    for raw_lpn in data.lpns[:5000]:
-        lpn = str(raw_lpn or "").strip().upper()
-        if lpn and lpn not in seen:
-            requested.append(lpn)
-            seen.add(lpn)
-    qc_map = load_qc_status_map()
-    items = {lpn: qc_map[lpn] for lpn in requested if lpn in qc_map}
-    with qc_status_cache_lock:
-        errors = list(qc_status_cache.get("last_errors") or [])
-    return {
-        "status": "success",
-        "items": items,
-        "requested": len(requested),
-        "qc_required": len(items),
-        "stale": bool(errors),
-    }
+    return {"status": "ok", "version": "1.6.0", "timestamp": time.time()}
 
 def transaction_already_processed(transaction_id: str) -> bool:
     tx_id = str(transaction_id or "").strip()
@@ -2280,10 +2292,6 @@ def _startup_warm_cache():
 
     # โหลดประวัติกล่องจาก Member Data ไว้ล่วงหน้า ไม่ให้การค้นหา Wave แรกต้องรอ Google Sheet
     load_member_history()
-
-    # โหลดธง QC ล่วงหน้าแบบ background; ถ้า Sheet ช้า/เข้าไม่ได้จะไม่กระทบการสแกน
-    load_qc_status_map()
-
 
 @app.on_event("startup")
 async def startup_event():
