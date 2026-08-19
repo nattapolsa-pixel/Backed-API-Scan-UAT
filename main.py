@@ -281,10 +281,32 @@ def summarize_branch_for_member_data(wave_data: dict, branch: str) -> dict:
         and ":" in str(item.get("scan_type") or "")
     }
     combined_masters = set(combined_children.values())
+    # หน้าจอถือ Combine หนึ่งกลุ่มเป็นภาชนะจริง 1 ใบ แม้ Master จะยังเป็น Pending
+    # จึงนับจากรายการลูกที่สแกนแล้วหนึ่งครั้งต่อ Master ก่อน แล้วข้ามทั้งลูกและ Master ในลูปหลัก
+    for master_lpn in combined_masters:
+        master_item = next((item for item in items if str(item.get("lpn") or "").strip().upper() == master_lpn
+                            and item.get("status") == "Scanned"), None)
+        child_item = next((item for item in items if combined_children.get(str(item.get("lpn") or "").strip().upper()) == master_lpn
+                           and item.get("status") == "Scanned"), None)
+        physical_item = master_item or child_item
+        if physical_item:
+            physical_breakdown = physical_item.get("color_breakdown") or []
+            if isinstance(physical_breakdown, str):
+                parsed = []
+                for part in physical_breakdown.split("|"):
+                    bits = part.split("~", 2)
+                    if len(bits) >= 2:
+                        parsed.append({"color": bits[0], "qty": _history_int(bits[1]),
+                                       "type": bits[2] if len(bits) > 2 else physical_item.get("scan_type")})
+                physical_breakdown = parsed
+            first_part = physical_breakdown[0] if physical_breakdown else {}
+            add(first_part.get("color") or physical_item.get("color"),
+                first_part.get("type") or physical_item.get("scan_type"), 1,
+                master_lpn)
     for item in items:
         if item.get("status") != "Scanned": continue
         lpn = str(item.get("lpn") or "").strip().upper(); scan_type = str(item.get("scan_type") or "")
-        if lpn in combined_children:
+        if lpn in combined_children or lpn in combined_masters:
             continue
         qty = int(item.get("qty") or 0)
         breakdown = item.get("color_breakdown") or []
@@ -294,14 +316,6 @@ def summarize_branch_for_member_data(wave_data: dict, branch: str) -> dict:
                 bits = part.split("~", 2)
                 if len(bits) >= 2: parsed.append({"color": bits[0], "qty": _history_int(bits[1]), "type": bits[2] if len(bits) > 2 else scan_type})
             breakdown = parsed
-        # Combine นับเป็นภาชนะจริง 1 ใบ: ข้าม child และนับ master เพียงครั้งเดียว
-        if lpn in combined_masters:
-            if breakdown:
-                part = breakdown[0]
-                add(part.get("color"), part.get("type"), 1, lpn)
-            else:
-                add(item.get("color"), scan_type, 1, lpn)
-            continue
         if not breakdown:
             add(item.get("color"), scan_type, qty, lpn)
         else:
@@ -1589,7 +1603,7 @@ async def read_root():
 # ✅ Health Check Endpoint: ตอบสนองเร็ว <5ms สำหรับ keep-alive heartbeat
 @app.get("/api/health")
 async def health_check():
-    return {"status": "ok", "version": "1.7.0", "timestamp": time.time()}
+    return {"status": "ok", "version": "1.7.1", "timestamp": time.time()}
 
 @app.post("/api/document-summary")
 def save_document_summary(data: DocumentSummaryBatchData):
