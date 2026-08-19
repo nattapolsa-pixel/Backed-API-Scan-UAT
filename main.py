@@ -68,6 +68,13 @@ MEMBER_HISTORY_CACHE_TTL_SECONDS = 10 * 60
 member_history_cache = {"expires_at": 0.0, "data": {}}
 member_history_lock = Lock()
 
+DELIVERY_REPORT_SPREADSHEET_ID = "1_giWrKy5bi8cpmdM-2ui1_vG9jQ7kEhf4yxMvHpj-XY"
+DELIVERY_REPORT_SHEET_NAME = "Delivery report"
+DELIVERY_CAR_SHEET_NAME = "Data Booking&Car"
+DELIVERY_BRANCH_SHEET_NAME = "Sheet3"
+delivery_report_lock = Lock()
+delivery_lookup_cache = {"expires_at": 0.0, "cars": {}, "branches": {}}
+
 def get_sheets_session():
     credentials = client._credentials
     if hasattr(credentials, "with_scopes"):
@@ -146,6 +153,115 @@ def write_member_history_summaries(summaries: list):
     for summary in summaries:
         write_member_history_summary(summary)
 
+def _sheet_values(session, spreadsheet_id: str, a1_range: str) -> list:
+    encoded = urllib.parse.quote(a1_range, safe="")
+    url = f"https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}/values/{encoded}"
+    response = session.get(url, timeout=60)
+    response.raise_for_status()
+    return response.json().get("values") or []
+
+def load_delivery_lookup_maps(session) -> tuple:
+    now = time.time()
+    with delivery_report_lock:
+        if delivery_lookup_cache["expires_at"] > now:
+            return delivery_lookup_cache["cars"], delivery_lookup_cache["branches"]
+        car_rows = _sheet_values(session, DELIVERY_REPORT_SPREADSHEET_ID, f"'{DELIVERY_CAR_SHEET_NAME}'!A:H")
+        branch_rows = _sheet_values(session, DELIVERY_REPORT_SPREADSHEET_ID, f"'{DELIVERY_BRANCH_SHEET_NAME}'!A:F")
+        cars = {}
+        for row in car_rows[1:]:
+            row = list(row) + [""] * max(0, 8 - len(row))
+            booking = str(row[2] or "").strip().upper()
+            if booking:
+                cars[booking] = {"carrier": str(row[5] or "").strip(), "driver": str(row[6] or "").strip(),
+                                 "plate": str(row[7] or "").strip()}
+        branches = {}
+        for row in branch_rows[1:]:
+            row = list(row) + [""] * max(0, 6 - len(row))
+            code = str(row[0] or "").strip().upper()
+            if code:
+                branches[code] = {"province": str(row[3] or "").strip(), "region": str(row[5] or "").strip()}
+        delivery_lookup_cache.update({"expires_at": now + 600, "cars": cars, "branches": branches})
+        return cars, branches
+
+def get_delivery_wave_meta(wave: str) -> dict:
+    query = """
+        SELECT MAX(Planned_Pick_Date) AS planned_pick_date,
+               COALESCE(MAX(NULLIF(TRIM(Vehicle_Booking_No), '')), '') AS booking_no
+        FROM `pro-analytics-db.logistics_db.wave_summary_fast`
+        WHERE SAFE_CAST(REGEXP_REPLACE(TRIM(CAST(Wave_Number AS STRING)), r'[^0-9]', '') AS INT64) = @wave
+    """
+    config = bigquery.QueryJobConfig(query_parameters=[bigquery.ScalarQueryParameter("wave", "INT64", int(wave))])
+    row = next(iter(client.query(query, job_config=config).result(timeout=BQ_JOB_TIMEOUT_SECONDS)), None)
+    return {"pick_date": row["planned_pick_date"] if row else None,
+            "booking": str(row["booking_no"] or "").strip().upper() if row else ""}
+
+def delivery_business_dates(pick_date):
+    if isinstance(pick_date, datetime.datetime):
+        pick_date = pick_date.date()
+    if not isinstance(pick_date, datetime.date):
+        return None, None
+    order_date = pick_date - datetime.timedelta(days=1)
+    # ตัวอย่าง Pick จันทร์ 17 -> วันที่สั่งศุกร์ 14 (ไม่ใช้เสาร์-อาทิตย์เป็นวันสั่ง)
+    if order_date.weekday() == 6:
+        order_date -= datetime.timedelta(days=2)
+    delivery_date = pick_date + datetime.timedelta(days=1)
+    if delivery_date.weekday() == 6:
+        delivery_date += datetime.timedelta(days=1)
+    return order_date, delivery_date
+
+def _date_serial(value):
+    return (value - datetime.date(1899, 12, 30)).days if isinstance(value, datetime.date) else ""
+
+def write_delivery_report_summary(summary: dict):
+    """Upsert one Wave+Branch summary into Delivery report A:T."""
+    wave = str(int(str(summary["wave"]).strip()))
+    branch = str(summary["branch"] or "").strip().upper()
+    meta = get_delivery_wave_meta(wave)
+    pick_date = meta.get("pick_date")
+    if not pick_date:
+        raise ValueError(f"Planned_Pick_Date not found for Wave {wave}")
+    order_date, delivery_date = delivery_business_dates(pick_date)
+    session = get_sheets_session()
+    cars, branches = load_delivery_lookup_maps(session)
+    booking = str(summary.get("booking") or meta.get("booking") or "").strip().upper()
+    car = cars.get(booking, {})
+    branch_master = branches.get(branch, {})
+
+    with delivery_report_lock:
+        existing = _sheet_values(session, DELIVERY_REPORT_SPREADSHEET_ID, f"'{DELIVERY_REPORT_SHEET_NAME}'!A:K")
+        target_row = 0
+        last_data_row = 1
+        max_sequence = 0
+        for index, row in enumerate(existing[1:], start=2):
+            row = list(row) + [""] * max(0, 11 - len(row))
+            try: max_sequence = max(max_sequence, int(float(str(row[0] or 0))))
+            except (TypeError, ValueError): pass
+            row_wave = re.sub(r"\D", "", str(row[9] or ""))
+            row_branch = str(row[10] or "").strip().upper()
+            if str(row[7] or "").strip() or row_wave or row_branch:
+                last_data_row = index
+            if row_wave and str(int(row_wave)) == wave and row_branch == branch:
+                target_row = index
+                break
+        if not target_row:
+            target_row = last_data_row + 1
+        sequence = max_sequence + 1 if target_row > last_data_row else _history_int(existing[target_row - 1][0])
+        if sequence <= 0:
+            sequence = max_sequence + 1
+        row_values = [[
+            sequence, _date_serial(order_date), _date_serial(pick_date), _date_serial(delivery_date),
+            car.get("carrier", ""), car.get("driver", ""), car.get("plate", ""), booking,
+            member_data_bu(summary.get("bu")), wave, branch, clean_branch_display_name(summary.get("branch_name")),
+            branch_master.get("province", ""), branch_master.get("region", ""),
+            _history_int(summary.get("m")), _history_int(summary.get("red")), _history_int(summary.get("blue")),
+            _history_int(summary.get("green")), _history_int(summary.get("black")), _history_int(summary.get("total"))
+        ]]
+        encoded = urllib.parse.quote(f"'{DELIVERY_REPORT_SHEET_NAME}'!A{target_row}:T{target_row}", safe="")
+        base = f"https://sheets.googleapis.com/v4/spreadsheets/{DELIVERY_REPORT_SPREADSHEET_ID}/values"
+        response = session.put(f"{base}/{encoded}?valueInputOption=RAW", json={"values": row_values}, timeout=60)
+        response.raise_for_status()
+    print(f"✅ Delivery report updated | Wave {wave} | Branch {branch} | Row {target_row}")
+
 def summarize_branch_for_member_data(wave_data: dict, branch: str) -> dict:
     items = [item for item in wave_data.get("lpn_list", []) if str(item.get("branch") or "").strip().upper() == branch]
     totals = {"m": 0, "red": 0, "blue": 0, "green": 0, "black": 0}
@@ -193,7 +309,10 @@ def summarize_branch_for_member_data(wave_data: dict, branch: str) -> dict:
     first = items[0] if items else {}
     pallet_nos = {int(no) for item in items for no in (item.get("branch_pallet_nos") or []) if int(no) > 0}
     if not pallet_nos: pallet_nos = {int(item.get("pallet_no") or 0) for item in items if int(item.get("pallet_no") or 0) > 0}
-    return {"wave": str(int(str(wave_data.get("wave_no") or 0))), "branch": branch,
+    wave_key = str(int(str(wave_data.get("wave_no") or 0)))
+    assignment = get_booking_branch_assignments().get((wave_key, branch))
+    current_booking = str((assignment or {}).get("Assigned_Booking") or wave_data.get("booking_no") or "").strip().upper()
+    return {"wave": wave_key, "booking": current_booking, "branch": branch,
             "branch_name": first.get("branch_name") or branch, "bu": member_data_bu(first.get("owner")),
             "label_count": len({str(item.get("lpn") or "") for item in items if item.get("lpn")}),
             **totals, "total": sum(totals.values()), "pallet": len(pallet_nos)}
@@ -1418,6 +1537,7 @@ class BookingBranchMoveData(BaseModel):
 
 class DocumentSummaryData(BaseModel):
     wave: str
+    booking: Optional[str] = None
     branch: str
     branch_name: Optional[str] = None
     bu: Optional[str] = None
@@ -1469,7 +1589,7 @@ async def read_root():
 # ✅ Health Check Endpoint: ตอบสนองเร็ว <5ms สำหรับ keep-alive heartbeat
 @app.get("/api/health")
 async def health_check():
-    return {"status": "ok", "version": "1.6.1", "timestamp": time.time()}
+    return {"status": "ok", "version": "1.7.0", "timestamp": time.time()}
 
 @app.post("/api/document-summary")
 def save_document_summary(data: DocumentSummaryBatchData):
@@ -1488,11 +1608,13 @@ def save_document_summary(data: DocumentSummaryBatchData):
                   ("label_count", "m", "red", "blue", "green", "black", "total", "pallet")}
         calculated_total = values["m"] + values["red"] + values["blue"] + values["green"] + values["black"]
         values["total"] = calculated_total
-        normalized.append({"wave": wave, "branch": branch,
+        normalized.append({"wave": wave, "booking": str(item.booking or "").strip().upper(), "branch": branch,
                            "branch_name": str(item.branch_name or branch).strip(),
                            "bu": member_data_bu(item.bu), **values})
     try:
         write_member_history_summaries(normalized)
+        for summary in normalized:
+            write_delivery_report_summary(summary)
     except Exception as exc:
         print(f"🚨 DOCUMENT SUMMARY WRITE ERROR: {exc}")
         raise HTTPException(status_code=503, detail="Member Data write failed")
@@ -2230,9 +2352,11 @@ def run_close_job_queries_in_background(wave_clean: str, branch: str, insert_zer
         # After BQ queries finish, refresh cache
         refreshed = get_wave_data_internal(wave_clean, force_refresh=True)
         try:
-            write_member_history_summary(summarize_branch_for_member_data(refreshed, branch))
+            summary = summarize_branch_for_member_data(refreshed, branch)
+            write_member_history_summary(summary)
+            write_delivery_report_summary(summary)
         except Exception as sheet_error:
-            print(f"⚠️ MEMBER DATA WRITE ERROR | Wave: {wave_clean} | Branch: {branch} | {sheet_error}")
+            print(f"⚠️ REPORT SHEET WRITE ERROR | Wave: {wave_clean} | Branch: {branch} | {sheet_error}")
         print(f"✅ BACKGROUND CLOSE JOB COMPLETE | Wave: {wave_clean} | Branch: {branch}")
     except Exception as e:
         print(f"🚨 BACKGROUND CLOSE JOB ERROR | Wave: {wave_clean} | Branch: {branch} | Error: {str(e)}")
