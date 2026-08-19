@@ -70,6 +70,8 @@ member_history_lock = Lock()
 
 DELIVERY_REPORT_SPREADSHEET_ID = "1_giWrKy5bi8cpmdM-2ui1_vG9jQ7kEhf4yxMvHpj-XY"
 DELIVERY_REPORT_SHEET_NAME = "Delivery report"
+DELIVERY_SOURCE_SHEET_NAME = "วางข้อมูล"
+DELIVERY_REPORT_SHEET_ID = 1686001204
 DELIVERY_CAR_SHEET_NAME = "Data Booking&Car"
 DELIVERY_BRANCH_SHEET_NAME = "Sheet3"
 delivery_report_lock = Lock()
@@ -213,7 +215,7 @@ def _date_serial(value):
     return (value - datetime.date(1899, 12, 30)).days if isinstance(value, datetime.date) else ""
 
 def write_delivery_report_summary(summary: dict):
-    """Upsert one Wave+Branch summary into Delivery report A:T."""
+    """Upsert one Wave+Branch into the source tab; Delivery report remains formula-driven."""
     wave = str(int(str(summary["wave"]).strip()))
     branch = str(summary["branch"] or "").strip().upper()
     meta = get_delivery_wave_meta(wave)
@@ -228,39 +230,61 @@ def write_delivery_report_summary(summary: dict):
     branch_master = branches.get(branch, {})
 
     with delivery_report_lock:
-        existing = _sheet_values(session, DELIVERY_REPORT_SPREADSHEET_ID, f"'{DELIVERY_REPORT_SHEET_NAME}'!A:K")
+        # Delivery report เป็นหน้าสูตร จึงต้องบันทึกที่ชีตต้นทาง วางข้อมูล เท่านั้น
+        # อ่าน A:F เพื่อไม่ให้สูตรที่เตรียมไว้ท้ายชีตถูกเข้าใจว่าเป็นข้อมูลจริง
+        existing = _sheet_values(session, DELIVERY_REPORT_SPREADSHEET_ID, f"'{DELIVERY_SOURCE_SHEET_NAME}'!A:F")
         target_row = 0
         last_data_row = 1
-        max_sequence = 0
         for index, row in enumerate(existing[1:], start=2):
-            row = list(row) + [""] * max(0, 11 - len(row))
-            try: max_sequence = max(max_sequence, int(float(str(row[0] or 0))))
-            except (TypeError, ValueError): pass
-            row_wave = re.sub(r"\D", "", str(row[9] or ""))
-            row_branch = str(row[10] or "").strip().upper()
-            if str(row[7] or "").strip() or row_wave or row_branch:
+            row = list(row) + [""] * max(0, 6 - len(row))
+            row_wave = re.sub(r"\D", "", str(row[2] or ""))
+            row_branch = str(row[3] or "").strip().upper()
+            if row_wave or row_branch:
                 last_data_row = index
             if row_wave and str(int(row_wave)) == wave and row_branch == branch:
                 target_row = index
                 break
         if not target_row:
             target_row = last_data_row + 1
-        sequence = max_sequence + 1 if target_row > last_data_row else _history_int(existing[target_row - 1][0])
-        if sequence <= 0:
-            sequence = max_sequence + 1
-        row_values = [[
-            sequence, _date_serial(order_date), _date_serial(pick_date), _date_serial(delivery_date),
-            car.get("carrier", ""), car.get("driver", ""), car.get("plate", ""), booking,
-            member_data_bu(summary.get("bu")), wave, branch, clean_branch_display_name(summary.get("branch_name")),
-            branch_master.get("province", ""), branch_master.get("region", ""),
+        now_bkk = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=7)))
+        core_values = [[
+            _date_serial(now_bkk.date()), now_bkk.strftime("%H:%M:%S"), wave, branch,
+            clean_branch_display_name(summary.get("branch_name")), member_data_bu(summary.get("bu")), "", "",
             _history_int(summary.get("m")), _history_int(summary.get("red")), _history_int(summary.get("blue")),
-            _history_int(summary.get("green")), _history_int(summary.get("black")), _history_int(summary.get("total"))
+            _history_int(summary.get("green")), _history_int(summary.get("black")), _history_int(summary.get("total")),
+            _history_int(summary.get("pallet")), "Outbound", ""
         ]]
-        encoded = urllib.parse.quote(f"'{DELIVERY_REPORT_SHEET_NAME}'!A{target_row}:T{target_row}", safe="")
         base = f"https://sheets.googleapis.com/v4/spreadsheets/{DELIVERY_REPORT_SPREADSHEET_ID}/values"
-        response = session.put(f"{base}/{encoded}?valueInputOption=RAW", json={"values": row_values}, timeout=60)
-        response.raise_for_status()
-    print(f"✅ Delivery report updated | Wave {wave} | Branch {branch} | Row {target_row}")
+        ranges = [
+            (f"'{DELIVERY_SOURCE_SHEET_NAME}'!A{target_row}:Q{target_row}", core_values),
+            (f"'{DELIVERY_SOURCE_SHEET_NAME}'!S{target_row}:V{target_row}", [[
+                booking, car.get("carrier", ""), car.get("driver", ""), car.get("plate", "")
+            ]]),
+            (f"'{DELIVERY_SOURCE_SHEET_NAME}'!X{target_row}:Z{target_row}", [[
+                _date_serial(order_date), _date_serial(pick_date), _date_serial(delivery_date)
+            ]]),
+        ]
+        for a1_range, values in ranges:
+            encoded = urllib.parse.quote(a1_range, safe="")
+            response = session.put(f"{base}/{encoded}?valueInputOption=RAW", json={"values": values}, timeout=60)
+            response.raise_for_status()
+
+        # คืนสูตรของหน้า Delivery report เฉพาะแถวเดียวจากแถวก่อนหน้า
+        # ป้องกัน #REF! และทำให้หน้า Report แสดงค่าจาก วางข้อมูล ตามโครงสร้างเดิม
+        if target_row > 2:
+            batch_url = f"https://sheets.googleapis.com/v4/spreadsheets/{DELIVERY_REPORT_SPREADSHEET_ID}:batchUpdate"
+            formula_copy = {
+                "requests": [{"copyPaste": {
+                    "source": {"sheetId": DELIVERY_REPORT_SHEET_ID, "startRowIndex": target_row - 2,
+                               "endRowIndex": target_row - 1, "startColumnIndex": 0, "endColumnIndex": 20},
+                    "destination": {"sheetId": DELIVERY_REPORT_SHEET_ID, "startRowIndex": target_row - 1,
+                                    "endRowIndex": target_row, "startColumnIndex": 0, "endColumnIndex": 20},
+                    "pasteType": "PASTE_FORMULA", "pasteOrientation": "NORMAL"
+                }}]
+            }
+            copied = session.post(batch_url, json=formula_copy, timeout=60)
+            copied.raise_for_status()
+    print(f"✅ Delivery source/report updated | Wave {wave} | Branch {branch} | Row {target_row}")
 
 def summarize_branch_for_member_data(wave_data: dict, branch: str) -> dict:
     items = [item for item in wave_data.get("lpn_list", []) if str(item.get("branch") or "").strip().upper() == branch]
@@ -1603,7 +1627,7 @@ async def read_root():
 # ✅ Health Check Endpoint: ตอบสนองเร็ว <5ms สำหรับ keep-alive heartbeat
 @app.get("/api/health")
 async def health_check():
-    return {"status": "ok", "version": "1.7.1", "timestamp": time.time()}
+    return {"status": "ok", "version": "1.7.2", "timestamp": time.time()}
 
 @app.post("/api/document-summary")
 def save_document_summary(data: DocumentSummaryBatchData):
