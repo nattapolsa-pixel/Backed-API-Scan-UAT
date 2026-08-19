@@ -80,6 +80,8 @@ def member_data_bu(owner) -> str:
     return {
         "DP02": "PUNTHAI",
         "DM02": "MAX MART",
+        "MAXMART": "MAX MART",
+        "MAX MART": "MAX MART",
     }.get(code, code or "Unknown")
 
 def write_member_history_summary(summary: dict):
@@ -139,6 +141,11 @@ def write_member_history_summary(summary: dict):
         member_history_cache["expires_at"] = 0
     print(f"✅ Member Data updated | Wave {target_wave} | Branch {target_branch} | {summary['total']} boxes")
 
+def write_member_history_summaries(summaries: list):
+    """Upsert document totals. Used after a supervisor confirms edited print values."""
+    for summary in summaries:
+        write_member_history_summary(summary)
+
 def summarize_branch_for_member_data(wave_data: dict, branch: str) -> dict:
     items = [item for item in wave_data.get("lpn_list", []) if str(item.get("branch") or "").strip().upper() == branch]
     totals = {"m": 0, "red": 0, "blue": 0, "green": 0, "black": 0}
@@ -151,9 +158,18 @@ def summarize_branch_for_member_data(wave_data: dict, branch: str) -> dict:
         elif color == "GREEN": totals["green"] += qty
         elif color == "BLACK": totals["black"] += qty
         else: totals["m"] += qty
+    combined_children = {
+        str(item.get("lpn") or "").strip().upper(): str(item.get("scan_type") or "").split(":", 1)[1].strip().upper()
+        for item in items
+        if str(item.get("scan_type") or "").upper().startswith("COMBINE:")
+        and ":" in str(item.get("scan_type") or "")
+    }
+    combined_masters = set(combined_children.values())
     for item in items:
         if item.get("status") != "Scanned": continue
         lpn = str(item.get("lpn") or "").strip().upper(); scan_type = str(item.get("scan_type") or "")
+        if lpn in combined_children:
+            continue
         qty = int(item.get("qty") or 0)
         breakdown = item.get("color_breakdown") or []
         if isinstance(breakdown, str):
@@ -162,8 +178,14 @@ def summarize_branch_for_member_data(wave_data: dict, branch: str) -> dict:
                 bits = part.split("~", 2)
                 if len(bits) >= 2: parsed.append({"color": bits[0], "qty": _history_int(bits[1]), "type": bits[2] if len(bits) > 2 else scan_type})
             breakdown = parsed
-        # COMBINE คือ LPN ที่สแกนจริงและมี 1 กล่อง ต้องนับตามสีของรายการนั้น
-        # ห้ามข้าม เพราะจะทำให้ยอดรวมขาด 1 กล่องต่อ Combine
+        # Combine นับเป็นภาชนะจริง 1 ใบ: ข้าม child และนับ master เพียงครั้งเดียว
+        if lpn in combined_masters:
+            if breakdown:
+                part = breakdown[0]
+                add(part.get("color"), part.get("type"), 1, lpn)
+            else:
+                add(item.get("color"), scan_type, 1, lpn)
+            continue
         if not breakdown:
             add(item.get("color"), scan_type, qty, lpn)
         else:
@@ -1394,6 +1416,24 @@ class BookingBranchMoveData(BaseModel):
     note: Optional[str] = None
     emp_id: str
 
+class DocumentSummaryData(BaseModel):
+    wave: str
+    branch: str
+    branch_name: Optional[str] = None
+    bu: Optional[str] = None
+    label_count: int = 0
+    m: int = 0
+    red: int = 0
+    blue: int = 0
+    green: int = 0
+    black: int = 0
+    total: int = 0
+    pallet: int = 0
+
+class DocumentSummaryBatchData(BaseModel):
+    summaries: List[DocumentSummaryData]
+    emp_id: Optional[str] = None
+
 def ensure_booking_override_table():
     client.query("""
         CREATE TABLE IF NOT EXISTS `pro-analytics-db.logistics_db.booking_branch_overrides` (
@@ -1429,7 +1469,34 @@ async def read_root():
 # ✅ Health Check Endpoint: ตอบสนองเร็ว <5ms สำหรับ keep-alive heartbeat
 @app.get("/api/health")
 async def health_check():
-    return {"status": "ok", "version": "1.6.0", "timestamp": time.time()}
+    return {"status": "ok", "version": "1.6.1", "timestamp": time.time()}
+
+@app.post("/api/document-summary")
+def save_document_summary(data: DocumentSummaryBatchData):
+    if not data.summaries or len(data.summaries) > 100:
+        raise HTTPException(status_code=400, detail="summary count must be 1-100")
+    normalized = []
+    for item in data.summaries:
+        try:
+            wave = str(int(str(item.wave).strip()))
+        except ValueError:
+            raise HTTPException(status_code=400, detail=f"invalid wave: {item.wave}")
+        branch = str(item.branch or "").strip().upper()
+        if not branch:
+            raise HTTPException(status_code=400, detail="branch is required")
+        values = {key: max(0, int(getattr(item, key) or 0)) for key in
+                  ("label_count", "m", "red", "blue", "green", "black", "total", "pallet")}
+        calculated_total = values["m"] + values["red"] + values["blue"] + values["green"] + values["black"]
+        values["total"] = calculated_total
+        normalized.append({"wave": wave, "branch": branch,
+                           "branch_name": str(item.branch_name or branch).strip(),
+                           "bu": member_data_bu(item.bu), **values})
+    try:
+        write_member_history_summaries(normalized)
+    except Exception as exc:
+        print(f"🚨 DOCUMENT SUMMARY WRITE ERROR: {exc}")
+        raise HTTPException(status_code=503, detail="Member Data write failed")
+    return {"status": "success", "updated": len(normalized)}
 
 def transaction_already_processed(transaction_id: str) -> bool:
     tx_id = str(transaction_id or "").strip()
