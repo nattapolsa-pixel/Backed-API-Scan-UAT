@@ -1627,10 +1627,18 @@ async def read_root():
 # ✅ Health Check Endpoint: ตอบสนองเร็ว <5ms สำหรับ keep-alive heartbeat
 @app.get("/api/health")
 async def health_check():
-    return {"status": "ok", "version": "1.7.2", "timestamp": time.time()}
+    return {"status": "ok", "version": "1.7.3", "timestamp": time.time()}
+
+def sync_document_summary_reports(summaries: list):
+    try:
+        write_member_history_summaries(summaries)
+        for summary in summaries:
+            write_delivery_report_summary(summary)
+    except Exception as exc:
+        print(f"🚨 DOCUMENT SUMMARY BACKGROUND WRITE ERROR: {exc}")
 
 @app.post("/api/document-summary")
-def save_document_summary(data: DocumentSummaryBatchData):
+def save_document_summary(data: DocumentSummaryBatchData, background_tasks: BackgroundTasks):
     if not data.summaries or len(data.summaries) > 100:
         raise HTTPException(status_code=400, detail="summary count must be 1-100")
     normalized = []
@@ -1649,14 +1657,8 @@ def save_document_summary(data: DocumentSummaryBatchData):
         normalized.append({"wave": wave, "booking": str(item.booking or "").strip().upper(), "branch": branch,
                            "branch_name": str(item.branch_name or branch).strip(),
                            "bu": member_data_bu(item.bu), **values})
-    try:
-        write_member_history_summaries(normalized)
-        for summary in normalized:
-            write_delivery_report_summary(summary)
-    except Exception as exc:
-        print(f"🚨 DOCUMENT SUMMARY WRITE ERROR: {exc}")
-        raise HTTPException(status_code=503, detail="Member Data write failed")
-    return {"status": "success", "updated": len(normalized)}
+    background_tasks.add_task(sync_document_summary_reports, copy.deepcopy(normalized))
+    return {"status": "queued", "updated": len(normalized)}
 
 def transaction_already_processed(transaction_id: str) -> bool:
     tx_id = str(transaction_id or "").strip()
