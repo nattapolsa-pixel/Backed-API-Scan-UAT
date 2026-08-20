@@ -1730,6 +1730,21 @@ def get_device_states(waves: str = "", branch_code: str = "", exclude_device_id:
             active.append(dict(state))
     return {"status": "success", "devices": active}
 
+@app.post("/api/clear-device-states")
+def clear_device_states(data: DeviceStateData):
+    branch = str(data.branch_code or "").strip().upper()
+    waves = {str(int(str(wave).strip())) for wave in data.waves if str(wave).strip().isdigit()}
+    with device_pending_states_lock:
+        to_del = []
+        for key, state in device_pending_states.items():
+            if branch and state.get("branch_code") == branch:
+                to_del.append(key)
+            elif waves and waves.intersection(state.get("waves") or []):
+                to_del.append(key)
+        for key in to_del:
+            device_pending_states.pop(key, None)
+    return {"status": "cleared", "count": len(to_del)}
+
 # 🚀 [API 1] โหลดข้อมูล Wave
 # 🚀 [API 1] โหลดข้อมูล Wave
 @app.get("/api/check-wave")
