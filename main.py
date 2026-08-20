@@ -93,17 +93,18 @@ def member_data_bu(owner) -> str:
         "MAX MART": "MAX MART",
     }.get(code, code or "Unknown")
 
-def write_member_history_summary(summary: dict):
-    """Upsert one completed Wave+Branch row in Member Data."""
+def write_member_history_summaries(summaries: list):
+    """Upsert document totals using batchUpdate in 1 single HTTP request."""
+    if not summaries:
+        return
     session = get_sheets_session()
     lookup_range = urllib.parse.quote("Member Data!A:D", safe="")
-    base = f"https://sheets.googleapis.com/v4/spreadsheets/{MEMBER_HISTORY_SPREADSHEET_ID}/values"
-    read_res = session.get(f"{base}/{lookup_range}", timeout=45)
+    base = f"https://sheets.googleapis.com/v4/spreadsheets/{MEMBER_HISTORY_SPREADSHEET_ID}"
+    read_res = session.get(f"{base}/values/{lookup_range}", timeout=45)
     read_res.raise_for_status()
     values = read_res.json().get("values") or []
-    target_wave = str(int(summary["wave"]))
-    target_branch = str(summary["branch"]).strip().upper()
-    row_no = 0
+    
+    existing_map = {}
     last_data_row = 1
     for index in range(len(values), 1, -1):
         row = values[index - 1]
@@ -112,33 +113,57 @@ def write_member_history_summary(summary: dict):
         branch_code = str(row[3] or "").strip().upper()
         if (wave_digits or branch_code) and index > last_data_row:
             last_data_row = index
-        if wave_digits and str(int(wave_digits)) == target_wave and branch_code == target_branch:
-            row_no = index
-            break
+        if wave_digits and branch_code:
+            key = (str(int(wave_digits)), branch_code)
+            if key not in existing_map:
+                existing_map[key] = index
+
     if not last_data_row:
         last_data_row = len(values)
+
     now_bkk = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=7)))
-    row_values = [[
-        now_bkk.strftime("%-d/%-m/%Y") if os.name != "nt" else f"{now_bkk.day}/{now_bkk.month}/{now_bkk.year}",
-        now_bkk.strftime("%H:%M"), target_wave, target_branch, summary["branch_name"], summary["bu"],
-        summary["label_count"], "", summary["m"], summary["red"], summary["blue"],
-        summary["green"], summary["black"], summary["total"], summary["pallet"], " Outbound"
-    ]]
-    target_row = row_no if row_no else (last_data_row + 1)
-    target_range = urllib.parse.quote(f"Member Data!A{target_row}:P{target_row}", safe="")
-    response = session.put(f"{base}/{target_range}?valueInputOption=USER_ENTERED", json={"values": row_values}, timeout=45)
+    date_str = now_bkk.strftime("%-d/%-m/%Y") if os.name != "nt" else f"{now_bkk.day}/{now_bkk.month}/{now_bkk.year}"
+    time_str = now_bkk.strftime("%H:%M")
+
+    batch_data = []
+    current_append_row = last_data_row + 1
+
+    for summary in summaries:
+        target_wave = str(int(summary["wave"]))
+        target_branch = str(summary["branch"]).strip().upper()
+        key = (target_wave, target_branch)
+        
+        if key in existing_map:
+            target_row = existing_map[key]
+        else:
+            target_row = current_append_row
+            existing_map[key] = target_row
+            current_append_row += 1
+
+        row_values = [[
+            date_str, time_str, target_wave, target_branch, summary["branch_name"], summary["bu"],
+            summary["label_count"], "", summary["m"], summary["red"], summary["blue"],
+            summary["green"], summary["black"], summary["total"], summary["pallet"], " Outbound"
+        ]]
+        batch_data.append({
+            "range": f"Member Data!A{target_row}:P{target_row}",
+            "values": row_values
+        })
+
+    batch_payload = {
+        "valueInputOption": "USER_ENTERED",
+        "data": batch_data
+    }
+    response = session.post(f"{base}/values:batchUpdate", json=batch_payload, timeout=45)
     response.raise_for_status()
+
     with member_history_lock:
         member_history_cache["expires_at"] = 0
-    print(f"✅ Member Data updated | Wave {target_wave} | Branch {target_branch} | Row {target_row} | {summary['total']} boxes")
+    print(f"⚡ Member Data BATCH updated | {len(batch_data)} branches in 1 request")
 
-def write_member_history_summaries(summaries: list):
-    """Upsert document totals. Used after a supervisor confirms edited print values."""
-    for summary in summaries:
-        try:
-            write_member_history_summary(summary)
-        except Exception as e:
-            print(f"🚨 Member history write error for {summary.get('wave')}/{summary.get('branch')}: {e}")
+def write_member_history_summary(summary: dict):
+    """Upsert one completed Wave+Branch row in Member Data."""
+    write_member_history_summaries([summary])
 
 def _sheet_values(session, spreadsheet_id: str, a1_range: str) -> list:
     encoded = urllib.parse.quote(a1_range, safe="")
@@ -199,27 +224,17 @@ def delivery_business_dates(pick_date):
 def _date_serial(value):
     return (value - datetime.date(1899, 12, 30)).days if isinstance(value, datetime.date) else ""
 
-def write_delivery_report_summary(summary: dict):
-    """Upsert one Wave+Branch into the source tab; Delivery report remains formula-driven."""
-    wave = str(int(str(summary["wave"]).strip()))
-    branch = str(summary["branch"] or "").strip().upper()
-    meta = get_delivery_wave_meta(wave)
-    pick_date = meta.get("pick_date")
-    if not pick_date:
-        now_bkk = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=7)))
-        pick_date = now_bkk.date()
-    order_date, delivery_date = delivery_business_dates(pick_date)
+def write_delivery_report_summaries(summaries: list):
+    """Upsert multiple Wave+Branch into the source tab using batchUpdate in 1 single HTTP request."""
+    if not summaries:
+        return
     session = get_sheets_session()
     cars, branches = load_delivery_lookup_maps(session)
-    booking = str(summary.get("booking") or meta.get("booking") or "").strip().upper()
-    car = cars.get(booking, {})
-    branch_master = branches.get(branch, {})
-
+    now_bkk = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=7)))
+    
     with delivery_report_lock:
-        # Delivery report เป็นหน้าสูตร จึงต้องบันทึกที่ชีตต้นทาง วางข้อมูล เท่านั้น
-        # อ่าน A:F เพื่อไม่ให้สูตรที่เตรียมไว้ท้ายชีตถูกเข้าใจว่าเป็นข้อมูลจริง
         existing = _sheet_values(session, DELIVERY_REPORT_SPREADSHEET_ID, f"'{DELIVERY_SOURCE_SHEET_NAME}'!A:F")
-        target_row = 0
+        existing_map = {}
         last_data_row = 1
         for index in range(len(existing), 1, -1):
             row = existing[index - 1]
@@ -228,50 +243,84 @@ def write_delivery_report_summary(summary: dict):
             row_branch = str(row[3] or "").strip().upper()
             if (row_wave or row_branch) and index > last_data_row:
                 last_data_row = index
-            if row_wave and str(int(row_wave)) == wave and row_branch == branch:
-                target_row = index
-                break
-        if not target_row:
-            target_row = last_data_row + 1
-        now_bkk = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=7)))
-        core_values = [[
-            _date_serial(now_bkk.date()), now_bkk.strftime("%H:%M:%S"), wave, branch,
-            clean_branch_display_name(summary.get("branch_name")), member_data_bu(summary.get("bu")), "", "",
-            _history_int(summary.get("m")), _history_int(summary.get("red")), _history_int(summary.get("blue")),
-            _history_int(summary.get("green")), _history_int(summary.get("black")), _history_int(summary.get("total")),
-            _history_int(summary.get("pallet")), "Outbound", ""
-        ]]
-        base = f"https://sheets.googleapis.com/v4/spreadsheets/{DELIVERY_REPORT_SPREADSHEET_ID}/values"
-        ranges = [
-            (f"'{DELIVERY_SOURCE_SHEET_NAME}'!A{target_row}:Q{target_row}", core_values),
-            (f"'{DELIVERY_SOURCE_SHEET_NAME}'!S{target_row}:V{target_row}", [[
-                booking, car.get("carrier", ""), car.get("driver", ""), car.get("plate", "")
-            ]]),
-            (f"'{DELIVERY_SOURCE_SHEET_NAME}'!X{target_row}:Z{target_row}", [[
-                _date_serial(order_date), _date_serial(pick_date), _date_serial(delivery_date)
-            ]]),
-        ]
-        for a1_range, values in ranges:
-            encoded = urllib.parse.quote(a1_range, safe="")
-            response = session.put(f"{base}/{encoded}?valueInputOption=RAW", json={"values": values}, timeout=60)
-            response.raise_for_status()
+            if row_wave and row_branch:
+                key = (str(int(row_wave)), row_branch)
+                if key not in existing_map:
+                    existing_map[key] = index
 
-        # คืนสูตรของหน้า Delivery report เฉพาะแถวเดียวจากแถวก่อนหน้า
-        # ป้องกัน #REF! และทำให้หน้า Report แสดงค่าจาก วางข้อมูล ตามโครงสร้างเดิม
-        if target_row > 2:
-            batch_url = f"https://sheets.googleapis.com/v4/spreadsheets/{DELIVERY_REPORT_SPREADSHEET_ID}:batchUpdate"
-            formula_copy = {
-                "requests": [{"copyPaste": {
+        if not last_data_row:
+            last_data_row = len(existing)
+
+        batch_data = []
+        formula_requests = []
+        current_append_row = last_data_row + 1
+        meta_cache = {}
+
+        for summary in summaries:
+            wave = str(int(str(summary["wave"]).strip()))
+            branch = str(summary["branch"] or "").strip().upper()
+            key = (wave, branch)
+            
+            if wave not in meta_cache:
+                meta_cache[wave] = get_delivery_wave_meta(wave)
+            meta = meta_cache[wave]
+
+            pick_date = meta.get("pick_date") or now_bkk.date()
+            order_date, delivery_date = delivery_business_dates(pick_date)
+            booking = str(summary.get("booking") or meta.get("booking") or "").strip().upper()
+            car = cars.get(booking, {})
+
+            if key in existing_map:
+                target_row = existing_map[key]
+            else:
+                target_row = current_append_row
+                existing_map[key] = target_row
+                current_append_row += 1
+
+            core_values = [[
+                _date_serial(now_bkk.date()), now_bkk.strftime("%H:%M:%S"), wave, branch,
+                clean_branch_display_name(summary.get("branch_name")), member_data_bu(summary.get("bu")), "", "",
+                _history_int(summary.get("m")), _history_int(summary.get("red")), _history_int(summary.get("blue")),
+                _history_int(summary.get("green")), _history_int(summary.get("black")), _history_int(summary.get("total")),
+                _history_int(summary.get("pallet")), "Outbound", ""
+            ]]
+            car_values = [[
+                booking, car.get("carrier", ""), car.get("driver", ""), car.get("plate", "")
+            ]]
+            date_values = [[
+                _date_serial(order_date), _date_serial(pick_date), _date_serial(delivery_date)
+            ]]
+
+            batch_data.append({"range": f"'{DELIVERY_SOURCE_SHEET_NAME}'!A{target_row}:Q{target_row}", "values": core_values})
+            batch_data.append({"range": f"'{DELIVERY_SOURCE_SHEET_NAME}'!S{target_row}:V{target_row}", "values": car_values})
+            batch_data.append({"range": f"'{DELIVERY_SOURCE_SHEET_NAME}'!X{target_row}:Z{target_row}", "values": date_values})
+
+            if target_row > 2:
+                formula_requests.append({"copyPaste": {
                     "source": {"sheetId": DELIVERY_REPORT_SHEET_ID, "startRowIndex": target_row - 2,
                                "endRowIndex": target_row - 1, "startColumnIndex": 0, "endColumnIndex": 20},
                     "destination": {"sheetId": DELIVERY_REPORT_SHEET_ID, "startRowIndex": target_row - 1,
                                     "endRowIndex": target_row, "startColumnIndex": 0, "endColumnIndex": 20},
                     "pasteType": "PASTE_FORMULA", "pasteOrientation": "NORMAL"
-                }}]
-            }
-            copied = session.post(batch_url, json=formula_copy, timeout=60)
-            copied.raise_for_status()
-    print(f"✅ Delivery source/report updated | Wave {wave} | Branch {branch} | Row {target_row}")
+                }})
+
+        # Send 1 single values:batchUpdate request
+        base = f"https://sheets.googleapis.com/v4/spreadsheets/{DELIVERY_REPORT_SPREADSHEET_ID}"
+        response = session.post(f"{base}/values:batchUpdate", json={"valueInputOption": "RAW", "data": batch_data}, timeout=60)
+        response.raise_for_status()
+
+        if formula_requests:
+            try:
+                copied = session.post(f"{base}:batchUpdate", json={"requests": formula_requests}, timeout=60)
+                copied.raise_for_status()
+            except Exception as fe:
+                print(f"⚠️ Formula copy warning: {fe}")
+
+        print(f"⚡ Delivery source/report BATCH updated | {len(summaries)} branches in 1 request")
+
+def write_delivery_report_summary(summary: dict):
+    """Upsert one Wave+Branch into the source tab; Delivery report remains formula-driven."""
+    write_delivery_report_summaries([summary])
 
 def summarize_branch_for_member_data(wave_data: dict, branch: str) -> dict:
     items = [item for item in wave_data.get("lpn_list", []) if str(item.get("branch") or "").strip().upper() == branch]
@@ -1623,18 +1672,29 @@ async def read_root():
 # ✅ Health Check Endpoint: ตอบสนองเร็ว <5ms สำหรับ keep-alive heartbeat
 @app.get("/api/health")
 async def health_check():
-    return {"status": "ok", "version": "1.7.5", "timestamp": time.time()}
+    return {"status": "ok", "version": "1.7.8", "timestamp": time.time()}
 
 def sync_document_summary_reports(summaries: list):
-    for summary in summaries:
-        try:
-            write_member_history_summary(summary)
-        except Exception as exc:
-            print(f"🚨 Member Data write error for Wave {summary.get('wave')} / Branch {summary.get('branch')}: {exc}")
-        try:
-            write_delivery_report_summary(summary)
-        except Exception as exc:
-            print(f"🚨 Delivery report write error for Wave {summary.get('wave')} / Branch {summary.get('branch')}: {exc}")
+    if not summaries:
+        return
+    try:
+        write_member_history_summaries(summaries)
+    except Exception as exc:
+        print(f"🚨 Member Data batch write error: {exc}")
+        for s in summaries:
+            try:
+                write_member_history_summary(s)
+            except Exception:
+                pass
+    try:
+        write_delivery_report_summaries(summaries)
+    except Exception as exc:
+        print(f"🚨 Delivery report batch write error: {exc}")
+        for s in summaries:
+            try:
+                write_delivery_report_summary(s)
+            except Exception:
+                pass
 
 @app.post("/api/document-summary")
 def save_document_summary(data: DocumentSummaryBatchData, background_tasks: BackgroundTasks):
