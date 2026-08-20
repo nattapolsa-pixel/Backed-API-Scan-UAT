@@ -1523,12 +1523,6 @@ class CloseData(BaseModel):
     branch_code: str = "ALL"
     close_type: str
 
-class CloseJobData(BaseModel):
-    wave: str
-    branch: str
-    emp_id: Optional[str] = None
-    completed_at: Optional[str] = None
-
 class PalletStartData(BaseModel):
     waves: List[str]
     booking_no: Optional[str] = None
@@ -1586,6 +1580,13 @@ class DocumentSummaryData(BaseModel):
 class DocumentSummaryBatchData(BaseModel):
     summaries: List[DocumentSummaryData]
     emp_id: Optional[str] = None
+
+class CloseJobData(BaseModel):
+    wave: str
+    branch: str
+    emp_id: Optional[str] = None
+    completed_at: Optional[str] = None
+    summary: Optional[DocumentSummaryData] = None
 
 def ensure_booking_override_table():
     client.query("""
@@ -2397,19 +2398,20 @@ def process_scan_batch(data: ScanBatchData, background_tasks: BackgroundTasks):
         }
 
 
-def run_close_job_queries_in_background(wave_clean: str, branch: str, insert_zero_query: str, insert_close_marker: str):
+def run_close_job_queries_in_background(wave_clean: str, branch: str, insert_zero_query: str, insert_close_marker: str, frontend_summary: dict = None):
     try:
         # Run BQ inserts
         client.query(insert_zero_query).result()
         client.query(insert_close_marker).result()
         # After BQ queries finish, refresh cache
         refreshed = get_wave_data_internal(wave_clean, force_refresh=True)
-        try:
-            summary = summarize_branch_for_member_data(refreshed, branch)
-            write_member_history_summary(summary)
-            write_delivery_report_summary(summary)
-        except Exception as sheet_error:
-            print(f"⚠️ REPORT SHEET WRITE ERROR | Wave: {wave_clean} | Branch: {branch} | {sheet_error}")
+        if not frontend_summary:
+            try:
+                summary = summarize_branch_for_member_data(refreshed, branch)
+                write_member_history_summary(summary)
+                write_delivery_report_summary(summary)
+            except Exception as sheet_error:
+                print(f"⚠️ REPORT SHEET WRITE ERROR | Wave: {wave_clean} | Branch: {branch} | {sheet_error}")
         print(f"✅ BACKGROUND CLOSE JOB COMPLETE | Wave: {wave_clean} | Branch: {branch}")
     except Exception as e:
         print(f"🚨 BACKGROUND CLOSE JOB ERROR | Wave: {wave_clean} | Branch: {branch} | Error: {str(e)}")
@@ -2461,13 +2463,22 @@ def close_job(data: CloseJobData, background_tasks: BackgroundTasks):
 
     record_shared_branch_closed(wave_clean, branch, completed_at, emp_id)
 
+    frontend_summary = None
+    if data.summary:
+        frontend_summary = data.summary.dict()
+        frontend_summary["wave"] = wave_clean
+        frontend_summary["branch"] = branch
+        # บันทึกยอดที่ถูกต้องจากหน้าจอสแกนลง Google Sheets ทันทีที่กดปิดสาขา
+        background_tasks.add_task(sync_document_summary_reports, [frontend_summary])
+
     # ตอบกลับทันที: งาน BigQuery ทั้งหมดทำเบื้องหลัง ไม่ query ซ้ำใน request ปิดสาขา
     background_tasks.add_task(
         run_close_job_queries_in_background,
         wave_clean,
         branch,
         insert_zero_query,
-        insert_close_marker
+        insert_close_marker,
+        frontend_summary
     )
 
     return {
