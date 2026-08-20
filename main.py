@@ -96,11 +96,8 @@ def member_data_bu(owner) -> str:
 def write_member_history_summary(summary: dict):
     """Upsert one completed Wave+Branch row in Member Data."""
     session = get_sheets_session()
-    sheet_range = urllib.parse.quote("Member Data!A:P", safe="")
     lookup_range = urllib.parse.quote("Member Data!A:D", safe="")
     base = f"https://sheets.googleapis.com/v4/spreadsheets/{MEMBER_HISTORY_SPREADSHEET_ID}/values"
-    # อ่านแค่ A:D เพราะคอลัมน์ Outbound ถูกลงสูตรยาวถึงท้ายชีต
-    # ถ้าอ่าน A:P จะเข้าใจผิดว่าแถวสูตรว่างคือข้อมูลจริง แล้ว append ไปไกลมาก
     read_res = session.get(f"{base}/{lookup_range}", timeout=45)
     read_res.raise_for_status()
     values = read_res.json().get("values") or []
@@ -108,25 +105,18 @@ def write_member_history_summary(summary: dict):
     target_branch = str(summary["branch"]).strip().upper()
     row_no = 0
     last_data_row = 1
-    blank_run = 0
-    misplaced_rows = []
-    for index, row in enumerate(values[1:], start=2):
+    for index in range(len(values), 1, -1):
+        row = values[index - 1]
         row = list(row) + [""] * max(0, 4 - len(row))
-        has_core_data = bool(str(row[0]).strip() or str(row[2]).strip() or str(row[3]).strip())
-        if not has_core_data:
-            blank_run += 1
-            continue
-        # ช่องว่างยาวเป็นแถวที่เตรียมรูปแบบไว้ ไม่ใช่ข้อมูลจริง
-        if blank_run > 50:
-            if str(row[3]).strip().upper() == target_branch and re.sub(r"\D", "", str(row[2] or "")) == target_wave:
-                misplaced_rows.append(index)
-            continue
-        blank_run = 0
-        last_data_row = index
         wave_digits = re.sub(r"\D", "", str(row[2] or ""))
-        if wave_digits and str(int(wave_digits)) == target_wave and str(row[3]).strip().upper() == target_branch:
+        branch_code = str(row[3] or "").strip().upper()
+        if (wave_digits or branch_code) and index > last_data_row:
+            last_data_row = index
+        if wave_digits and str(int(wave_digits)) == target_wave and branch_code == target_branch:
             row_no = index
             break
+    if not last_data_row:
+        last_data_row = len(values)
     now_bkk = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=7)))
     row_values = [[
         now_bkk.strftime("%-d/%-m/%Y") if os.name != "nt" else f"{now_bkk.day}/{now_bkk.month}/{now_bkk.year}",
@@ -134,21 +124,13 @@ def write_member_history_summary(summary: dict):
         summary["label_count"], "", summary["m"], summary["red"], summary["blue"],
         summary["green"], summary["black"], summary["total"], summary["pallet"], " Outbound"
     ]]
-    if row_no:
-        target_range = urllib.parse.quote(f"Member Data!A{row_no}:P{row_no}", safe="")
-        response = session.put(f"{base}/{target_range}?valueInputOption=USER_ENTERED", json={"values": row_values}, timeout=45)
-    else:
-        next_row = last_data_row + 1
-        target_range = urllib.parse.quote(f"Member Data!A{next_row}:P{next_row}", safe="")
-        response = session.put(f"{base}/{target_range}?valueInputOption=USER_ENTERED", json={"values": row_values}, timeout=45)
+    target_row = row_no if row_no else (last_data_row + 1)
+    target_range = urllib.parse.quote(f"Member Data!A{target_row}:P{target_row}", safe="")
+    response = session.put(f"{base}/{target_range}?valueInputOption=USER_ENTERED", json={"values": row_values}, timeout=45)
     response.raise_for_status()
-    for bad_row in misplaced_rows:
-        clear_range = urllib.parse.quote(f"Member Data!A{bad_row}:P{bad_row}", safe="")
-        cleared = session.post(f"{base}/{clear_range}:clear", json={}, timeout=30)
-        cleared.raise_for_status()
     with member_history_lock:
         member_history_cache["expires_at"] = 0
-    print(f"✅ Member Data updated | Wave {target_wave} | Branch {target_branch} | {summary['total']} boxes")
+    print(f"✅ Member Data updated | Wave {target_wave} | Branch {target_branch} | Row {target_row} | {summary['total']} boxes")
 
 def write_member_history_summaries(summaries: list):
     """Upsert document totals. Used after a supervisor confirms edited print values."""
@@ -239,11 +221,12 @@ def write_delivery_report_summary(summary: dict):
         existing = _sheet_values(session, DELIVERY_REPORT_SPREADSHEET_ID, f"'{DELIVERY_SOURCE_SHEET_NAME}'!A:F")
         target_row = 0
         last_data_row = 1
-        for index, row in enumerate(existing[1:], start=2):
+        for index in range(len(existing), 1, -1):
+            row = existing[index - 1]
             row = list(row) + [""] * max(0, 6 - len(row))
             row_wave = re.sub(r"\D", "", str(row[2] or ""))
             row_branch = str(row[3] or "").strip().upper()
-            if row_wave or row_branch:
+            if (row_wave or row_branch) and index > last_data_row:
                 last_data_row = index
             if row_wave and str(int(row_wave)) == wave and row_branch == branch:
                 target_row = index
