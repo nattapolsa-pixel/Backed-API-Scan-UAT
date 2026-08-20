@@ -153,7 +153,10 @@ def write_member_history_summary(summary: dict):
 def write_member_history_summaries(summaries: list):
     """Upsert document totals. Used after a supervisor confirms edited print values."""
     for summary in summaries:
-        write_member_history_summary(summary)
+        try:
+            write_member_history_summary(summary)
+        except Exception as e:
+            print(f"🚨 Member history write error for {summary.get('wave')}/{summary.get('branch')}: {e}")
 
 def _sheet_values(session, spreadsheet_id: str, a1_range: str) -> list:
     encoded = urllib.parse.quote(a1_range, safe="")
@@ -221,7 +224,8 @@ def write_delivery_report_summary(summary: dict):
     meta = get_delivery_wave_meta(wave)
     pick_date = meta.get("pick_date")
     if not pick_date:
-        raise ValueError(f"Planned_Pick_Date not found for Wave {wave}")
+        now_bkk = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=7)))
+        pick_date = now_bkk.date()
     order_date, delivery_date = delivery_business_dates(pick_date)
     session = get_sheets_session()
     cars, branches = load_delivery_lookup_maps(session)
@@ -333,6 +337,12 @@ def summarize_branch_for_member_data(wave_data: dict, branch: str) -> dict:
         if lpn in combined_children or lpn in combined_masters:
             continue
         qty = int(item.get("qty") or 0)
+        prefix = lpn[:2].upper()
+        # PP/SP (Direct Qty Pallets): Frontend นับ qty รวม 1 ครั้ง ไม่วน breakdown
+        # ต้องทำเหมือนกันใน Backend มิฉะนั้นยอดจะพองขึ้นถ้า breakdown มีหลาย part
+        if prefix in DIRECT_QTY_PREFIXES:
+            totals["m"] += qty
+            continue
         breakdown = item.get("color_breakdown") or []
         if isinstance(breakdown, str):
             parsed = []
@@ -345,8 +355,10 @@ def summarize_branch_for_member_data(wave_data: dict, branch: str) -> dict:
         else:
             for part in breakdown: add(part.get("color"), part.get("type"), _history_int(part.get("qty")), lpn)
     first = items[0] if items else {}
-    pallet_nos = {int(no) for item in items for no in (item.get("branch_pallet_nos") or []) if int(no) > 0}
-    if not pallet_nos: pallet_nos = {int(item.get("pallet_no") or 0) for item in items if int(item.get("pallet_no") or 0) > 0}
+    scanned_items = [item for item in items if item.get("status") == "Scanned"]
+    pallet_nos = {int(item.get("pallet_no") or 0) for item in scanned_items if int(item.get("pallet_no") or 0) > 0}
+    if not pallet_nos:
+        pallet_nos = {int(no) for item in scanned_items for no in (item.get("branch_pallet_nos") or []) if int(no) > 0}
     wave_key = str(int(str(wave_data.get("wave_no") or 0)))
     assignment = get_booking_branch_assignments().get((wave_key, branch))
     current_booking = str((assignment or {}).get("Assigned_Booking") or wave_data.get("booking_no") or "").strip().upper()
@@ -1627,15 +1639,18 @@ async def read_root():
 # ✅ Health Check Endpoint: ตอบสนองเร็ว <5ms สำหรับ keep-alive heartbeat
 @app.get("/api/health")
 async def health_check():
-    return {"status": "ok", "version": "1.7.3", "timestamp": time.time()}
+    return {"status": "ok", "version": "1.7.5", "timestamp": time.time()}
 
 def sync_document_summary_reports(summaries: list):
-    try:
-        write_member_history_summaries(summaries)
-        for summary in summaries:
+    for summary in summaries:
+        try:
+            write_member_history_summary(summary)
+        except Exception as exc:
+            print(f"🚨 Member Data write error for Wave {summary.get('wave')} / Branch {summary.get('branch')}: {exc}")
+        try:
             write_delivery_report_summary(summary)
-    except Exception as exc:
-        print(f"🚨 DOCUMENT SUMMARY BACKGROUND WRITE ERROR: {exc}")
+        except Exception as exc:
+            print(f"🚨 Delivery report write error for Wave {summary.get('wave')} / Branch {summary.get('branch')}: {exc}")
 
 @app.post("/api/document-summary")
 def save_document_summary(data: DocumentSummaryBatchData, background_tasks: BackgroundTasks):
