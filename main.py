@@ -715,7 +715,7 @@ valid_lpns_cache = {}  # wave_no -> {"lpns": set((lpn, branch_code)), "expires_a
 valid_lpns_cache_lock = Lock()
 
 # --- ULTRA-FAST WAVE AND BOOKING SEARCH CACHE ---
-WAVE_CACHE_TTL = 600  # 10 minutes cache
+WAVE_CACHE_TTL = 1500  # 25 minutes cache (เพิ่มจาก 10 min เพื่อลด BigQuery calls)
 wave_cache = {}  # wave_detail_str -> {"data": dict, "expires_at": float}
 wave_cache_lock = Lock()
 wave_query_locks = {}
@@ -902,8 +902,13 @@ def fetch_wave_data_from_bq(search_wave_id: int) -> dict:
     wave_scan_str = str(search_wave_id)
     wave_detail_str = f"{search_wave_id:010d}"
 
-    query = f"""
-        WITH QCRaw AS (
+    # =============================================================
+    # ⚡ ข้าม QC CTEs ทั้งหมดเมื่อ QC_FEATURE_ENABLED = False
+    # ลด complexity ของ query ลงมากกว่า 50% เมื่อ QC ถูก Hold
+    # =============================================================
+    if QC_FEATURE_ENABLED:
+        qc_ctes = f"""
+        QCRaw AS (
             SELECT
                 TRIM(string_field_18) AS Order_Number,
                 TRIM(string_field_31) AS Product_Code,
@@ -1001,7 +1006,26 @@ def fetch_wave_data_from_bq(search_wave_id: int) -> dict:
             SELECT *,
                 QC_Eligible AND QC_Rank <= GREATEST(1, CAST(CEIL(Eligible_Count * IF(QC_Group = 'MART', 0.50, 0.60)) AS INT64)) AS QC_Required
             FROM QCRanked
-        ),
+        ),"""
+        qc_select = """
+            COALESCE(MAX(qc.QC_Required), FALSE) AS qc_required,
+            ROUND(MAX(qc.QC_Risk), 4) AS qc_risk,
+            MAX(qc.QC_Group) AS qc_source,"""
+        qc_join = f"""
+        LEFT JOIN QCStatus AS qc
+          ON TRIM(UPPER(d.LPN)) = qc.Clean_LPN
+         AND TRIM(UPPER(d.Branch_Code)) = qc.Branch_Code"""
+    else:
+        # 🚀 QC ถูก Hold → ข้าม QC CTEs ทั้งหมด ลด query ลง 50%+
+        qc_ctes = ""
+        qc_select = """
+            FALSE AS qc_required,
+            CAST(0.0 AS FLOAT64) AS qc_risk,
+            CAST(NULL AS STRING) AS qc_source,"""
+        qc_join = ""
+
+    query = f"""
+        WITH {qc_ctes}
         ScanRows AS (
             SELECT
                 TRIM(CAST(Wave_Number AS STRING)) AS Wave_Number,
@@ -1168,9 +1192,7 @@ def fetch_wave_data_from_bq(search_wave_id: int) -> dict:
             ANY_VALUE(sps.Submitted_Pallet_Nos) AS branch_submitted_pallet_nos,
             ANY_VALUE(bcs.Branch_Closed_At) AS branch_closed_at,
             ANY_VALUE(bcs.Branch_Closed_By) AS branch_closed_by,
-            COALESCE(MAX(qc.QC_Required), FALSE) AS qc_required,
-            ROUND(MAX(qc.QC_Risk), 4) AS qc_risk,
-            MAX(qc.QC_Group) AS qc_source,
+            {qc_select}
             ARRAY_AGG(STRUCT(
                 TRIM(d.Owner) AS owner,
                 TRIM(d.Product_Code) AS product_code,
@@ -1200,9 +1222,7 @@ def fetch_wave_data_from_bq(search_wave_id: int) -> dict:
           ON TRIM(UPPER(d.Branch_Code)) = sps.Scan_Branch
         LEFT JOIN BranchCloseSummary AS bcs
           ON TRIM(UPPER(d.Branch_Code)) = bcs.Scan_Branch
-        LEFT JOIN QCStatus AS qc
-          ON TRIM(UPPER(d.LPN)) = qc.Clean_LPN
-         AND TRIM(UPPER(d.Branch_Code)) = qc.Branch_Code
+        {qc_join}
         WHERE SAFE_CAST(REGEXP_REPLACE(TRIM(CAST(d.Wave_Number AS STRING)), r'[^0-9]', '') AS INT64) = {search_wave_id}
         GROUP BY d.LPN, d.Zone, d.Branch_Code, d.Wave_Number
     """
@@ -1216,6 +1236,7 @@ def fetch_wave_data_from_bq(search_wave_id: int) -> dict:
     """
 
     job_config = bigquery.QueryJobConfig(use_query_cache=True)
+    # 🚀 รัน meta_job และ query_job แบบ parallel เพื่อลดเวลาโดยรวม
     meta_job = client.query(meta_query, job_config=job_config)
     query_job = client.query(query, job_config=job_config)
 
