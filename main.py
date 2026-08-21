@@ -54,6 +54,10 @@ client = bigquery.Client(
 # ✅ BigQuery Job Timeout: ป้องกัน query ค้างนานโดยไม่จำกัด
 BQ_JOB_TIMEOUT_SECONDS = 30
 
+# 🔒 QC Feature Toggle: ตั้ง False เพื่อ Hold ระบบ QC ไว้ก่อน
+#    เปลี่ยนเป็น True เมื่อต้องการเปิดใช้งานระบบ QC
+QC_FEATURE_ENABLED = False
+
 NUMERIC_BRANCH_MASTER_SPREADSHEET_ID = "1zI5YAq0JvlM-WsaCfDVYVZgiCn5pWx_HVJjQMiTFwoI"
 NUMERIC_BRANCH_MASTER_SHEET_NAME = "Master"
 NUMERIC_BRANCH_MASTER_GID = "606346592"
@@ -1277,8 +1281,9 @@ def fetch_wave_data_from_bq(search_wave_id: int) -> dict:
             "branch_submitted_pallet_nos": list(row["branch_submitted_pallet_nos"] or []),
             "branch_closed_at": row["branch_closed_at"].isoformat() if row["branch_closed_at"] else "",
             "branch_closed_by": row["branch_closed_by"] or "",
-            "qc_required": bool(row["qc_required"]),
-            "qc_status": "ต้อง QC" if row["qc_required"] else "",
+            # 🔒 QC_FEATURE_ENABLED=False → hold QC, เปลี่ยนเป็น True เมื่อเปิดใช้งาน
+            "qc_required": bool(row["qc_required"]) and QC_FEATURE_ENABLED,
+            "qc_status": ("ต้อง QC" if row["qc_required"] else "") if QC_FEATURE_ENABLED else "",
             "qc_risk": float(row["qc_risk"] or 0),
             "qc_source": row["qc_source"] or "",
             "wave_no": str(row["Full_Wave"]).strip()
