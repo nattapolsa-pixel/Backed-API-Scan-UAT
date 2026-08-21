@@ -51,8 +51,8 @@ client = bigquery.Client(
     project=os.environ.get("GOOGLE_CLOUD_PROJECT", "pro-analytics-db")
 )
 
-# ✅ BigQuery Job Timeout: ป้องกัน query ค้างนานโดยไม่จำกัด
-BQ_JOB_TIMEOUT_SECONDS = 30
+# ✅ BigQuery Job Timeout: Standard Plan → เพิ่มเป็น 45 วินาที (ไม่มีปัญหา cold start อีกต่อไป)
+BQ_JOB_TIMEOUT_SECONDS = 45
 
 # 🔒 QC Feature Toggle: ตั้ง False เพื่อ Hold ระบบ QC ไว้ก่อน
 #    เปลี่ยนเป็น True เมื่อต้องการเปิดใช้งานระบบ QC
@@ -715,13 +715,13 @@ valid_lpns_cache = {}  # wave_no -> {"lpns": set((lpn, branch_code)), "expires_a
 valid_lpns_cache_lock = Lock()
 
 # --- ULTRA-FAST WAVE AND BOOKING SEARCH CACHE ---
-WAVE_CACHE_TTL = 1500  # 25 minutes cache (เพิ่มจาก 10 min เพื่อลด BigQuery calls)
+WAVE_CACHE_TTL = 1800  # 30 นาที cache (Standard Plan: 2GB RAM เพียงพอ)
 wave_cache = {}  # wave_detail_str -> {"data": dict, "expires_at": float}
 wave_cache_lock = Lock()
 wave_query_locks = {}
 wave_query_locks_guard = Lock()
 
-BOOKING_WAVES_CACHE_TTL = 600  # 10 minutes cache
+BOOKING_WAVES_CACHE_TTL = 1800  # 30 นาที cache
 booking_waves_cache = {}  # booking_clean -> {"mapping": dict, "expires_at": float}
 booking_waves_cache_lock = Lock()
 
@@ -2621,13 +2621,28 @@ def query_pending_waves_from_bigquery():
 
 
 def _startup_warm_cache():
-    """ดึงรายการ Wave ล่วงหน้าตอน startup เพื่อให้พร้อมใช้งานทันที"""
+    """⚡ Standard Plan: ดึงรายการ Wave ล่วงหน้าตอน startup พร้อม preload Wave cache"""
     try:
         data = query_pending_waves_from_bigquery()
         with pending_waves_cache_lock:
             pending_waves_cache["data"] = data
             pending_waves_cache["expires_at"] = time.time() + PENDING_WAVES_CACHE_TTL_SECONDS
-        print("✅ Startup cache warm-up complete")
+        print("✅ Startup cache warm-up complete (pending waves)")
+
+        # ⚡ Standard Plan: 2GB RAM → preload Wave แรกๆ ให้พร้อมเลย
+        waves_to_preload = (data.get("waves") or [])[:3]
+        if waves_to_preload:
+            import threading
+            def _preload_waves():
+                for w in waves_to_preload:
+                    try:
+                        wno = str(w.get("wave_no") or "").strip()
+                        if wno:
+                            get_wave_data_internal(wno, force_refresh=False)
+                            print(f"⚡ Preloaded wave {wno} into cache")
+                    except Exception as we:
+                        print(f"⚠️ Wave preload skipped {w}: {we}")
+            threading.Thread(target=_preload_waves, daemon=True).start()
     except Exception as e:
         print(f"⚠️ Startup cache warm-up failed (non-critical): {e}")
 
@@ -2636,7 +2651,7 @@ def _startup_warm_cache():
 
 @app.on_event("startup")
 async def startup_event():
-    """Pre-warm cache ตอน server เริ่มทำงาน เพื่อให้ response เร็วตั้งแต่ request แรก"""
+    """⚡ Standard Plan: Pre-warm cache + preload Wave cache ตอน server เริ่มทำงาน"""
     import threading
     threading.Thread(target=_startup_warm_cache, daemon=True).start()
 

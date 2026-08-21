@@ -2,10 +2,11 @@ services:
   - type: web
     name: dc-scanner-api-nattapol
     runtime: python
-    plan: free
+    plan: standard
     region: singapore
     buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT --workers 1
+    # ⚡ Standard Plan: 1 CPU → ใช้ 2 workers (1 worker/0.5 CPU) + 2 threads ต่อ worker
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT --workers 2 --timeout-keep-alive 75
     healthCheckPath: /api/health
     autoDeploy: true
     envVars:
