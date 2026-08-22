@@ -821,7 +821,13 @@ def record_local_scan(wave_no: str, lpn: str, branch_code: str, qty: int, scan_t
             pallet_parts = [{"pallet_no": int(current.get("pallet_no", 0) or 0), "color": current.get("color") or "None", "qty": int(current.get("qty") or 0), "type": current.get("scan_type") or "TOTE"}]
         part_key = (int(pallet_no or 0), color.upper())
         pallet_map = {(int(part.get("pallet_no", 0) or 0), str(part.get("color") or "None").upper()): part for part in pallet_parts}
-        pallet_map[part_key] = {"pallet_no": int(pallet_no or 0), "color": color, "qty": qty, "type": scan_type}
+        
+        if (scan_type == "Carton" or is_direct_qty_lpn_value(lpn_upper)) and part_key in pallet_map:
+            prev_pallet_qty = int(pallet_map[part_key].get("qty", 0) or 0)
+            pallet_map[part_key] = {"pallet_no": int(pallet_no or 0), "color": color, "qty": prev_pallet_qty + qty, "type": scan_type}
+        else:
+            pallet_map[part_key] = {"pallet_no": int(pallet_no or 0), "color": color, "qty": qty, "type": scan_type}
+
         pallet_breakdown = list(pallet_map.values())
         color_map = {}
         for part in pallet_breakdown:
@@ -1038,7 +1044,7 @@ def fetch_wave_data_from_bq(search_wave_id: int) -> dict:
                 TRIM(IFNULL(Emp_ID, '')) AS Emp_ID,
                 IFNULL(Pallet_No, 0) AS Pallet_No,
                 Timestamp,
-                IF(Qty = 0 OR Scan_Type IN ('RESET_BOX', 'CANCEL_COMBINE'), 1, 0) AS Is_Reset
+                IF(Qty = 0 OR Scan_Type IN ('RESET_BOX', 'CANCEL_COMBINE') OR STARTS_WITH(Scan_Type, 'CORRECTION|'), 1, 0) AS Is_Reset
             FROM `pro-analytics-db.logistics_db.app_scan_transactions`
             -- Wave_Number อาจถูกเก็บเป็น 58903, 0000058903 หรือ WAVE-58903
             WHERE SAFE_CAST(REGEXP_REPLACE(TRIM(CAST(Wave_Number AS STRING)), r'[^0-9]', '') AS INT64) = {search_wave_id}
@@ -1060,18 +1066,19 @@ def fetch_wave_data_from_bq(search_wave_id: int) -> dict:
               AND IFNULL(r.Qty, 0) > 0
               AND (lr.Reset_Timestamp IS NULL OR r.Timestamp > lr.Reset_Timestamp)
         ),
-        LatestColorScan AS (
-            SELECT * EXCEPT(rn)
-            FROM (
-                SELECT
-                    *,
-                    ROW_NUMBER() OVER (
-                        PARTITION BY Scan_Wave_ID, Clean_LPN, Scan_Branch, Pallet_No, UPPER(IFNULL(Color, 'None'))
-                        ORDER BY Timestamp DESC, Qty DESC
-                    ) AS rn
-                FROM ValidScanRows
-            )
-            WHERE rn = 1
+        PalletColorAggregatedScans AS (
+            SELECT
+                Scan_Wave_ID,
+                Clean_LPN,
+                Scan_Branch,
+                Pallet_No,
+                UPPER(IFNULL(Color, 'None')) AS Color_Key,
+                ARRAY_AGG(Color ORDER BY Timestamp DESC LIMIT 1)[OFFSET(0)] AS Color,
+                ARRAY_AGG(Scan_Type ORDER BY Timestamp DESC LIMIT 1)[OFFSET(0)] AS Scan_Type,
+                SUM(Qty) AS Qty,
+                MAX(Timestamp) AS Max_Timestamp
+            FROM ValidScanRows
+            GROUP BY Scan_Wave_ID, Clean_LPN, Scan_Branch, Pallet_No, Color_Key
         ),
         ScanHistory AS (
             SELECT
@@ -1080,11 +1087,11 @@ def fetch_wave_data_from_bq(search_wave_id: int) -> dict:
                 Scan_Branch,
                 SUM(Qty) AS Scanned_Qty,
                 MAX(Pallet_No) AS Scanned_Pallet_No,
-                ARRAY_AGG(Scan_Type ORDER BY Timestamp DESC LIMIT 1)[OFFSET(0)] AS Scan_Type,
-                ARRAY_AGG(Color ORDER BY Timestamp DESC LIMIT 1)[OFFSET(0)] AS Color,
+                ARRAY_AGG(Scan_Type ORDER BY Max_Timestamp DESC LIMIT 1)[OFFSET(0)] AS Scan_Type,
+                ARRAY_AGG(Color ORDER BY Max_Timestamp DESC LIMIT 1)[OFFSET(0)] AS Color,
                 STRING_AGG(CONCAT(IFNULL(Color, 'None'), '~', CAST(Qty AS STRING), '~', IFNULL(Scan_Type, '')), '|') AS Color_Breakdown,
-                STRING_AGG(CONCAT(CAST(Pallet_No AS STRING), '~', IFNULL(Color, 'None'), '~', CAST(Qty AS STRING), '~', IFNULL(Scan_Type, '')), '|' ORDER BY Pallet_No, Timestamp) AS Pallet_Breakdown
-            FROM LatestColorScan
+                STRING_AGG(CONCAT(CAST(Pallet_No AS STRING), '~', IFNULL(Color, 'None'), '~', CAST(Qty AS STRING), '~', IFNULL(Scan_Type, '')), '|' ORDER BY Pallet_No, Max_Timestamp) AS Pallet_Breakdown
+            FROM PalletColorAggregatedScans
             GROUP BY Scan_Wave_ID, Clean_LPN, Scan_Branch
         ),
         PalletSummary AS (
