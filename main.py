@@ -199,6 +199,88 @@ def load_delivery_lookup_maps(session) -> tuple:
         delivery_lookup_cache.update({"expires_at": now + 600, "cars": cars, "branches": branches})
         return cars, branches
 
+BOOKING_WAVE_SHEET_ID = "1jOnJnnwlWZ491FEAFXAMgc7BftssHZcZp8x17LOQj6k"
+BOOKING_WAVE_SHEET_GID = "499980322"
+booking_wave_sheet_cache = {"expires_at": 0.0, "bookings": {}, "waves": {}}
+booking_wave_sheet_lock = Lock()
+
+def load_booking_wave_sheet_meta() -> tuple:
+    now = time.time()
+    with booking_wave_sheet_lock:
+        if booking_wave_sheet_cache["expires_at"] > now:
+            return booking_wave_sheet_cache["bookings"], booking_wave_sheet_cache["waves"]
+
+    booking_map = {}
+    wave_map = {}
+    try:
+        tq = "SELECT K, L, Q, R WHERE K IS NOT NULL OR L IS NOT NULL"
+        url = f"https://docs.google.com/spreadsheets/d/{BOOKING_WAVE_SHEET_ID}/gviz/tq?gid={BOOKING_WAVE_SHEET_GID}&tqx=out:json&tq={urllib.parse.quote(tq)}"
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            text = resp.read().decode("utf-8")
+            m = re.search(r"google\.visualization\.Query\.setResponse\((.*)\);", text, re.DOTALL)
+            if m:
+                data = json.loads(m.group(1))
+                rows = data.get("table", {}).get("rows", [])
+                for r in rows:
+                    c = r.get("c") or []
+                    def get_val(idx):
+                        if idx < len(c) and c[idx]:
+                            return str(c[idx].get("f") or c[idx].get("v") or "").strip()
+                        return ""
+                    b = get_val(0)
+                    w = get_val(1)
+                    sender = get_val(2)
+                    plate = get_val(3)
+
+                    waves = [str(int(x)) for x in re.findall(r"\b\d{5,}\b", w)]
+                    clean_b = re.sub(r"\s+", "", b.upper())
+                    compact_b = clean_b.replace("-", "")
+                    raw_num = re.sub(r"^B0*1*", "", compact_b)
+
+                    entry = {
+                        "booking": clean_b,
+                        "waves": waves,
+                        "sender": sender,
+                        "plate": plate
+                    }
+
+                    if clean_b:
+                        booking_map[clean_b] = entry
+                        booking_map[compact_b] = entry
+                        if raw_num:
+                            booking_map[raw_num] = entry
+                            booking_map[f"B001-{raw_num}"] = entry
+
+                    for wave_id in waves:
+                        wave_map[wave_id] = entry
+                        wave_map[f"{int(wave_id):010d}"] = entry
+
+        with booking_wave_sheet_lock:
+            booking_wave_sheet_cache["bookings"] = booking_map
+            booking_wave_sheet_cache["waves"] = wave_map
+            booking_wave_sheet_cache["expires_at"] = now + 120
+    except Exception as e:
+        print(f"⚠️ Error loading Booking & Wave Google Sheet meta: {e}")
+
+    return booking_map, wave_map
+
+def get_sheet_meta_for_wave(wave_no: str) -> dict:
+    clean_wave = re.sub(r"\D", "", str(wave_no or ""))
+    if not clean_wave:
+        return {}
+    _, wave_map = load_booking_wave_sheet_meta()
+    return wave_map.get(str(int(clean_wave))) or {}
+
+def get_sheet_meta_for_booking(booking_no: str) -> dict:
+    clean_b = re.sub(r"\s+", "", str(booking_no or "").upper())
+    if not clean_b:
+        return {}
+    booking_map, _ = load_booking_wave_sheet_meta()
+    compact = clean_b.replace("-", "")
+    raw_num = re.sub(r"^B0*1*", "", compact)
+    return booking_map.get(clean_b) or booking_map.get(compact) or booking_map.get(raw_num) or booking_map.get(f"B001-{raw_num}") or {}
+
 def get_delivery_wave_meta(wave: str) -> dict:
     query = """
         SELECT MAX(Planned_Pick_Date) AS planned_pick_date,
@@ -1254,6 +1336,13 @@ def fetch_wave_data_from_bq(search_wave_id: int) -> dict:
         booking_no = meta_rows[0]["booking_no"] or ""
         license_plate = meta_rows[0]["license_plate"] or ""
 
+    sheet_meta = get_sheet_meta_for_wave(str(search_wave_id))
+    if sheet_meta:
+        if sheet_meta.get("booking"):
+            booking_no = sheet_meta["booking"]
+        if sheet_meta.get("plate"):
+            license_plate = sheet_meta["plate"]
+
     results = query_job.result(timeout=BQ_JOB_TIMEOUT_SECONDS)
 
     lpn_list = []
@@ -1470,6 +1559,12 @@ def fetch_booking_waves_from_bq(booking_no: str) -> dict:
     query_job = client.query(query, job_config=booking_config)
     results = list(query_job.result(timeout=BQ_JOB_TIMEOUT_SECONDS))
     if not results:
+        sheet_meta = get_sheet_meta_for_booking(booking_no)
+        if sheet_meta and sheet_meta.get("waves"):
+            return {
+                "waves": sheet_meta["waves"],
+                "license_plate": sheet_meta.get("plate", "")
+            }
         raise HTTPException(status_code=404, detail=f"ไม่พบข้อมูลสำหรับ Booking No. [{booking_no}]")
     
     waves = []
