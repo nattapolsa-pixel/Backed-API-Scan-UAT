@@ -300,24 +300,37 @@ def get_document_overrides_for_wave(wave_no: str) -> dict:
             SELECT Branch_Code, M_Count, Red_Count, Blue_Count, Green_Count, Black_Count, Total_Count, Pallet_Count, Is_Hidden, Emp_ID, Updated_At
             FROM `pro-analytics-db.logistics_db.wave_document_overrides`
             WHERE SAFE_CAST(REGEXP_REPLACE(TRIM(CAST(Wave_Number AS STRING)), r'[^0-9]', '') AS INT64) = {int(clean_wave)}
-            QUALIFY ROW_NUMBER() OVER (PARTITION BY UPPER(TRIM(Branch_Code)) ORDER BY Updated_At DESC) = 1
+            ORDER BY Updated_At DESC
         """
         rows = list(client.query(query).result(timeout=BQ_JOB_TIMEOUT_SECONDS))
+        latest_reset_time = None
+        for r in rows:
+            if str(r["Branch_Code"]).strip().upper() == "RESET_ALL":
+                latest_reset_time = r["Updated_At"]
+                break
+
+        seen_branches = set()
         for r in rows:
             b = str(r["Branch_Code"]).strip().upper()
-            if b:
-                overrides[b] = {
-                    "m": r["M_Count"],
-                    "red": r["Red_Count"],
-                    "blue": r["Blue_Count"],
-                    "green": r["Green_Count"],
-                    "black": r["Black_Count"],
-                    "total": r["Total_Count"],
-                    "pallet": r["Pallet_Count"],
-                    "is_hidden": bool(r["Is_Hidden"]),
-                    "emp_id": str(r["Emp_ID"] or ""),
-                    "updated_at": r["Updated_At"].isoformat() if r["Updated_At"] else ""
-                }
+            if not b or b == "RESET_ALL":
+                continue
+            if latest_reset_time and r["Updated_At"] and r["Updated_At"] <= latest_reset_time:
+                continue
+            if b in seen_branches:
+                continue
+            seen_branches.add(b)
+            overrides[b] = {
+                "m": r["M_Count"],
+                "red": r["Red_Count"],
+                "blue": r["Blue_Count"],
+                "green": r["Green_Count"],
+                "black": r["Black_Count"],
+                "total": r["Total_Count"],
+                "pallet": r["Pallet_Count"],
+                "is_hidden": bool(r["Is_Hidden"]),
+                "emp_id": str(r["Emp_ID"] or ""),
+                "updated_at": r["Updated_At"].isoformat() if r["Updated_At"] else ""
+            }
         with document_overrides_lock:
             document_overrides_overlay[wave_key] = copy.deepcopy(overrides)
     except Exception as e:
@@ -1984,18 +1997,33 @@ def reset_document_overrides(data: ResetDocumentOverridesData, background_tasks:
     waves_to_clear = list(dict.fromkeys(waves_to_clear))
     with document_overrides_lock:
         for w in waves_to_clear:
-            document_overrides_overlay.pop(w, None)
+            document_overrides_overlay[w] = {}
 
     if waves_to_clear:
-        def delete_bq_overrides(waves):
+        def tombstone_bq_overrides(waves, emp):
             try:
-                wave_list_sql = ", ".join(f"'{w}'" for w in waves)
-                query = f"DELETE FROM `pro-analytics-db.logistics_db.wave_document_overrides` WHERE Wave_Number IN ({wave_list_sql})"
-                client.query(query).result(timeout=BQ_JOB_TIMEOUT_SECONDS)
-                print(f"✅ Cleared document overrides for waves {waves} in BigQuery")
+                now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+                rows = [{
+                    "Wave_Number": str(w),
+                    "Booking_No": "",
+                    "Branch_Code": "RESET_ALL",
+                    "M_Count": 0,
+                    "Red_Count": 0,
+                    "Blue_Count": 0,
+                    "Green_Count": 0,
+                    "Black_Count": 0,
+                    "Total_Count": -1,
+                    "Pallet_Count": 0,
+                    "Is_Hidden": 0,
+                    "Emp_ID": str(emp or ""),
+                    "Updated_At": now_iso
+                } for w in waves]
+                table_ref = client.dataset("logistics_db").table("wave_document_overrides")
+                client.insert_rows_json(table_ref, rows)
+                print(f"✅ Tombstoned document overrides for waves {waves} in BigQuery")
             except Exception as e:
-                print(f"⚠️ Error deleting BQ document overrides: {e}")
-        background_tasks.add_task(delete_bq_overrides, waves_to_clear)
+                print(f"⚠️ Error tombstoning BQ document overrides: {e}")
+        background_tasks.add_task(tombstone_bq_overrides, waves_to_clear, data.emp_id)
 
     return {"status": "success", "cleared_waves": waves_to_clear}
 
