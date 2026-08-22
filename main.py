@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Response
 from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel
 from typing import List, Optional       # ✅ แก้ไข #1: เพิ่ม Optional
@@ -710,7 +710,7 @@ is_refreshing_pending_waves = False
 is_refreshing_pending_waves_lock = Lock()
 
 # Valid LPNs Validation Cache to prevent slow BigQuery queries on every scan
-VALID_LPNS_CACHE_TTL = 600  # 10 minutes cache
+VALID_LPNS_CACHE_TTL = 1800  # ⚡ 30 นาที (Standard Plan: RAM เพียงพอ เพิ่มจาก 10 นาที)
 valid_lpns_cache = {}  # wave_no -> {"lpns": set((lpn, branch_code)), "expires_at": float}
 valid_lpns_cache_lock = Lock()
 
@@ -1697,8 +1697,11 @@ async def read_root():
 
 # ✅ Health Check Endpoint: ตอบสนองเร็ว <5ms สำหรับ keep-alive heartbeat
 @app.get("/api/health")
-async def health_check():
-    return {"status": "ok", "version": "1.7.8", "timestamp": time.time()}
+async def health_check(response: Response):
+    # ⚡ Cache-Control: s-maxage=5 ทำให้ CDN/Render ตอบ health check ได้ทันที ไม่ต้อง round-trip ถึง Python
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Connection"] = "keep-alive"
+    return {"status": "ok", "version": "1.8.0", "timestamp": time.time()}
 
 def sync_document_summary_reports(summaries: list):
     if not summaries:
