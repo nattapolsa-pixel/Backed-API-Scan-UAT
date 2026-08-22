@@ -281,6 +281,80 @@ def get_sheet_meta_for_booking(booking_no: str) -> dict:
     raw_num = re.sub(r"^B0*1*", "", compact)
     return booking_map.get(clean_b) or booking_map.get(compact) or booking_map.get(raw_num) or booking_map.get(f"B001-{raw_num}") or {}
 
+# ==================== DOCUMENT OVERRIDES SYNC SYSTEM ====================
+document_overrides_overlay = {}
+document_overrides_lock = Lock()
+
+def get_document_overrides_for_wave(wave_no: str) -> dict:
+    clean_wave = re.sub(r"\D", "", str(wave_no or ""))
+    if not clean_wave:
+        return {}
+    wave_key = str(int(clean_wave))
+    with document_overrides_lock:
+        if wave_key in document_overrides_overlay:
+            return copy.deepcopy(document_overrides_overlay[wave_key])
+
+    overrides = {}
+    try:
+        query = f"""
+            SELECT Branch_Code, M_Count, Red_Count, Blue_Count, Green_Count, Black_Count, Total_Count, Pallet_Count, Is_Hidden, Emp_ID, Updated_At
+            FROM `pro-analytics-db.logistics_db.wave_document_overrides`
+            WHERE SAFE_CAST(REGEXP_REPLACE(TRIM(CAST(Wave_Number AS STRING)), r'[^0-9]', '') AS INT64) = {int(clean_wave)}
+            QUALIFY ROW_NUMBER() OVER (PARTITION BY UPPER(TRIM(Branch_Code)) ORDER BY Updated_At DESC) = 1
+        """
+        rows = list(client.query(query).result(timeout=BQ_JOB_TIMEOUT_SECONDS))
+        for r in rows:
+            b = str(r["Branch_Code"]).strip().upper()
+            if b:
+                overrides[b] = {
+                    "m": r["M_Count"],
+                    "red": r["Red_Count"],
+                    "blue": r["Blue_Count"],
+                    "green": r["Green_Count"],
+                    "black": r["Black_Count"],
+                    "total": r["Total_Count"],
+                    "pallet": r["Pallet_Count"],
+                    "is_hidden": bool(r["Is_Hidden"]),
+                    "emp_id": str(r["Emp_ID"] or ""),
+                    "updated_at": r["Updated_At"].isoformat() if r["Updated_At"] else ""
+                }
+        with document_overrides_lock:
+            document_overrides_overlay[wave_key] = copy.deepcopy(overrides)
+    except Exception as e:
+        print(f"⚠️ Error reading document overrides from BQ: {e}")
+    return overrides
+
+def record_document_overrides_to_bq(summaries: list, emp_id: str):
+    if not summaries:
+        return
+    now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    rows_to_insert = []
+    for s in summaries:
+        rows_to_insert.append({
+            "Wave_Number": str(s["wave"]),
+            "Booking_No": str(s.get("booking") or ""),
+            "Branch_Code": str(s["branch"]).upper(),
+            "M_Count": int(s.get("m", 0) or 0),
+            "Red_Count": int(s.get("red", 0) or 0),
+            "Blue_Count": int(s.get("blue", 0) or 0),
+            "Green_Count": int(s.get("green", 0) or 0),
+            "Black_Count": int(s.get("black", 0) or 0),
+            "Total_Count": int(s.get("total", 0) or 0),
+            "Pallet_Count": int(s.get("pallet", 0) or 0),
+            "Is_Hidden": 1 if s.get("is_hidden") else 0,
+            "Emp_ID": str(emp_id or ""),
+            "Updated_At": now_iso
+        })
+    try:
+        table_ref = client.dataset("logistics_db").table("wave_document_overrides")
+        errors = client.insert_rows_json(table_ref, rows_to_insert)
+        if errors:
+            print(f"⚠️ Error inserting document overrides to BQ: {errors}")
+        else:
+            print(f"✅ Saved {len(rows_to_insert)} document overrides to BigQuery")
+    except Exception as e:
+        print(f"⚠️ Exception saving document overrides to BQ: {e}")
+
 def get_delivery_wave_meta(wave: str) -> dict:
     query = """
         SELECT MAX(Planned_Pick_Date) AS planned_pick_date,
@@ -1430,31 +1504,38 @@ def get_wave_data_internal(wave_no: str, force_refresh: bool = False) -> dict:
         raise HTTPException(status_code=400, detail="รหัส Wave ต้องเป็นตัวเลขเท่านั้น")
 
     wave_detail_str = f"{search_wave_id:010d}"
+    wave_clean = str(search_wave_id)
     now = time.time()
 
+    data = None
     if not force_refresh:
         with wave_cache_lock:
             cached = wave_cache.get(wave_detail_str)
             if cached and cached["expires_at"] > now:
-                return cached["data"]
+                data = copy.deepcopy(cached["data"])
 
-    # ป้องกันหลาย Handheld ยิง Query Wave เดียวกันพร้อมกันตอน cache หมดอายุ
-    with wave_query_locks_guard:
-        query_lock = wave_query_locks.setdefault(wave_detail_str, Lock())
-    with query_lock:
-        if not force_refresh:
-            with wave_cache_lock:
-                cached = wave_cache.get(wave_detail_str)
-                if cached and cached["expires_at"] > time.time():
-                    return cached["data"]
+    if data is None:
+        # ป้องกันหลาย Handheld ยิง Query Wave เดียวกันพร้อมกันตอน cache หมดอายุ
+        with wave_query_locks_guard:
+            query_lock = wave_query_locks.setdefault(wave_detail_str, Lock())
+        with query_lock:
+            if not force_refresh:
+                with wave_cache_lock:
+                    cached = wave_cache.get(wave_detail_str)
+                    if cached and cached["expires_at"] > time.time():
+                        data = copy.deepcopy(cached["data"])
 
-        data = fetch_wave_data_from_bq(search_wave_id)
-        with wave_cache_lock:
-            wave_cache[wave_detail_str] = {
-                "data": data,
-                "expires_at": time.time() + WAVE_CACHE_TTL
-            }
-        return data
+            if data is None:
+                data = fetch_wave_data_from_bq(search_wave_id)
+                with wave_cache_lock:
+                    wave_cache[wave_detail_str] = {
+                        "data": data,
+                        "expires_at": time.time() + WAVE_CACHE_TTL
+                    }
+                data = copy.deepcopy(data)
+
+    data["document_overrides"] = get_document_overrides_for_wave(wave_clean)
+    return data
 
 active_wave_refreshes = set()
 active_wave_refreshes_lock = Lock()
@@ -1652,12 +1733,19 @@ def get_booking_data_internal(booking_no: str, force_refresh: bool = False) -> d
         if item["status"] == "Scanned":
             zones_calc[z]["scanned"] += 1
             
+    combined_overrides = {}
+    for wave_no_inc in waves_included:
+        clean_w = re.sub(r"\D", "", str(wave_no_inc))
+        if clean_w:
+            combined_overrides.update(get_document_overrides_for_wave(clean_w))
+
     return {
         "booking_no": booking_no,
         "license_plate": license_plate,
         "waves": list(waves_included),
         "lpn_list": lpn_list,
-        "zone_summary": list(zones_calc.values())
+        "zone_summary": list(zones_calc.values()),
+        "document_overrides": combined_overrides
     }
 
 
@@ -1753,9 +1841,15 @@ class DocumentSummaryData(BaseModel):
     black: int = 0
     total: int = 0
     pallet: int = 0
+    is_hidden: Optional[bool] = False
 
 class DocumentSummaryBatchData(BaseModel):
     summaries: List[DocumentSummaryData]
+    emp_id: Optional[str] = None
+
+class ResetDocumentOverridesData(BaseModel):
+    wave: Optional[str] = None
+    booking: Optional[str] = None
     emp_id: Optional[str] = None
 
 class CloseJobData(BaseModel):
@@ -1832,6 +1926,9 @@ def save_document_summary(data: DocumentSummaryBatchData, background_tasks: Back
     if not data.summaries or len(data.summaries) > 100:
         raise HTTPException(status_code=400, detail="summary count must be 1-100")
     normalized = []
+    emp_id = str(data.emp_id or "").strip()
+    now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+
     for item in data.summaries:
         try:
             wave = str(int(str(item.wave).strip()))
@@ -1844,11 +1941,70 @@ def save_document_summary(data: DocumentSummaryBatchData, background_tasks: Back
                   ("label_count", "m", "red", "blue", "green", "black", "total", "pallet")}
         calculated_total = values["m"] + values["red"] + values["blue"] + values["green"] + values["black"]
         values["total"] = calculated_total
-        normalized.append({"wave": wave, "booking": str(item.booking or "").strip().upper(), "branch": branch,
-                           "branch_name": str(item.branch_name or branch).strip(),
-                           "bu": member_data_bu(item.bu), **values})
+        is_hidden = bool(getattr(item, "is_hidden", False))
+
+        # บันทึกลง Memory Overlay ทันที เพื่อให้ทุกเครื่องที่เปิด Wave นี้เห็นยอดตรงกันแบบ Real-time
+        with document_overrides_lock:
+            wave_ov = document_overrides_overlay.setdefault(wave, {})
+            wave_ov[branch] = {
+                **values,
+                "is_hidden": is_hidden,
+                "emp_id": emp_id,
+                "updated_at": now_iso
+            }
+
+        normalized.append({
+            "wave": wave,
+            "booking": str(item.booking or "").strip().upper(),
+            "branch": branch,
+            "branch_name": str(item.branch_name or branch).strip(),
+            "bu": member_data_bu(item.bu),
+            "is_hidden": is_hidden,
+            **values
+        })
+
+    background_tasks.add_task(record_document_overrides_to_bq, copy.deepcopy(normalized), emp_id)
     background_tasks.add_task(sync_document_summary_reports, copy.deepcopy(normalized))
-    return {"status": "queued", "updated": len(normalized)}
+    return {"status": "success", "updated": len(normalized)}
+
+@app.post("/api/reset-document-overrides")
+def reset_document_overrides(data: ResetDocumentOverridesData, background_tasks: BackgroundTasks):
+    waves_to_clear = []
+    if data.wave:
+        for w in str(data.wave).split(","):
+            digits = re.sub(r"\D", "", w.strip())
+            if digits:
+                waves_to_clear.append(str(int(digits)))
+    if data.booking:
+        clean_b = str(data.booking).strip().upper()
+        mapping = get_sheet_meta_for_booking(clean_b)
+        if mapping and mapping.get("waves"):
+            waves_to_clear.extend(mapping["waves"])
+
+    waves_to_clear = list(dict.fromkeys(waves_to_clear))
+    with document_overrides_lock:
+        for w in waves_to_clear:
+            document_overrides_overlay.pop(w, None)
+
+    if waves_to_clear:
+        def delete_bq_overrides(waves):
+            try:
+                wave_list_sql = ", ".join(f"'{w}'" for w in waves)
+                query = f"DELETE FROM `pro-analytics-db.logistics_db.wave_document_overrides` WHERE Wave_Number IN ({wave_list_sql})"
+                client.query(query).result(timeout=BQ_JOB_TIMEOUT_SECONDS)
+                print(f"✅ Cleared document overrides for waves {waves} in BigQuery")
+            except Exception as e:
+                print(f"⚠️ Error deleting BQ document overrides: {e}")
+        background_tasks.add_task(delete_bq_overrides, waves_to_clear)
+
+    return {"status": "success", "cleared_waves": waves_to_clear}
+
+@app.get("/api/document-overrides")
+def get_document_overrides_endpoint(wave_no: str):
+    clean_w = re.sub(r"\D", "", str(wave_no or ""))
+    if not clean_w:
+        return {"overrides": {}}
+    return {"wave_no": clean_w, "overrides": get_document_overrides_for_wave(clean_w)}
 
 def transaction_already_processed(transaction_id: str) -> bool:
     tx_id = str(transaction_id or "").strip()
