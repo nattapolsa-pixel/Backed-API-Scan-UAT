@@ -1437,6 +1437,7 @@ def fetch_wave_data_from_bq(search_wave_id: int) -> dict:
                 UPPER(IFNULL(Color, 'None')) AS Color_Key,
                 ARRAY_AGG(Color ORDER BY Timestamp DESC LIMIT 1)[OFFSET(0)] AS Color,
                 ARRAY_AGG(Scan_Type ORDER BY Timestamp DESC LIMIT 1)[OFFSET(0)] AS Scan_Type,
+                ARRAY_AGG(Emp_ID ORDER BY Timestamp DESC LIMIT 1)[OFFSET(0)] AS Emp_ID,
                 SUM(Qty) AS Qty,
                 MAX(Timestamp) AS Max_Timestamp
             FROM ValidScanRows
@@ -1451,6 +1452,7 @@ def fetch_wave_data_from_bq(search_wave_id: int) -> dict:
                 MAX(Pallet_No) AS Scanned_Pallet_No,
                 ARRAY_AGG(Scan_Type ORDER BY Max_Timestamp DESC LIMIT 1)[OFFSET(0)] AS Scan_Type,
                 ARRAY_AGG(Color ORDER BY Max_Timestamp DESC LIMIT 1)[OFFSET(0)] AS Color,
+                STRING_AGG(DISTINCT NULLIF(TRIM(Emp_ID), ''), ', ' ORDER BY NULLIF(TRIM(Emp_ID), '')) AS Scanner_Emp_IDs,
                 STRING_AGG(CONCAT(IFNULL(Color, 'None'), '~', CAST(Qty AS STRING), '~', IFNULL(Scan_Type, '')), '|') AS Color_Breakdown,
                 STRING_AGG(CONCAT(CAST(Pallet_No AS STRING), '~', IFNULL(Color, 'None'), '~', CAST(Qty AS STRING), '~', IFNULL(Scan_Type, '')), '|' ORDER BY Pallet_No, Max_Timestamp) AS Pallet_Breakdown
             FROM PalletColorAggregatedScans
@@ -1554,6 +1556,7 @@ def fetch_wave_data_from_bq(search_wave_id: int) -> dict:
             COALESCE(MAX(s.Scanned_Pallet_No), 0) AS pallet_no,
             COALESCE(MAX(TRIM(d.Owner)), 'Unknown') AS owner,
             MAX(s.Color) AS color,
+            MAX(s.Scanner_Emp_IDs) AS scanner_emp_ids,
             MAX(s.Color_Breakdown) AS color_breakdown,
             MAX(s.Pallet_Breakdown) AS pallet_breakdown,
             ANY_VALUE(ps.Pallet_Nos) AS branch_pallet_nos,
@@ -1670,6 +1673,7 @@ def fetch_wave_data_from_bq(search_wave_id: int) -> dict:
             "scan_type": row["scan_type"],
             "owner": row["owner"] or "Unknown",
             "color": row["color"] or "None",
+            "scanner_emp_ids": row["scanner_emp_ids"] or "",
             "color_breakdown": row["color_breakdown"] or "",
             "pallet_breakdown": pallet_breakdown,
             "pallet_no": row["pallet_no"] if row["pallet_no"] is not None else 0,
@@ -2107,7 +2111,7 @@ async def health_check(response: Response):
     # ⚡ Cache-Control: s-maxage=5 ทำให้ CDN/Render ตอบ health check ได้ทันที ไม่ต้อง round-trip ถึง Python
     response.headers["Cache-Control"] = "no-store"
     response.headers["Connection"] = "keep-alive"
-    return {"status": "ok", "version": "1.8.1", "timestamp": time.time()}
+    return {"status": "ok", "version": "1.8.2", "timestamp": time.time()}
 
 def sync_document_summary_reports(summaries: list):
     if not summaries:
