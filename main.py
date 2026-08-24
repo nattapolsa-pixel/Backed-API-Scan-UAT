@@ -427,19 +427,21 @@ def write_delivery_report_summaries(summaries: list):
             existing_map = dict(delivery_report_row_cache["existing_map"])
             last_data_row = int(delivery_report_row_cache["last_data_row"] or 1)
         else:
-            existing = _sheet_values(session, DELIVERY_REPORT_SPREADSHEET_ID, f"'{DELIVERY_SOURCE_SHEET_NAME}'!A:F")
+            existing = _sheet_values(session, DELIVERY_REPORT_SPREADSHEET_ID, f"'{DELIVERY_SOURCE_SHEET_NAME}'!A:V")
             existing_map = {}
             last_data_row = 1
             for index in range(len(existing), 1, -1):
-                row = list(existing[index - 1]) + [""] * max(0, 6 - len(existing[index - 1]))
+                row = list(existing[index - 1]) + [""] * max(0, 22 - len(existing[index - 1]))
                 row_wave = re.sub(r"\D", "", str(row[2] or ""))
                 row_branch = str(row[3] or "").strip().upper()
+                row_booking = str(row[18] or "").strip().upper()
                 if (row_wave or row_branch) and index > last_data_row:
                     last_data_row = index
                 if row_wave and row_branch:
-                    key = (str(int(row_wave)), row_branch)
-                    if key not in existing_map:
-                        existing_map[key] = index
+                    wave_branch = (str(int(row_wave)), row_branch)
+                    exact_key = (row_booking, *wave_branch)
+                    existing_map.setdefault(exact_key, index)
+                    existing_map.setdefault(("", *wave_branch), index)
 
         batch_data = []
         formula_requests = []
@@ -449,8 +451,6 @@ def write_delivery_report_summaries(summaries: list):
         for summary in summaries:
             wave = str(int(str(summary["wave"]).strip()))
             branch = str(summary["branch"] or "").strip().upper()
-            key = (wave, branch)
-            
             if wave not in meta_cache:
                 meta_cache[wave] = get_delivery_wave_meta(wave)
             meta = meta_cache[wave]
@@ -459,9 +459,13 @@ def write_delivery_report_summaries(summaries: list):
             order_date, delivery_date = delivery_business_dates(pick_date)
             booking = str(summary.get("booking") or meta.get("booking") or "").strip().upper()
             car = cars.get(booking, {})
+            key = (booking, wave, branch)
+            legacy_key = ("", wave, branch)
 
             if key in existing_map:
                 target_row = existing_map[key]
+            elif not summary.get("booking_split") and legacy_key in existing_map:
+                target_row = existing_map[legacy_key]
             else:
                 target_row = current_append_row
                 existing_map[key] = target_row
@@ -518,6 +522,17 @@ def write_delivery_report_summary(summary: dict):
 
 def summarize_branch_for_member_data(wave_data: dict, branch: str) -> dict:
     items = [item for item in wave_data.get("lpn_list", []) if str(item.get("branch") or "").strip().upper() == branch]
+    split_summary = next((item.get("booking_split_summary") for item in items if item.get("booking_split_summary")), None)
+    if split_summary:
+        first = items[0] if items else {}
+        totals = {field: max(0, int(split_summary.get(field) or 0)) for field in ("m", "red", "blue", "green", "black")}
+        return {
+            "wave": str(int(str(wave_data.get("wave_no") or 0))),
+            "booking": str(wave_data.get("booking_no") or "").strip().upper(),
+            "branch": branch, "branch_name": first.get("branch_name") or branch,
+            "bu": member_data_bu(first.get("owner")), "label_count": len(items),
+            **totals, "total": sum(totals.values()), "pallet": max(0, int(split_summary.get("pallet") or 0))
+        }
     totals = {"m": 0, "red": 0, "blue": 0, "green": 0, "black": 0}
     def add(color, scan_type, qty, lpn=""):
         color = str(color or "None").upper(); scan_type = str(scan_type or "").upper(); prefix = str(lpn or "")[:2].upper()
@@ -1898,9 +1913,15 @@ def get_booking_data_internal(booking_no: str, force_refresh: bool = False) -> d
     mapping = get_booking_waves_mapping(booking_no, force_refresh)
     booking_clean = booking_no.strip().upper()
     assignments = get_booking_branch_assignments()
+    splits = get_booking_branch_splits()
     override_waves = [wave for (wave, branch), move in assignments.items()
                       if str(move.get("Assigned_Booking") or "").strip().upper() == booking_clean]
-    waves = list(dict.fromkeys(list(mapping["waves"]) + override_waves))
+    split_waves = [wave for (wave, branch, target), split in splits.items()
+                   if target == booking_clean or str(split.get("Source_Booking") or "").strip().upper() == booking_clean]
+    waves = list(dict.fromkeys(
+        str(int(re.sub(r"\D", "", str(wave)))) for wave in (list(mapping["waves"]) + override_waves + split_waves)
+        if re.sub(r"\D", "", str(wave or ""))
+    ))
     license_plate = mapping["license_plate"]
     
     lpn_list = []
@@ -1922,21 +1943,61 @@ def get_booking_data_internal(booking_no: str, force_refresh: bool = False) -> d
                 
     for wave_data_overlaid in wave_results:
         wave_key = str(int(str(wave_data_overlaid["wave_no"]).strip()))
+        native_booking = str(wave_data_overlaid.get("booking_no") or "").strip().upper()
+        items_by_branch = {}
         for item in wave_data_overlaid.get("lpn_list", []):
-            assignment = assignments.get((wave_key, str(item.get("branch") or "").strip().upper()))
+            items_by_branch.setdefault(str(item.get("branch") or "").strip().upper(), []).append(item)
+        for branch, branch_items in items_by_branch.items():
+            assignment = assignments.get((wave_key, branch))
             assigned_booking = str((assignment or {}).get("Assigned_Booking") or "").strip().upper()
-            native_booking = str(wave_data_overlaid.get("booking_no") or "").strip().upper()
-            effective_booking = assigned_booking or native_booking
-            if effective_booking == booking_clean:
-                if assignment:
+            branch_splits = [split for (split_wave, split_branch, target), split in splits.items()
+                             if split_wave == wave_key and split_branch == branch and bool(split.get("Is_Active", True))]
+            if assigned_booking:
+                if assigned_booking != booking_clean:
+                    continue
+                for item in branch_items:
+                    item = copy.deepcopy(item)
                     item["booking_override"] = {
                         "previous_booking": assignment.get("Previous_Booking") or native_booking,
-                        "assigned_booking": assignment.get("Assigned_Booking") or booking_clean,
+                        "assigned_booking": assigned_booking,
                         "reason": assignment.get("Reason") or "",
                         "emp_id": assignment.get("Emp_ID") or "",
                         "created_at": assignment.get("Created_At").isoformat() if assignment.get("Created_At") else ""
                     }
-                lpn_list.append(item)
+                    lpn_list.append(item)
+                continue
+
+            base_summary = summarize_branch_for_member_data(
+                {"wave_no": wave_key, "booking_no": native_booking, "lpn_list": branch_items}, branch
+            )
+            fields = ("m", "red", "blue", "green", "black", "pallet")
+            split_columns = {"m": "M_Count", "red": "Red_Count", "blue": "Blue_Count",
+                             "green": "Green_Count", "black": "Black_Count", "pallet": "Pallet_Count"}
+            outgoing = {field: sum(int(split.get(split_columns[field]) or 0) for split in branch_splits)
+                        for field in fields}
+            target_split = next((split for split in branch_splits
+                                 if str(split.get("Target_Booking") or "").strip().upper() == booking_clean), None)
+
+            if booking_clean == native_booking:
+                visible_totals = {field: max(0, int(base_summary.get(field) or 0) - outgoing[field]) for field in fields}
+                for item in branch_items:
+                    item = copy.deepcopy(item)
+                    item["booking_split_summary"] = visible_totals
+                    item["booking_split_outgoing"] = True
+                    lpn_list.append(item)
+            elif target_split:
+                visible_totals = {field: max(0, int(target_split.get(split_columns[field]) or 0)) for field in fields}
+                first = copy.deepcopy(branch_items[0])
+                first.update({
+                    "lpn": f"แบ่งยอดจาก {native_booking}", "zone": "TRANSFER", "status": "Scanned",
+                    "qty": sum(visible_totals[field] for field in ("m", "red", "blue", "green", "black")),
+                    "total_qty": sum(visible_totals[field] for field in ("m", "red", "blue", "green", "black")),
+                    "scan_type": "BOOKING_SPLIT", "color": "None", "historical_summary": True,
+                    "booking_split_summary": visible_totals,
+                    "booking_split_source": native_booking,
+                    "booking_split_target": booking_clean,
+                })
+                lpn_list.append(first)
         waves_included.add(wave_data_overlaid["wave_no"])
         
     zones_calc = {}
@@ -2042,6 +2103,14 @@ class BookingBranchMoveData(BaseModel):
     note: Optional[str] = None
     emp_id: str
 
+class BookingBranchSplitData(BookingBranchMoveData):
+    m: int = 0
+    red: int = 0
+    blue: int = 0
+    green: int = 0
+    black: int = 0
+    pallet: int = 0
+
 class DocumentSummaryData(BaseModel):
     wave: str
     booking: Optional[str] = None
@@ -2058,6 +2127,7 @@ class DocumentSummaryData(BaseModel):
     pallet: int = 0
     is_hidden: Optional[bool] = False
     is_closed: Optional[bool] = False
+    booking_split: Optional[bool] = False
 
 class DocumentSummaryBatchData(BaseModel):
     summaries: List[DocumentSummaryData]
@@ -2105,6 +2175,32 @@ def get_booking_branch_assignments() -> dict:
         print(f"BOOKING OVERRIDE READ ERROR: {exc}")
         return {}
 
+def ensure_booking_split_table():
+    client.query("""
+        CREATE TABLE IF NOT EXISTS `pro-analytics-db.logistics_db.booking_branch_splits` (
+            Event_ID STRING, Wave_Number STRING, Branch_Code STRING,
+            Source_Booking STRING, Target_Booking STRING,
+            M_Count INT64, Red_Count INT64, Blue_Count INT64, Green_Count INT64, Black_Count INT64,
+            Pallet_Count INT64, Is_Active BOOL, Reason STRING, Note STRING, Emp_ID STRING, Created_At TIMESTAMP
+        )
+    """).result(timeout=BQ_JOB_TIMEOUT_SECONDS)
+
+def get_booking_branch_splits() -> dict:
+    try:
+        ensure_booking_split_table()
+        rows = client.query("""
+            SELECT * FROM `pro-analytics-db.logistics_db.booking_branch_splits`
+            QUALIFY ROW_NUMBER() OVER (
+                PARTITION BY TRIM(Wave_Number), UPPER(TRIM(Branch_Code)), UPPER(TRIM(Target_Booking))
+                ORDER BY Created_At DESC, Event_ID DESC
+            ) = 1
+        """).result(timeout=BQ_JOB_TIMEOUT_SECONDS)
+        return {(str(row["Wave_Number"]).strip(), str(row["Branch_Code"]).strip().upper(),
+                 str(row["Target_Booking"]).strip().upper()): dict(row.items()) for row in rows}
+    except Exception as exc:
+        print(f"BOOKING SPLIT READ ERROR: {exc}")
+        return {}
+
 # ==================== ROUTES & APIs ====================
 
 @app.get("/")
@@ -2117,18 +2213,21 @@ async def health_check(response: Response):
     # ⚡ Cache-Control: s-maxage=5 ทำให้ CDN/Render ตอบ health check ได้ทันที ไม่ต้อง round-trip ถึง Python
     response.headers["Cache-Control"] = "no-store"
     response.headers["Connection"] = "keep-alive"
-    return {"status": "ok", "version": "1.8.3", "timestamp": time.time()}
+    return {"status": "ok", "version": "1.9.0", "timestamp": time.time()}
 
 def sync_document_summary_reports(summaries: list):
     if not summaries:
         return
     failures = []
+    # Member Data ไม่มีคอลัมน์ Booking จึงเก็บยอดรวมเดิม 1 แถวต่อ Wave+Branch
+    # ส่วน Delivery report รองรับแยก Booking และรับยอดแบ่งได้
+    member_summaries = [summary for summary in summaries if not summary.get("booking_split")]
     try:
-        write_member_history_summaries(summaries)
+        write_member_history_summaries(member_summaries)
     except Exception as exc:
         print(f"🚨 Member Data batch write error: {exc}")
         failed = []
-        for s in summaries:
+        for s in member_summaries:
             try:
                 write_member_history_summary(s)
             except Exception as single_exc:
@@ -2180,6 +2279,7 @@ def save_document_summary(data: DocumentSummaryBatchData, background_tasks: Back
             "bu": member_data_bu(item.bu),
             "is_hidden": is_hidden,
             "is_closed": bool(getattr(item, "is_closed", False)),
+            "booking_split": bool(getattr(item, "booking_split", False)),
             **values
         })
 
@@ -2378,12 +2478,14 @@ def preview_booking_branch(wave_no: str, branch_code: str):
     assignment = assignments.get((wave_clean, branch))
     current_booking = str((assignment or {}).get("Assigned_Booking") or data.get("booking_no") or "").strip().upper()
     scanned = [item for item in items if item.get("status") == "Scanned"]
+    summary = summarize_branch_for_member_data(data, branch)
     return {
         "status": "success", "wave_no": wave_clean, "branch_code": branch,
         "branch_name": items[0].get("branch_name") or "Unknown",
         "current_booking": current_booking, "lpn_total": len(items),
         "lpn_scanned": len(scanned), "box_qty": sum(int(item.get("qty") or 0) for item in scanned),
         "pallet_count": len({int(item.get("pallet_no") or 0) for item in scanned if int(item.get("pallet_no") or 0) > 0}),
+        "totals": {field: int(summary.get(field) or 0) for field in ("m", "red", "blue", "green", "black", "pallet")},
         "closed_at": next((item.get("branch_closed_at") for item in items if item.get("branch_closed_at")), "")
     }
 
@@ -2417,6 +2519,8 @@ def get_wave_branch_options(wave_no: str):
         assignment = assignments.get((wave_clean, branch))
         row["current_booking"] = str((assignment or {}).get("Assigned_Booking") or native_booking).strip().upper()
         row["pallet_count"] = len(row.pop("pallet_nos"))
+        summary = summarize_branch_for_member_data(data, branch)
+        row["totals"] = {field: int(summary.get(field) or 0) for field in ("m", "red", "blue", "green", "black", "pallet")}
         row["is_closed"] = bool(row["closed_at"])
         options.append(row)
     options.sort(key=lambda item: item["branch_code"])
@@ -2459,6 +2563,74 @@ def move_booking_branch(data: BookingBranchMoveData):
         booking_waves_cache.pop(target, None)
     queue_branch_totals_reconciliation([(wave_clean, branch)], delay_seconds=0.5)
     return {"status": "success", "message": "ย้ายสาขาเรียบร้อย", "previous_booking": previous, "target_booking": target, "preview": preview}
+
+@app.post("/api/split-booking-branch")
+def split_booking_branch(data: BookingBranchSplitData):
+    target = str(data.target_booking or "").strip().upper()
+    wave_clean = str(int(str(data.wave_no).strip()))
+    branch = str(data.branch_code or "").strip().upper()
+    reason = str(data.reason or "").strip()
+    emp_id = str(data.emp_id or "").strip()
+    if not target or not branch or not reason or not emp_id:
+        raise HTTPException(status_code=400, detail="กรุณาระบุ Booking, สาขา, เหตุผล และผู้ดำเนินการให้ครบ")
+    preview = preview_booking_branch(wave_clean, branch)
+    source = str(preview.get("current_booking") or "").strip().upper()
+    if source == target:
+        raise HTTPException(status_code=409, detail=f"สาขา {branch} อยู่ใน Booking {target} แล้ว")
+    requested = {field: max(0, int(getattr(data, field) or 0)) for field in
+                 ("m", "red", "blue", "green", "black", "pallet")}
+    if sum(requested[field] for field in ("m", "red", "blue", "green", "black")) <= 0:
+        raise HTTPException(status_code=400, detail="กรุณาระบุยอดกล่องที่ต้องการแบ่งอย่างน้อย 1 กล่อง")
+    available = preview.get("totals") or {}
+    existing_splits = [split for (split_wave, split_branch, split_target), split in get_booking_branch_splits().items()
+                       if split_wave == wave_clean and split_branch == branch and bool(split.get("Is_Active", True))
+                       and split_target != target]
+    split_columns = {"m": "M_Count", "red": "Red_Count", "blue": "Blue_Count",
+                     "green": "Green_Count", "black": "Black_Count", "pallet": "Pallet_Count"}
+    for field, value in requested.items():
+        remaining = max(0, int(available.get(field) or 0) - sum(int(split.get(split_columns[field]) or 0) for split in existing_splits))
+        if value > remaining:
+            raise HTTPException(status_code=409, detail=f"ยอด {field} ที่แบ่ง ({value}) มากกว่ายอดคงเหลือ ({remaining})")
+    get_booking_waves_mapping(target, force_refresh=True)
+    ensure_booking_split_table()
+    query = """
+        INSERT INTO `pro-analytics-db.logistics_db.booking_branch_splits`
+        (Event_ID, Wave_Number, Branch_Code, Source_Booking, Target_Booking,
+         M_Count, Red_Count, Blue_Count, Green_Count, Black_Count, Pallet_Count,
+         Is_Active, Reason, Note, Emp_ID, Created_At)
+        VALUES (@event_id, @wave, @branch, @source, @target,
+                @m, @red, @blue, @green, @black, @pallet,
+                TRUE, @reason, @note, @emp_id, CURRENT_TIMESTAMP())
+    """
+    params = [
+        bigquery.ScalarQueryParameter("event_id", "STRING", str(uuid.uuid4())),
+        bigquery.ScalarQueryParameter("wave", "STRING", wave_clean),
+        bigquery.ScalarQueryParameter("branch", "STRING", branch),
+        bigquery.ScalarQueryParameter("source", "STRING", source),
+        bigquery.ScalarQueryParameter("target", "STRING", target),
+        *[bigquery.ScalarQueryParameter(field, "INT64", requested[field]) for field in ("m", "red", "blue", "green", "black", "pallet")],
+        bigquery.ScalarQueryParameter("reason", "STRING", reason),
+        bigquery.ScalarQueryParameter("note", "STRING", str(data.note or "").strip()),
+        bigquery.ScalarQueryParameter("emp_id", "STRING", emp_id),
+    ]
+    client.query(query, job_config=bigquery.QueryJobConfig(query_parameters=params)).result(timeout=BQ_JOB_TIMEOUT_SECONDS)
+    with booking_waves_cache_lock:
+        booking_waves_cache.pop(source, None)
+        booking_waves_cache.pop(target, None)
+    split_report_summaries = []
+    for booking in (source, target):
+        booking_view = get_booking_data_internal(booking, force_refresh=True)
+        summary = summarize_branch_for_member_data(
+            {"wave_no": wave_clean, "booking_no": booking, "lpn_list": booking_view.get("lpn_list", [])}, branch
+        )
+        branch_view_items = [item for item in booking_view.get("lpn_list", [])
+                             if str(item.get("branch") or "").strip().upper() == branch]
+        if branch_view_items and any(item.get("branch_closed_at") for item in branch_view_items):
+            summary.update({"booking": booking, "booking_split": True, "is_closed": True})
+            split_report_summaries.append(summary)
+    queue_report_summary_snapshots(split_report_summaries, delay_seconds=0.0)
+    return {"status": "success", "message": "แบ่งยอดเข้าสอง Booking เรียบร้อย",
+            "source_booking": source, "target_booking": target, "allocated": requested}
 
 @app.post("/api/start-pallet")
 def start_pallet(data: PalletStartData):
