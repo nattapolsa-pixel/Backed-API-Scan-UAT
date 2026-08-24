@@ -74,7 +74,7 @@ member_history_cache = {"expires_at": 0.0, "data": {}}
 member_history_lock = Lock()
 member_history_row_cache = {"expires_at": 0.0, "existing_map": {}, "last_data_row": 1}
 
-DELIVERY_REPORT_SPREADSHEET_ID = "1_giWrKy5bi8cpmdM-2ui1_vG9jQ7kEhf4yxMvHpj-XY"
+DELIVERY_REPORT_SPREADSHEET_ID = "14kBtY2tdMXi3I9rbNleokmyJ_WWGRmKXPPU2VaVstZQ"
 DELIVERY_REPORT_SHEET_NAME = "Delivery report"
 DELIVERY_SOURCE_SHEET_NAME = "วางข้อมูล"
 DELIVERY_REPORT_SHEET_ID = 1686001204
@@ -2213,7 +2213,7 @@ async def health_check(response: Response):
     # ⚡ Cache-Control: s-maxage=5 ทำให้ CDN/Render ตอบ health check ได้ทันที ไม่ต้อง round-trip ถึง Python
     response.headers["Cache-Control"] = "no-store"
     response.headers["Connection"] = "keep-alive"
-    return {"status": "ok", "version": "1.9.0", "timestamp": time.time()}
+    return {"status": "ok", "version": "1.9.1", "timestamp": time.time()}
 
 def sync_document_summary_reports(summaries: list):
     if not summaries:
