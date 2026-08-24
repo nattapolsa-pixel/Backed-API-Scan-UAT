@@ -6,9 +6,9 @@ services:
     region: singapore
     buildCommand: pip install -r requirements.txt
     # ⚡ Standard Plan: 1 CPU dedicated
-    # gunicorn + UvicornWorker = stable process manager + fast async workers
-    # 2 workers (recommended: 2 × CPU cores) + 120s keep-alive
-    startCommand: gunicorn main:app -w 2 -k uvicorn.workers.UvicornWorker --bind 0.0.0.0:$PORT --timeout 120 --keep-alive 5 --max-requests 1000 --max-requests-jitter 100
+    # Standard มี 1 CPU: ใช้ async worker เดียวเพื่อให้ cache/คิวซิงก์ยอดเป็นชุดเดียวกันทุก request
+    # FastAPI ยังรองรับหลาย Handheld พร้อมกันผ่าน async + threadpool โดยไม่แบ่ง state เป็นคนละ process
+    startCommand: gunicorn main:app -w 1 -k uvicorn.workers.UvicornWorker --worker-connections 1000 --bind 0.0.0.0:$PORT --timeout 120 --keep-alive 5 --max-requests 2000 --max-requests-jitter 200
     healthCheckPath: /api/health
     autoDeploy: true
     envVars:

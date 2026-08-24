@@ -17,6 +17,7 @@ import uuid
 import datetime
 import urllib.parse
 import urllib.request
+import threading
 from threading import Lock
 from concurrent.futures import ThreadPoolExecutor
 from fastapi.middleware.cors import CORSMiddleware
@@ -71,6 +72,7 @@ MEMBER_HISTORY_GID = "0"
 MEMBER_HISTORY_CACHE_TTL_SECONDS = 10 * 60
 member_history_cache = {"expires_at": 0.0, "data": {}}
 member_history_lock = Lock()
+member_history_row_cache = {"expires_at": 0.0, "existing_map": {}, "last_data_row": 1}
 
 DELIVERY_REPORT_SPREADSHEET_ID = "1_giWrKy5bi8cpmdM-2ui1_vG9jQ7kEhf4yxMvHpj-XY"
 DELIVERY_REPORT_SHEET_NAME = "Delivery report"
@@ -80,6 +82,8 @@ DELIVERY_CAR_SHEET_NAME = "Data Booking&Car"
 DELIVERY_BRANCH_SHEET_NAME = "Sheet3"
 delivery_report_lock = Lock()
 delivery_lookup_cache = {"expires_at": 0.0, "cars": {}, "branches": {}}
+delivery_report_row_cache = {"expires_at": 0.0, "existing_map": {}, "last_data_row": 1}
+SHEET_ROW_CACHE_TTL_SECONDS = 5 * 60
 
 def get_sheets_session():
     credentials = client._credentials
@@ -102,28 +106,28 @@ def write_member_history_summaries(summaries: list):
     if not summaries:
         return
     session = get_sheets_session()
-    lookup_range = urllib.parse.quote("Member Data!A:D", safe="")
     base = f"https://sheets.googleapis.com/v4/spreadsheets/{MEMBER_HISTORY_SPREADSHEET_ID}"
-    read_res = session.get(f"{base}/values/{lookup_range}", timeout=45)
-    read_res.raise_for_status()
-    values = read_res.json().get("values") or []
-    
-    existing_map = {}
-    last_data_row = 1
-    for index in range(len(values), 1, -1):
-        row = values[index - 1]
-        row = list(row) + [""] * max(0, 4 - len(row))
-        wave_digits = re.sub(r"\D", "", str(row[2] or ""))
-        branch_code = str(row[3] or "").strip().upper()
-        if (wave_digits or branch_code) and index > last_data_row:
-            last_data_row = index
-        if wave_digits and branch_code:
-            key = (str(int(wave_digits)), branch_code)
-            if key not in existing_map:
-                existing_map[key] = index
-
-    if not last_data_row:
-        last_data_row = len(values)
+    now = time.time()
+    if member_history_row_cache["existing_map"] and member_history_row_cache["expires_at"] > now:
+        existing_map = dict(member_history_row_cache["existing_map"])
+        last_data_row = int(member_history_row_cache["last_data_row"] or 1)
+    else:
+        lookup_range = urllib.parse.quote("Member Data!A:D", safe="")
+        read_res = session.get(f"{base}/values/{lookup_range}", timeout=45)
+        read_res.raise_for_status()
+        values = read_res.json().get("values") or []
+        existing_map = {}
+        last_data_row = 1
+        for index in range(len(values), 1, -1):
+            row = list(values[index - 1]) + [""] * max(0, 4 - len(values[index - 1]))
+            wave_digits = re.sub(r"\D", "", str(row[2] or ""))
+            branch_code = str(row[3] or "").strip().upper()
+            if (wave_digits or branch_code) and index > last_data_row:
+                last_data_row = index
+            if wave_digits and branch_code:
+                key = (str(int(wave_digits)), branch_code)
+                if key not in existing_map:
+                    existing_map[key] = index
 
     now_bkk = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=7)))
     date_str = now_bkk.strftime("%-d/%-m/%Y") if os.name != "nt" else f"{now_bkk.day}/{now_bkk.month}/{now_bkk.year}"
@@ -160,6 +164,10 @@ def write_member_history_summaries(summaries: list):
     }
     response = session.post(f"{base}/values:batchUpdate", json=batch_payload, timeout=45)
     response.raise_for_status()
+
+    member_history_row_cache["existing_map"] = dict(existing_map)
+    member_history_row_cache["last_data_row"] = max(last_data_row, current_append_row - 1)
+    member_history_row_cache["expires_at"] = time.time() + SHEET_ROW_CACHE_TTL_SECONDS
 
     with member_history_lock:
         member_history_cache["expires_at"] = 0
@@ -284,6 +292,7 @@ def get_sheet_meta_for_booking(booking_no: str) -> dict:
 # ==================== DOCUMENT OVERRIDES SYNC SYSTEM ====================
 document_overrides_overlay = {}
 document_overrides_lock = Lock()
+MANUAL_OVERRIDE_EMP_PREFIX = "MANUAL_OVERRIDE|"
 
 def get_document_overrides_for_wave(wave_no: str) -> dict:
     clean_wave = re.sub(r"\D", "", str(wave_no or ""))
@@ -318,6 +327,11 @@ def get_document_overrides_for_wave(wave_no: str) -> dict:
                 continue
             if b in seen_branches:
                 continue
+            # ก่อน v1.8.1 ยอด snapshot อัตโนมัติถูกเขียนปนกับยอดที่ผู้ใช้แก้จริง
+            # ใช้เฉพาะแถวที่มี marker ใหม่ เพื่อไม่ให้ยอดเก่าค้างทับผลสแกนในอนาคต
+            raw_emp_id = str(r["Emp_ID"] or "")
+            if not raw_emp_id.startswith(MANUAL_OVERRIDE_EMP_PREFIX):
+                continue
             seen_branches.add(b)
             overrides[b] = {
                 "m": r["M_Count"],
@@ -328,7 +342,7 @@ def get_document_overrides_for_wave(wave_no: str) -> dict:
                 "total": r["Total_Count"],
                 "pallet": r["Pallet_Count"],
                 "is_hidden": bool(r["Is_Hidden"]),
-                "emp_id": str(r["Emp_ID"] or ""),
+                "emp_id": raw_emp_id[len(MANUAL_OVERRIDE_EMP_PREFIX):],
                 "updated_at": r["Updated_At"].isoformat() if r["Updated_At"] else ""
             }
         with document_overrides_lock:
@@ -355,18 +369,20 @@ def record_document_overrides_to_bq(summaries: list, emp_id: str):
             "Total_Count": int(s.get("total", 0) or 0),
             "Pallet_Count": int(s.get("pallet", 0) or 0),
             "Is_Hidden": 1 if s.get("is_hidden") else 0,
-            "Emp_ID": str(emp_id or ""),
+            # Marker แยกยอดที่ผู้ใช้ตั้งใจแก้ ออกจาก snapshot อัตโนมัติอย่างถาวร
+            "Emp_ID": f"{MANUAL_OVERRIDE_EMP_PREFIX}{str(emp_id or '').strip()}",
             "Updated_At": now_iso
         })
     try:
         table_ref = client.dataset("logistics_db").table("wave_document_overrides")
         errors = client.insert_rows_json(table_ref, rows_to_insert)
         if errors:
-            print(f"⚠️ Error inserting document overrides to BQ: {errors}")
+            raise RuntimeError(f"BigQuery override insert errors: {errors}")
         else:
             print(f"✅ Saved {len(rows_to_insert)} document overrides to BigQuery")
     except Exception as e:
         print(f"⚠️ Exception saving document overrides to BQ: {e}")
+        raise
 
 def get_delivery_wave_meta(wave: str) -> dict:
     query = """
@@ -406,23 +422,24 @@ def write_delivery_report_summaries(summaries: list):
     now_bkk = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=7)))
     
     with delivery_report_lock:
-        existing = _sheet_values(session, DELIVERY_REPORT_SPREADSHEET_ID, f"'{DELIVERY_SOURCE_SHEET_NAME}'!A:F")
-        existing_map = {}
-        last_data_row = 1
-        for index in range(len(existing), 1, -1):
-            row = existing[index - 1]
-            row = list(row) + [""] * max(0, 6 - len(row))
-            row_wave = re.sub(r"\D", "", str(row[2] or ""))
-            row_branch = str(row[3] or "").strip().upper()
-            if (row_wave or row_branch) and index > last_data_row:
-                last_data_row = index
-            if row_wave and row_branch:
-                key = (str(int(row_wave)), row_branch)
-                if key not in existing_map:
-                    existing_map[key] = index
-
-        if not last_data_row:
-            last_data_row = len(existing)
+        now = time.time()
+        if delivery_report_row_cache["existing_map"] and delivery_report_row_cache["expires_at"] > now:
+            existing_map = dict(delivery_report_row_cache["existing_map"])
+            last_data_row = int(delivery_report_row_cache["last_data_row"] or 1)
+        else:
+            existing = _sheet_values(session, DELIVERY_REPORT_SPREADSHEET_ID, f"'{DELIVERY_SOURCE_SHEET_NAME}'!A:F")
+            existing_map = {}
+            last_data_row = 1
+            for index in range(len(existing), 1, -1):
+                row = list(existing[index - 1]) + [""] * max(0, 6 - len(existing[index - 1]))
+                row_wave = re.sub(r"\D", "", str(row[2] or ""))
+                row_branch = str(row[3] or "").strip().upper()
+                if (row_wave or row_branch) and index > last_data_row:
+                    last_data_row = index
+                if row_wave and row_branch:
+                    key = (str(int(row_wave)), row_branch)
+                    if key not in existing_map:
+                        existing_map[key] = index
 
         batch_data = []
         formula_requests = []
@@ -481,6 +498,10 @@ def write_delivery_report_summaries(summaries: list):
         base = f"https://sheets.googleapis.com/v4/spreadsheets/{DELIVERY_REPORT_SPREADSHEET_ID}"
         response = session.post(f"{base}/values:batchUpdate", json={"valueInputOption": "RAW", "data": batch_data}, timeout=60)
         response.raise_for_status()
+
+        delivery_report_row_cache["existing_map"] = dict(existing_map)
+        delivery_report_row_cache["last_data_row"] = max(last_data_row, current_append_row - 1)
+        delivery_report_row_cache["expires_at"] = time.time() + SHEET_ROW_CACHE_TTL_SECONDS
 
         if formula_requests:
             try:
@@ -571,6 +592,178 @@ def summarize_branch_for_member_data(wave_data: dict, branch: str) -> dict:
             "branch_name": first.get("branch_name") or branch, "bu": member_data_bu(first.get("owner")),
             "label_count": len({str(item.get("lpn") or "") for item in items if item.get("lpn")}),
             **totals, "total": sum(totals.values()), "pallet": len(pallet_nos)}
+
+
+def apply_document_override_to_summary(summary: dict) -> dict:
+    """Apply only an intentional document override to a calculated scanner summary."""
+    result = copy.deepcopy(summary)
+    wave = str(result.get("wave") or "").strip()
+    branch = str(result.get("branch") or "").strip().upper()
+    if not wave or not branch:
+        return result
+    override = (get_document_overrides_for_wave(wave) or {}).get(branch) or {}
+    if not override:
+        return result
+    for field in ("m", "red", "blue", "green", "black", "pallet"):
+        if override.get(field) is not None:
+            result[field] = max(0, int(override.get(field) or 0))
+    result["total"] = sum(int(result.get(field) or 0) for field in ("m", "red", "blue", "green", "black"))
+    result["is_hidden"] = bool(override.get("is_hidden", False))
+    return result
+
+
+# ==================== RELIABLE REPORT SYNC COORDINATOR ====================
+# API requests acknowledge the scanner immediately. A single background worker then
+# coalesces rapid changes and writes the latest totals to both operational Sheets.
+REPORT_SYNC_FAST_DELAY_SECONDS = 0.15
+REPORT_SYNC_RECONCILE_DELAY_SECONDS = 1.75
+REPORT_SYNC_MAX_DEBOUNCE_SECONDS = 3.0
+report_sync_pending = {}
+report_sync_pending_lock = Lock()
+report_sync_wakeup = threading.Event()
+report_sync_worker_started = False
+report_sync_worker_start_lock = Lock()
+
+
+def _report_sync_key(wave: str, branch: str, mode: str) -> tuple:
+    clean_wave = re.sub(r"\D", "", str(wave or ""))
+    return (str(int(clean_wave)) if clean_wave else "", str(branch or "").strip().upper(), mode)
+
+
+def queue_report_summary_snapshots(summaries: list, delay_seconds: float = REPORT_SYNC_FAST_DELAY_SECONDS):
+    """Queue exact totals already shown by the web; latest snapshot wins per Wave+Branch."""
+    now = time.time()
+    with report_sync_pending_lock:
+        for raw in summaries or []:
+            summary = copy.deepcopy(raw)
+            key = _report_sync_key(summary.get("wave"), summary.get("branch"), "snapshot")
+            if not key[0] or not key[1]:
+                continue
+            previous = report_sync_pending.get(key) or {}
+            first_at = float(previous.get("first_at") or now)
+            report_sync_pending[key] = {
+                "mode": "snapshot",
+                "wave": key[0],
+                "branch": key[1],
+                "summary": summary,
+                "first_at": first_at,
+                "due_at": min(now + max(0.0, delay_seconds), first_at + REPORT_SYNC_MAX_DEBOUNCE_SECONDS),
+                "attempts": int(previous.get("attempts") or 0),
+            }
+    report_sync_wakeup.set()
+
+
+def queue_branch_totals_reconciliation(wave_branch_pairs, delay_seconds: float = REPORT_SYNC_RECONCILE_DELAY_SECONDS):
+    """Queue a server-side recalculation from BigQuery after streaming rows become queryable."""
+    now = time.time()
+    with report_sync_pending_lock:
+        for wave, branch in wave_branch_pairs or []:
+            key = _report_sync_key(wave, branch, "reconcile")
+            if not key[0] or not key[1]:
+                continue
+            previous = report_sync_pending.get(key) or {}
+            first_at = float(previous.get("first_at") or now)
+            report_sync_pending[key] = {
+                "mode": "reconcile",
+                "wave": key[0],
+                "branch": key[1],
+                "summary": None,
+                "first_at": first_at,
+                "due_at": min(now + max(0.0, delay_seconds), first_at + REPORT_SYNC_MAX_DEBOUNCE_SECONDS),
+                "attempts": int(previous.get("attempts") or 0),
+            }
+    report_sync_wakeup.set()
+
+
+def queue_wave_totals_reconciliation(waves, delay_seconds: float = REPORT_SYNC_RECONCILE_DELAY_SECONDS):
+    """Rebuild every branch in a Wave, used after clearing document overrides."""
+    now = time.time()
+    with report_sync_pending_lock:
+        for wave in waves or []:
+            key = _report_sync_key(wave, "*", "reconcile_wave")
+            if not key[0]:
+                continue
+            report_sync_pending[key] = {
+                "mode": "reconcile_wave", "wave": key[0], "branch": "*", "summary": None,
+                "first_at": now, "due_at": now + max(0.0, delay_seconds), "attempts": 0,
+            }
+    report_sync_wakeup.set()
+
+
+def _build_reconciled_summaries(entries: list) -> list:
+    summaries = []
+    entries_by_wave = {}
+    for entry in entries:
+        entries_by_wave.setdefault(entry["wave"], []).append(entry)
+    for wave, wave_entries in entries_by_wave.items():
+        # One fresh BigQuery query per Wave, even when many branches changed together.
+        fresh = get_wave_data_internal(wave, force_refresh=True)
+        fresh = apply_local_overlay(wave, fresh)
+        available_branches = sorted({str(item.get("branch") or "").strip().upper()
+                                     for item in fresh.get("lpn_list", []) if item.get("branch")})
+        requested = set()
+        for entry in wave_entries:
+            if entry["mode"] == "reconcile_wave":
+                requested.update(available_branches)
+            else:
+                requested.add(entry["branch"])
+        for branch in sorted(requested):
+            summary = summarize_branch_for_member_data(fresh, branch)
+            summaries.append(apply_document_override_to_summary(summary))
+    return summaries
+
+
+def _requeue_failed_report_entries(entries: list):
+    now = time.time()
+    with report_sync_pending_lock:
+        for entry in entries:
+            attempts = int(entry.get("attempts") or 0) + 1
+            retry = copy.deepcopy(entry)
+            retry["attempts"] = attempts
+            retry["first_at"] = now
+            retry["due_at"] = now + min(60.0, 3.0 * (2 ** min(attempts, 4)))
+            key = _report_sync_key(retry["wave"], retry["branch"], retry["mode"])
+            # Never replace a newer change that arrived while this write was running.
+            report_sync_pending.setdefault(key, retry)
+    report_sync_wakeup.set()
+
+
+def report_sync_worker_loop():
+    """Serialize Sheet writes, batch branches, retry failures, and keep scanner requests fast."""
+    while True:
+        report_sync_wakeup.wait(timeout=0.5)
+        report_sync_wakeup.clear()
+        now = time.time()
+        due_entries = []
+        with report_sync_pending_lock:
+            for key, entry in list(report_sync_pending.items()):
+                if float(entry.get("due_at") or 0) <= now:
+                    due_entries.append(entry)
+                    report_sync_pending.pop(key, None)
+        if not due_entries:
+            continue
+        try:
+            snapshots = [copy.deepcopy(entry["summary"]) for entry in due_entries
+                         if entry["mode"] == "snapshot" and entry.get("summary")]
+            reconciles = [entry for entry in due_entries if entry["mode"] != "snapshot"]
+            # Snapshot gives users a fast update. Reconciliation follows from durable BigQuery state.
+            if snapshots:
+                sync_document_summary_reports(snapshots)
+            if reconciles:
+                sync_document_summary_reports(_build_reconciled_summaries(reconciles))
+            print(f"✅ REPORT SYNC | snapshots={len(snapshots)} reconciles={len(reconciles)}")
+        except Exception as exc:
+            print(f"🚨 REPORT SYNC RETRY | entries={len(due_entries)} | {exc}")
+            _requeue_failed_report_entries(due_entries)
+
+
+def ensure_report_sync_worker_started():
+    global report_sync_worker_started
+    with report_sync_worker_start_lock:
+        if report_sync_worker_started:
+            return
+        threading.Thread(target=report_sync_worker_loop, daemon=True, name="report-sync-worker").start()
+        report_sync_worker_started = True
 
 def _history_int(value) -> int:
     try:
@@ -1859,6 +2052,10 @@ class DocumentSummaryData(BaseModel):
 class DocumentSummaryBatchData(BaseModel):
     summaries: List[DocumentSummaryData]
     emp_id: Optional[str] = None
+    # False = snapshot ยอดอัตโนมัติจากหน้าจอ (ใช้ซิงก์รายงานเท่านั้น)
+    # True = ผู้ใช้แก้ยอด/ซ่อนสาขาเอง จึงค่อยบันทึกเป็น override ถาวร
+    persist_overrides: bool = False
+    reason: Optional[str] = None
 
 class ResetDocumentOverridesData(BaseModel):
     wave: Optional[str] = None
@@ -1910,29 +2107,38 @@ async def health_check(response: Response):
     # ⚡ Cache-Control: s-maxage=5 ทำให้ CDN/Render ตอบ health check ได้ทันที ไม่ต้อง round-trip ถึง Python
     response.headers["Cache-Control"] = "no-store"
     response.headers["Connection"] = "keep-alive"
-    return {"status": "ok", "version": "1.8.0", "timestamp": time.time()}
+    return {"status": "ok", "version": "1.8.1", "timestamp": time.time()}
 
 def sync_document_summary_reports(summaries: list):
     if not summaries:
         return
+    failures = []
     try:
         write_member_history_summaries(summaries)
     except Exception as exc:
         print(f"🚨 Member Data batch write error: {exc}")
+        failed = []
         for s in summaries:
             try:
                 write_member_history_summary(s)
-            except Exception:
-                pass
+            except Exception as single_exc:
+                failed.append(f"{s.get('wave')}/{s.get('branch')}: {single_exc}")
+        if failed:
+            failures.append("Member Data: " + "; ".join(failed))
     try:
         write_delivery_report_summaries(summaries)
     except Exception as exc:
         print(f"🚨 Delivery report batch write error: {exc}")
+        failed = []
         for s in summaries:
             try:
                 write_delivery_report_summary(s)
-            except Exception:
-                pass
+            except Exception as single_exc:
+                failed.append(f"{s.get('wave')}/{s.get('branch')}: {single_exc}")
+        if failed:
+            failures.append("Delivery report: " + "; ".join(failed))
+    if failures:
+        raise RuntimeError(" | ".join(failures))
 
 @app.post("/api/document-summary")
 def save_document_summary(data: DocumentSummaryBatchData, background_tasks: BackgroundTasks):
@@ -1956,16 +2162,6 @@ def save_document_summary(data: DocumentSummaryBatchData, background_tasks: Back
         values["total"] = calculated_total
         is_hidden = bool(getattr(item, "is_hidden", False))
 
-        # บันทึกลง Memory Overlay ทันที เพื่อให้ทุกเครื่องที่เปิด Wave นี้เห็นยอดตรงกันแบบ Real-time
-        with document_overrides_lock:
-            wave_ov = document_overrides_overlay.setdefault(wave, {})
-            wave_ov[branch] = {
-                **values,
-                "is_hidden": is_hidden,
-                "emp_id": emp_id,
-                "updated_at": now_iso
-            }
-
         normalized.append({
             "wave": wave,
             "booking": str(item.booking or "").strip().upper(),
@@ -1976,9 +2172,25 @@ def save_document_summary(data: DocumentSummaryBatchData, background_tasks: Back
             **values
         })
 
-    background_tasks.add_task(record_document_overrides_to_bq, copy.deepcopy(normalized), emp_id)
-    background_tasks.add_task(sync_document_summary_reports, copy.deepcopy(normalized))
-    return {"status": "success", "updated": len(normalized)}
+    if data.persist_overrides:
+        # ยอดที่ผู้ใช้แก้ต้องลง BigQuery สำเร็จก่อนตอบกลับ เพื่อไม่ให้ขึ้นว่าบันทึกแล้วแต่หายหลัง restart
+        record_document_overrides_to_bq(copy.deepcopy(normalized), emp_id)
+        with document_overrides_lock:
+            for item in normalized:
+                wave_ov = document_overrides_overlay.setdefault(item["wave"], {})
+                wave_ov[item["branch"]] = {
+                    **{field: item[field] for field in ("m", "red", "blue", "green", "black", "total", "pallet")},
+                    "is_hidden": bool(item.get("is_hidden")),
+                    "emp_id": emp_id,
+                    "updated_at": now_iso,
+                }
+    queue_report_summary_snapshots(copy.deepcopy(normalized))
+    return {
+        "status": "success",
+        "updated": len(normalized),
+        "report_sync": "queued",
+        "persist_overrides": bool(data.persist_overrides),
+    }
 
 @app.post("/api/reset-document-overrides")
 def reset_document_overrides(data: ResetDocumentOverridesData, background_tasks: BackgroundTasks):
@@ -1995,15 +2207,10 @@ def reset_document_overrides(data: ResetDocumentOverridesData, background_tasks:
             waves_to_clear.extend(mapping["waves"])
 
     waves_to_clear = list(dict.fromkeys(waves_to_clear))
-    with document_overrides_lock:
-        for w in waves_to_clear:
-            document_overrides_overlay[w] = {}
-
     if waves_to_clear:
         def tombstone_bq_overrides(waves, emp):
-            try:
-                now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
-                rows = [{
+            now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            rows = [{
                     "Wave_Number": str(w),
                     "Booking_No": "",
                     "Branch_Code": "RESET_ALL",
@@ -2015,15 +2222,20 @@ def reset_document_overrides(data: ResetDocumentOverridesData, background_tasks:
                     "Total_Count": -1,
                     "Pallet_Count": 0,
                     "Is_Hidden": 0,
-                    "Emp_ID": str(emp or ""),
+                    "Emp_ID": f"RESET_OVERRIDE|{str(emp or '').strip()}",
                     "Updated_At": now_iso
                 } for w in waves]
-                table_ref = client.dataset("logistics_db").table("wave_document_overrides")
-                client.insert_rows_json(table_ref, rows)
-                print(f"✅ Tombstoned document overrides for waves {waves} in BigQuery")
-            except Exception as e:
-                print(f"⚠️ Error tombstoning BQ document overrides: {e}")
-        background_tasks.add_task(tombstone_bq_overrides, waves_to_clear, data.emp_id)
+            table_ref = client.dataset("logistics_db").table("wave_document_overrides")
+            errors = client.insert_rows_json(table_ref, rows)
+            if errors:
+                raise RuntimeError(f"BigQuery reset override errors: {errors}")
+            print(f"✅ Tombstoned document overrides for waves {waves} in BigQuery")
+        # เช่นเดียวกับการแก้ยอด: reset ต้อง durable ก่อนจึงแจ้งว่าสำเร็จ
+        tombstone_bq_overrides(waves_to_clear, data.emp_id)
+        with document_overrides_lock:
+            for w in waves_to_clear:
+                document_overrides_overlay[w] = {}
+        queue_wave_totals_reconciliation(waves_to_clear, delay_seconds=0.5)
 
     return {"status": "success", "cleared_waves": waves_to_clear}
 
@@ -2232,6 +2444,7 @@ def move_booking_branch(data: BookingBranchMoveData):
     with booking_waves_cache_lock:
         booking_waves_cache.pop(previous, None)
         booking_waves_cache.pop(target, None)
+    queue_branch_totals_reconciliation([(wave_clean, branch)], delay_seconds=0.5)
     return {"status": "success", "message": "ย้ายสาขาเรียบร้อย", "previous_booking": previous, "target_booking": target, "preview": preview}
 
 @app.post("/api/start-pallet")
@@ -2345,7 +2558,8 @@ def submit_pallet(data: PalletSubmitData):
     if errors:
         raise HTTPException(status_code=500, detail=f"ส่งสถานะพาเลทไม่สำเร็จ: {errors}")
     record_shared_pallet_state(wave_ids, branch, pallet_no, color=color, submitted=True)
-    return {"status": "success", "pallet_no": pallet_no, "submitted_by": emp_id}
+    queue_branch_totals_reconciliation([(str(wave_id), branch) for wave_id in wave_ids], delay_seconds=0.5)
+    return {"status": "success", "pallet_no": pallet_no, "submitted_by": emp_id, "report_sync": "queued"}
 
 def encode_correction_audit(payload: dict) -> str:
     raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
@@ -2399,7 +2613,8 @@ def correct_lpn(data: CorrectionData, background_tasks: BackgroundTasks):
     ])
     duplicate_row = next(iter(client.query(duplicate_query, job_config=duplicate_config).result(timeout=BQ_JOB_TIMEOUT_SECONDS)))
     if int(duplicate_row["found"] or 0) > 0:
-        return {"status": "success", "correction_id": correction_id, "duplicate": True}
+        queue_branch_totals_reconciliation([(wave_clean, branch)])
+        return {"status": "success", "correction_id": correction_id, "duplicate": True, "report_sync": "queued"}
 
     fresh = apply_local_overlay(wave_clean, get_wave_data_internal(wave_clean, force_refresh=True))
     current = next((item for item in fresh.get("lpn_list", [])
@@ -2466,8 +2681,9 @@ def correct_lpn(data: CorrectionData, background_tasks: BackgroundTasks):
     record_local_scan(wave_clean, lpn, branch, 0, audit_type, audit_color, 0)
     if new_qty > 0:
         record_local_scan(wave_clean, lpn, branch, new_qty, scan_type, color, pallet_no)
+    queue_branch_totals_reconciliation([(wave_clean, branch)])
     # ไม่ refresh BigQuery ซ้ำทุกครั้ง: local overlay อัปเดตทุกเครื่องได้ทันทีอยู่แล้ว
-    return {"status": "success", "correction_id": correction_id, "audit": audit_payload}
+    return {"status": "success", "correction_id": correction_id, "audit": audit_payload, "report_sync": "queued"}
 
 @app.get("/api/corrections")
 def get_corrections(waves: str, branch: str, lpn: Optional[str] = None):
@@ -2604,36 +2820,14 @@ def process_scan(data: ScanData, background_tasks: BackgroundTasks):
             raise Exception(f"BigQuery streaming errors: {errors}")
         mark_transaction_processed(transaction_id)
         record_local_scan(wave_clean, lpn_val, branch_val, data.qty, type_val, color_val, pallet_no_val, base_pallet_breakdown)
+        queue_branch_totals_reconciliation([(wave_clean, branch_val)])
         print(f"✅ SAVED | LPN: {lpn_val}")
-        return {"status": "success", "message": "Saved"}
+        return {"status": "success", "message": "Saved", "report_sync": "queued"}
     except Exception as e:
-        print(f"🚨 INSERT FALLBACK TO QUERY | LPN: {lpn_val} | Error: {str(e)}")
-        # Fallback to standard query insert if streaming insert fails for any reason
-        def esc(val):
-            return (val or "").replace("\\", "\\\\").replace("'", "\\'")
-        esc_lpn = esc(lpn_val)
-        esc_branch = esc(branch_val)
-        esc_branch_name = esc(branch_name_val)
-        esc_emp = esc(emp_val)
-        esc_type = esc(type_val)
-        esc_color = esc(color_val)
-        
-        insert_query = f"""
-            INSERT INTO `pro-analytics-db.logistics_db.app_scan_transactions`
-            (`Wave_Number`, `LPN`, `Scan_Type`, `Color`, `Qty`, `Timestamp`, `Branch_Code`, `Branch_Name`, `Emp_ID`, `Pallet_No`)
-            VALUES
-            ('{wave_clean}', '{esc_lpn}', '{esc_type}', '{esc_color}', {data.qty},
-             CURRENT_TIMESTAMP(), '{esc_branch}', '{esc_branch_name}', '{esc_emp}', {pallet_no_val})
-        """
-        try:
-            client.query(insert_query).result()
-            mark_transaction_processed(transaction_id)
-            record_local_scan(wave_clean, lpn_val, branch_val, data.qty, type_val, color_val, pallet_no_val, base_pallet_breakdown)
-            print(f"✅ SAVED (Fallback Query) | LPN: {lpn_val}")
-            return {"status": "success", "message": "Saved"}
-        except Exception as query_err:
-            print(f"🚨 DOUBLE INSERT ERROR | LPN: {lpn_val} | Error: {str(query_err)}")
-            raise HTTPException(status_code=500, detail=str(query_err))
+        # ห้าม fallback ด้วย SQL INSERT เพราะ response หลุดหลัง BigQuery รับแล้วจะทำให้ยอดซ้ำ
+        # Frontend จะ retry ด้วย transaction_id/insertId เดิม จึง dedupe ได้อย่างปลอดภัย
+        print(f"🚨 INSERT RETRY REQUIRED | LPN: {lpn_val} | Error: {str(e)}")
+        raise HTTPException(status_code=503, detail="Server ยังไม่ยืนยันการบันทึก ระบบจะส่งรายการเดิมซ้ำให้อัตโนมัติ")
 
 
 # 🚀 [API 2.5] บันทึกข้อมูลสแกนเป็นชุด (Batch)
@@ -2648,13 +2842,17 @@ def process_scan_batch(data: ScanBatchData, background_tasks: BackgroundTasks):
     accepted_scans = []
     row_ids = []
     failed_scans = []
+    processed_transaction_ids = []
     for item in data.scans:
-        if transaction_already_processed(item.transaction_id or ""):
+        item_transaction_id = (item.transaction_id or "").strip()
+        if transaction_already_processed(item_transaction_id):
+            if item_transaction_id:
+                processed_transaction_ids.append(item_transaction_id)
             continue
         try:
             wave_clean = str(int(item.wave_no))
         except ValueError:
-            failed_scans.append({"lpn": item.lpn, "reason": "รหัส Wave ไม่ถูกต้อง"})
+            failed_scans.append({"lpn": item.lpn, "transaction_id": item_transaction_id, "reason": "รหัส Wave ไม่ถูกต้อง"})
             continue
 
         lpn_val = (item.lpn or "").strip()
@@ -2675,7 +2873,7 @@ def process_scan_batch(data: ScanBatchData, background_tasks: BackgroundTasks):
         if valid_pairs:
             if (lpn_val.upper(), branch_val.upper()) not in valid_pairs:
                 print(f"🚫 BATCH REJECTED | LPN: {lpn_val} ไม่พบใน Wave {wave_clean} / Branch {branch_val}")
-                failed_scans.append({"lpn": item.lpn, "reason": f"ไม่พบ LPN ใน Wave/Branch"})
+                failed_scans.append({"lpn": item.lpn, "transaction_id": item_transaction_id, "reason": "ไม่พบ LPN ใน Wave/Branch"})
                 continue
         else:
             # Fallback to direct query if cache is empty
@@ -2696,10 +2894,10 @@ def process_scan_batch(data: ScanBatchData, background_tasks: BackgroundTasks):
                 check_result = client.query(check_query, job_config=check_config).result()
                 found = next(iter(check_result))["found"]
                 if found == 0:
-                    failed_scans.append({"lpn": item.lpn, "reason": f"ไม่พบ LPN ใน Wave/Branch (Fallback)"})
+                    failed_scans.append({"lpn": item.lpn, "transaction_id": item_transaction_id, "reason": "ไม่พบ LPN ใน Wave/Branch (Fallback)"})
                     continue
             except Exception as e:
-                failed_scans.append({"lpn": item.lpn, "reason": f"Check error: {str(e)}"})
+                failed_scans.append({"lpn": item.lpn, "transaction_id": item_transaction_id, "reason": f"Check error: {str(e)}"})
                 continue
 
         rows_to_insert.append({
@@ -2714,26 +2912,60 @@ def process_scan_batch(data: ScanBatchData, background_tasks: BackgroundTasks):
             "Emp_ID": emp_val,
             "Pallet_No": pallet_no_val
         })
-        accepted_scans.append((wave_clean, lpn_val, branch_val, item.qty, type_val, color_val, pallet_no_val, (item.transaction_id or "").strip()))
-        row_ids.append((item.transaction_id or "").strip() or str(uuid.uuid4()))
+        accepted_scans.append((wave_clean, lpn_val, branch_val, item.qty, type_val, color_val, pallet_no_val, item_transaction_id))
+        row_ids.append(item_transaction_id or str(uuid.uuid4()))
 
     # Trigger background refreshes
     # ไม่สร้าง BigQuery query เพิ่มตามจำนวน Wave หลัง batch; overlay ถูกบันทึกไว้แล้ว
 
     if not rows_to_insert:
-        raise HTTPException(
-            status_code=400,
-            detail={"message": "ไม่มีข้อมูลสแกนที่ผ่านการตรวจสอบ", "errors": failed_scans}
-        )
+        return {
+            "status": "success" if processed_transaction_ids and not failed_scans else "failed",
+            "message": "Already saved" if processed_transaction_ids else "ไม่มีข้อมูลสแกนที่ผ่านการตรวจสอบ",
+            "processed_count": 0,
+            "failed_count": len(failed_scans),
+            "processed_transaction_ids": processed_transaction_ids,
+            "errors": failed_scans,
+            "report_sync": "not_needed",
+        }
 
     try:
         errors = client.insert_rows_json(table_ref, rows_to_insert, row_ids=row_ids)
         if errors:
             print(f"🚨 BATCH INSERT ROWS JSON ERROR | Errors: {errors}")
-            raise Exception(f"BigQuery streaming errors: {errors}")
+            # Streaming API อาจรับสำเร็จเพียงบางแถว ห้าม fallback ทั้ง batch เพราะยอดจะซ้ำ
+            failed_indexes = {int(error.get("index")) for error in errors if error.get("index") is not None}
+            if not failed_indexes:
+                failed_indexes = set(range(len(rows_to_insert)))
+            streamed_scans = [scan for index, scan in enumerate(accepted_scans) if index not in failed_indexes]
+            for scan in streamed_scans:
+                record_local_scan(*scan[:7])
+                mark_transaction_processed(scan[7])
+                if scan[7]:
+                    processed_transaction_ids.append(scan[7])
+            queue_branch_totals_reconciliation({(scan[0], scan[2]) for scan in streamed_scans})
+            error_by_index = {int(error.get("index")): error for error in errors if error.get("index") is not None}
+            for index in sorted(failed_indexes):
+                scan = accepted_scans[index]
+                failed_scans.append({
+                    "lpn": scan[1],
+                    "transaction_id": scan[7],
+                    "reason": f"BigQuery ยังไม่รับรายการ: {error_by_index.get(index, {})}",
+                })
+            return {
+                "status": "partial_success" if streamed_scans else "failed",
+                "processed_count": len(streamed_scans),
+                "failed_count": len(failed_scans),
+                "processed_transaction_ids": processed_transaction_ids,
+                "errors": failed_scans,
+                "report_sync": "queued" if streamed_scans else "not_queued",
+            }
         for scan in accepted_scans:
             record_local_scan(*scan[:7])
             mark_transaction_processed(scan[7])
+            if scan[7]:
+                processed_transaction_ids.append(scan[7])
+        queue_branch_totals_reconciliation({(scan[0], scan[2]) for scan in accepted_scans})
         
         print(f"✅ BATCH SAVED | Processed: {len(rows_to_insert)} | Failed: {len(failed_scans)}")
         return {
@@ -2741,55 +2973,32 @@ def process_scan_batch(data: ScanBatchData, background_tasks: BackgroundTasks):
             "message": "Saved", 
             "processed_count": len(rows_to_insert), 
             "failed_count": len(failed_scans),
-            "errors": failed_scans
+            "processed_transaction_ids": processed_transaction_ids,
+            "errors": failed_scans,
+            "report_sync": "queued",
         }
     except Exception as e:
-        print(f"🚨 BATCH INSERT FALLBACK | Error: {str(e)}")
-        # If streaming batch fails, fall back to inserting rows sequentially via query
-        success_count = 0
-        for row, scan in zip(rows_to_insert, accepted_scans):
-            def esc(val):
-                return (val or "").replace("\\", "\\\\").replace("'", "\\'")
-            insert_query = f"""
-                INSERT INTO `pro-analytics-db.logistics_db.app_scan_transactions`
-                (`Wave_Number`, `LPN`, `Scan_Type`, `Color`, `Qty`, `Timestamp`, `Branch_Code`, `Branch_Name`, `Emp_ID`, `Pallet_No`)
-                VALUES
-                ('{row["Wave_Number"]}', '{esc(row["LPN"])}', '{esc(row["Scan_Type"])}', '{esc(row["Color"])}', {row["Qty"]},
-                 CURRENT_TIMESTAMP(), '{esc(row["Branch_Code"])}', '{esc(row["Branch_Name"])}', '{esc(row["Emp_ID"])}', {int(row.get("Pallet_No", 0) or 0)})
-            """
-            try:
-                client.query(insert_query).result()
-                record_local_scan(*scan[:7])
-                mark_transaction_processed(scan[7])
-                success_count += 1
-            except Exception as query_err:
-                print(f"🚨 BATCH FALLBACK SINGLE INSERT ERROR | LPN: {row['LPN']} | Error: {str(query_err)}")
-        
-        return {
-            "status": "partial_success" if success_count > 0 else "failed",
-            "processed_count": success_count,
-            "failed_count": len(rows_to_insert) - success_count + len(failed_scans),
-            "errors": failed_scans
-        }
+        # ไม่ยิง SQL ซ้ำทั้งชุดเมื่อไม่รู้ว่า BigQuery รับไปแล้วหรือยัง
+        # ให้ Handheld retry ด้วย transaction_id เดิมเพื่อใช้ insertId dedupe
+        print(f"🚨 BATCH RETRY REQUIRED | Error: {str(e)}")
+        raise HTTPException(status_code=503, detail="Server ยังไม่ยืนยันรายการชุดนี้ ระบบจะส่งซ้ำด้วยรหัสเดิมอัตโนมัติ")
 
 
-def run_close_job_queries_in_background(wave_clean: str, branch: str, insert_zero_query: str, insert_close_marker: str, frontend_summary: dict = None):
-    try:
-        # Run BQ inserts
-        client.query(insert_zero_query).result()
-        client.query(insert_close_marker).result()
-        # After BQ queries finish, refresh cache
-        refreshed = get_wave_data_internal(wave_clean, force_refresh=True)
-        if not frontend_summary:
-            try:
-                summary = summarize_branch_for_member_data(refreshed, branch)
-                write_member_history_summary(summary)
-                write_delivery_report_summary(summary)
-            except Exception as sheet_error:
-                print(f"⚠️ REPORT SHEET WRITE ERROR | Wave: {wave_clean} | Branch: {branch} | {sheet_error}")
-        print(f"✅ BACKGROUND CLOSE JOB COMPLETE | Wave: {wave_clean} | Branch: {branch}")
-    except Exception as e:
-        print(f"🚨 BACKGROUND CLOSE JOB ERROR | Wave: {wave_clean} | Branch: {branch} | Error: {str(e)}")
+def run_close_job_queries_in_background(wave_clean: str, branch: str, insert_zero_query: str, frontend_summary: dict = None):
+    # CLOSE_JOB marker ถูก streaming แบบ durable ก่อนตอบ API แล้ว ส่วน AUTO_NOT_FOUND ทำเบื้องหลัง
+    # และ retry ได้ เพราะ Qty=0 จึง idempotent และไม่ทำให้ยอดกล่องเพิ่ม
+    for attempt in range(1, 6):
+        try:
+            client.query(insert_zero_query).result(timeout=BQ_JOB_TIMEOUT_SECONDS)
+            queue_branch_totals_reconciliation([(wave_clean, branch)], delay_seconds=0.25)
+            print(f"✅ BACKGROUND CLOSE JOB COMPLETE | Wave: {wave_clean} | Branch: {branch}")
+            return
+        except Exception as e:
+            print(f"🚨 BACKGROUND CLOSE JOB RETRY {attempt}/5 | Wave: {wave_clean} | Branch: {branch} | Error: {str(e)}")
+            if attempt < 5:
+                time.sleep(min(15, attempt * 2))
+    # Marker ยังอยู่ใน BigQuery จึงให้ startup recovery/การเปิดงานครั้งถัดไป reconcile Sheet ได้เสมอ
+    queue_branch_totals_reconciliation([(wave_clean, branch)], delay_seconds=0.25)
 
 
 # 🚀 [API 5] ปิดจบงานสาขา
@@ -2806,9 +3015,6 @@ def close_job(data: CloseJobData, background_tasks: BackgroundTasks):
     branch = esc(data.branch.strip().upper())
     emp_id = esc((data.emp_id or "").strip())
     completed_at = esc((data.completed_at or "").strip())
-    timestamp_expr = "CURRENT_TIMESTAMP()"
-    if completed_at:
-        timestamp_expr = f"COALESCE(SAFE_CAST('{completed_at}' AS TIMESTAMP), CURRENT_TIMESTAMP())"
 
     insert_zero_query = f"""
         INSERT INTO `pro-analytics-db.logistics_db.app_scan_transactions`
@@ -2830,11 +3036,25 @@ def close_job(data: CloseJobData, background_tasks: BackgroundTasks):
         WHERE s.LPN IS NULL
     """
 
-    insert_close_marker = f"""
-        INSERT INTO `pro-analytics-db.logistics_db.app_scan_transactions`
-        (`Wave_Number`, `LPN`, `Scan_Type`, `Color`, `Qty`, `Timestamp`, `Branch_Code`, `Emp_ID`)
-        VALUES ('{wave_clean}', 'BRANCH_{branch}', 'CLOSE_JOB', 'None', 0, {timestamp_expr}, '{branch}', '{emp_id}')
-    """
+    marker_timestamp = completed_at or (datetime.datetime.now(datetime.timezone.utc).isoformat())
+    marker_row = {
+        "Wave_Number": wave_clean,
+        "LPN": f"BRANCH_{branch}",
+        "Scan_Type": "CLOSE_JOB",
+        "Color": "None",
+        "Qty": 0,
+        "Timestamp": marker_timestamp,
+        "Branch_Code": branch,
+        "Emp_ID": emp_id,
+        "Pallet_No": 0,
+    }
+    marker_errors = client.insert_rows_json(
+        client.dataset("logistics_db").table("app_scan_transactions"),
+        [marker_row],
+        row_ids=[f"close-{wave_clean}-{branch}-{marker_timestamp}"],
+    )
+    if marker_errors:
+        raise HTTPException(status_code=503, detail=f"บันทึกสถานะปิดสาขายังไม่สำเร็จ: {marker_errors}")
 
     record_shared_branch_closed(wave_clean, branch, completed_at, emp_id)
 
@@ -2843,8 +3063,8 @@ def close_job(data: CloseJobData, background_tasks: BackgroundTasks):
         frontend_summary = data.summary.dict()
         frontend_summary["wave"] = wave_clean
         frontend_summary["branch"] = branch
-        # บันทึกยอดที่ถูกต้องจากหน้าจอสแกนลง Google Sheets ทันทีที่กดปิดสาขา
-        background_tasks.add_task(sync_document_summary_reports, [frontend_summary])
+        # Fast snapshot from the exact numbers visible on screen; server reconciliation follows.
+        queue_report_summary_snapshots([frontend_summary], delay_seconds=0.0)
 
     # ตอบกลับทันที: งาน BigQuery ทั้งหมดทำเบื้องหลัง ไม่ query ซ้ำใน request ปิดสาขา
     background_tasks.add_task(
@@ -2852,7 +3072,6 @@ def close_job(data: CloseJobData, background_tasks: BackgroundTasks):
         wave_clean,
         branch,
         insert_zero_query,
-        insert_close_marker,
         frontend_summary
     )
 
@@ -2938,11 +3157,35 @@ def _startup_warm_cache():
     # โหลดประวัติกล่องจาก Member Data ไว้ล่วงหน้า ไม่ให้การค้นหา Wave แรกต้องรอ Google Sheet
     load_member_history()
 
+
+def recover_recent_report_syncs():
+    """Recover Sheet updates if Render restarted after accepting a scan but before writing reports."""
+    try:
+        query = """
+            SELECT DISTINCT
+                CAST(SAFE_CAST(REGEXP_REPLACE(TRIM(CAST(Wave_Number AS STRING)), r'[^0-9]', '') AS INT64) AS STRING) AS wave,
+                TRIM(UPPER(CAST(Branch_Code AS STRING))) AS branch
+            FROM `pro-analytics-db.logistics_db.app_scan_transactions`
+            WHERE SAFE_CAST(Timestamp AS TIMESTAMP) >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 6 HOUR)
+              AND SAFE_CAST(REGEXP_REPLACE(TRIM(CAST(Wave_Number AS STRING)), r'[^0-9]', '') AS INT64) IS NOT NULL
+              AND NULLIF(TRIM(CAST(Branch_Code AS STRING)), '') IS NOT NULL
+            LIMIT 2000
+        """
+        rows = list(client.query(query).result(timeout=BQ_JOB_TIMEOUT_SECONDS))
+        pairs = {(str(row["wave"] or ""), str(row["branch"] or "").strip().upper()) for row in rows}
+        pairs = {(wave, branch) for wave, branch in pairs if wave and branch}
+        if pairs:
+            queue_branch_totals_reconciliation(pairs, delay_seconds=1.0)
+            print(f"♻️ REPORT SYNC RECOVERY | queued={len(pairs)} recent Wave+Branch pairs")
+    except Exception as exc:
+        print(f"⚠️ REPORT SYNC RECOVERY skipped: {exc}")
+
 @app.on_event("startup")
 async def startup_event():
     """⚡ Standard Plan: Pre-warm cache + preload Wave cache ตอน server เริ่มทำงาน"""
-    import threading
+    ensure_report_sync_worker_started()
     threading.Thread(target=_startup_warm_cache, daemon=True).start()
+    threading.Thread(target=recover_recent_report_syncs, daemon=True, name="report-sync-recovery").start()
 
 def run_pending_waves_refresh_in_background():
     global is_refreshing_pending_waves
