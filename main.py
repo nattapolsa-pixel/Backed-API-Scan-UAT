@@ -708,6 +708,11 @@ def _build_reconciled_summaries(entries: list) -> list:
             else:
                 requested.add(entry["branch"])
         for branch in sorted(requested):
+            branch_items = [item for item in fresh.get("lpn_list", [])
+                            if str(item.get("branch") or "").strip().upper() == branch]
+            # Google Sheets เป็นรายงานงานที่ปิดจบแล้วเท่านั้น ห้ามสร้างแถว 0/ยอดระหว่างทำงาน
+            if not any(item.get("branch_closed_at") for item in branch_items):
+                continue
             summary = summarize_branch_for_member_data(fresh, branch)
             summaries.append(apply_document_override_to_summary(summary))
     return summaries
@@ -2052,6 +2057,7 @@ class DocumentSummaryData(BaseModel):
     total: int = 0
     pallet: int = 0
     is_hidden: Optional[bool] = False
+    is_closed: Optional[bool] = False
 
 class DocumentSummaryBatchData(BaseModel):
     summaries: List[DocumentSummaryData]
@@ -2111,7 +2117,7 @@ async def health_check(response: Response):
     # ⚡ Cache-Control: s-maxage=5 ทำให้ CDN/Render ตอบ health check ได้ทันที ไม่ต้อง round-trip ถึง Python
     response.headers["Cache-Control"] = "no-store"
     response.headers["Connection"] = "keep-alive"
-    return {"status": "ok", "version": "1.8.2", "timestamp": time.time()}
+    return {"status": "ok", "version": "1.8.3", "timestamp": time.time()}
 
 def sync_document_summary_reports(summaries: list):
     if not summaries:
@@ -2173,6 +2179,7 @@ def save_document_summary(data: DocumentSummaryBatchData, background_tasks: Back
             "branch_name": str(item.branch_name or branch).strip(),
             "bu": member_data_bu(item.bu),
             "is_hidden": is_hidden,
+            "is_closed": bool(getattr(item, "is_closed", False)),
             **values
         })
 
@@ -2188,11 +2195,13 @@ def save_document_summary(data: DocumentSummaryBatchData, background_tasks: Back
                     "emp_id": emp_id,
                     "updated_at": now_iso,
                 }
-    queue_report_summary_snapshots(copy.deepcopy(normalized))
+    # ยังเก็บ manual override ได้ตามเดิม แต่ส่งเข้า Sheets เฉพาะสาขาที่ปิดจบแล้ว
+    closed_summaries = [item for item in normalized if item.get("is_closed")]
+    queue_report_summary_snapshots(copy.deepcopy(closed_summaries))
     return {
         "status": "success",
-        "updated": len(normalized),
-        "report_sync": "queued",
+        "updated": len(closed_summaries),
+        "report_sync": "queued" if closed_summaries else "waiting_for_branch_close",
         "persist_overrides": bool(data.persist_overrides),
     }
 
@@ -3067,6 +3076,7 @@ def close_job(data: CloseJobData, background_tasks: BackgroundTasks):
         frontend_summary = data.summary.dict()
         frontend_summary["wave"] = wave_clean
         frontend_summary["branch"] = branch
+        frontend_summary["is_closed"] = True
         # Fast snapshot from the exact numbers visible on screen; server reconciliation follows.
         queue_report_summary_snapshots([frontend_summary], delay_seconds=0.0)
 
