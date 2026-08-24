@@ -77,6 +77,7 @@ member_history_row_cache = {"expires_at": 0.0, "existing_map": {}, "last_data_ro
 DELIVERY_REPORT_SPREADSHEET_ID = "14kBtY2tdMXi3I9rbNleokmyJ_WWGRmKXPPU2VaVstZQ"
 DELIVERY_REPORT_SHEET_NAME = "Delivery report"
 DELIVERY_SOURCE_SHEET_NAME = "วางข้อมูล"
+DELIVERY_SOURCE_SHEET_ID = 0
 DELIVERY_REPORT_SHEET_ID = 1686001204
 DELIVERY_CAR_SHEET_NAME = "Data Booking&Car"
 DELIVERY_BRANCH_SHEET_NAME = "Sheet3"
@@ -513,6 +514,26 @@ def write_delivery_report_summaries(summaries: list):
                 copied.raise_for_status()
             except Exception as fe:
                 print(f"⚠️ Formula copy warning: {fe}")
+
+        # จัดกลุ่ม Wave เดียวกันให้อยู่ติดกันเสมอ แม้แต่ละสาขาจะปิดงานคนละเวลา
+        # เรียง Wave -> Booking -> รหัสสาขา โดยคงหัวตารางแถวแรกไว้
+        if current_append_row > 2:
+            try:
+                sort_request = {"requests": [{"sortRange": {
+                    "range": {"sheetId": DELIVERY_SOURCE_SHEET_ID, "startRowIndex": 1,
+                              "endRowIndex": current_append_row - 1, "startColumnIndex": 0, "endColumnIndex": 26},
+                    "sortSpecs": [
+                        {"dimensionIndex": 2, "sortOrder": "ASCENDING"},
+                        {"dimensionIndex": 18, "sortOrder": "ASCENDING"},
+                        {"dimensionIndex": 3, "sortOrder": "ASCENDING"}
+                    ]
+                }}]}
+                sorted_response = session.post(f"{base}:batchUpdate", json=sort_request, timeout=60)
+                sorted_response.raise_for_status()
+                # หลังเรียงแล้วตำแหน่งแถวเปลี่ยนทั้งหมด ต้องอ่าน index ใหม่ในการเขียนรอบถัดไป
+                delivery_report_row_cache.update({"expires_at": 0.0, "existing_map": {}, "last_data_row": 1})
+            except Exception as sort_exc:
+                print(f"⚠️ Delivery source sort warning: {sort_exc}")
 
         print(f"⚡ Delivery source/report BATCH updated | {len(summaries)} branches in 1 request")
 
@@ -2213,7 +2234,7 @@ async def health_check(response: Response):
     # ⚡ Cache-Control: s-maxage=5 ทำให้ CDN/Render ตอบ health check ได้ทันที ไม่ต้อง round-trip ถึง Python
     response.headers["Cache-Control"] = "no-store"
     response.headers["Connection"] = "keep-alive"
-    return {"status": "ok", "version": "1.9.1", "timestamp": time.time()}
+    return {"status": "ok", "version": "1.9.2", "timestamp": time.time()}
 
 def sync_document_summary_reports(summaries: list):
     if not summaries:
