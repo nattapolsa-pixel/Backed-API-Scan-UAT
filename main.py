@@ -518,7 +518,12 @@ def write_delivery_report_summaries(summaries: list):
         # เรียง วันที่ -> เวลา โดยคงหัวตารางแถวแรกไว้
         if current_append_row > 2:
             try:
-                sort_request = {"requests": [{"sortRange": {
+                sort_request = {"requests": [{"repeatCell": {
+                    "range": {"sheetId": DELIVERY_SOURCE_SHEET_ID, "startRowIndex": 1,
+                              "endRowIndex": current_append_row - 1, "startColumnIndex": 0, "endColumnIndex": 1},
+                    "cell": {"userEnteredFormat": {"numberFormat": {"type": "DATE", "pattern": "d/m/yyyy"}}},
+                    "fields": "userEnteredFormat.numberFormat"
+                }}, {"sortRange": {
                     "range": {"sheetId": DELIVERY_SOURCE_SHEET_ID, "startRowIndex": 1,
                               "endRowIndex": current_append_row - 1, "startColumnIndex": 0, "endColumnIndex": 26},
                     "sortSpecs": [
@@ -2232,7 +2237,7 @@ async def health_check(response: Response):
     # ⚡ Cache-Control: s-maxage=5 ทำให้ CDN/Render ตอบ health check ได้ทันที ไม่ต้อง round-trip ถึง Python
     response.headers["Cache-Control"] = "no-store"
     response.headers["Connection"] = "keep-alive"
-    return {"status": "ok", "version": "1.9.4", "timestamp": time.time()}
+    return {"status": "ok", "version": "1.9.5", "timestamp": time.time()}
 
 def sync_document_summary_reports(summaries: list):
     if not summaries:
