@@ -302,7 +302,11 @@ def get_document_overrides_for_wave(wave_no: str) -> dict:
     wave_key = str(int(clean_wave))
     with document_overrides_lock:
         if wave_key in document_overrides_overlay:
-            return copy.deepcopy(document_overrides_overlay[wave_key])
+            return {
+                branch: copy.deepcopy(value)
+                for branch, value in document_overrides_overlay[wave_key].items()
+                if value.get("is_hidden") or any(int(value.get(field) or 0) > 0 for field in ("m", "red", "blue", "green", "black", "pallet"))
+            }
 
     overrides = {}
     try:
@@ -332,6 +336,10 @@ def get_document_overrides_for_wave(wave_no: str) -> dict:
             # ใช้เฉพาะแถวที่มี marker ใหม่ เพื่อไม่ให้ยอดเก่าค้างทับผลสแกนในอนาคต
             raw_emp_id = str(r["Emp_ID"] or "")
             if not raw_emp_id.startswith(MANUAL_OVERRIDE_EMP_PREFIX):
+                continue
+            if not bool(r["Is_Hidden"]) and not any(int(r[field] or 0) > 0 for field in
+                    ("M_Count", "Red_Count", "Blue_Count", "Green_Count", "Black_Count", "Pallet_Count")):
+                # ศูนย์ทั้งแถวอาจเกิดจากหน้าจอที่ยังโหลดไม่เสร็จ ห้ามใช้ล็อกทับยอดสแกนจริง
                 continue
             seen_branches.add(b)
             overrides[b] = {
@@ -523,6 +531,23 @@ def write_delivery_report_summary(summary: dict):
 
 def summarize_branch_for_member_data(wave_data: dict, branch: str) -> dict:
     items = [item for item in wave_data.get("lpn_list", []) if str(item.get("branch") or "").strip().upper() == branch]
+    # ตัดเฉพาะ transaction ที่ซ้ำกันทุกมิติจาก network retry แต่ LPN เดิมคนละพาเลทยังนับแยกตามปกติ
+    unique_items = []
+    seen_item_keys = set()
+    for item in items:
+        breakdown = item.get("color_breakdown") or []
+        breakdown_key = (json.dumps(breakdown, sort_keys=True, ensure_ascii=False, default=str)
+                         if isinstance(breakdown, (dict, list)) else str(breakdown))
+        item_key = (
+            str(item.get("lpn") or "").strip().upper(), str(item.get("status") or ""),
+            int(item.get("qty") or 0), str(item.get("scan_type") or "").strip().upper(),
+            str(item.get("color") or "").strip().upper(), int(item.get("pallet_no") or 0), breakdown_key,
+        )
+        if item_key in seen_item_keys:
+            continue
+        seen_item_keys.add(item_key)
+        unique_items.append(item)
+    items = unique_items
     split_summary = next((item.get("booking_split_summary") for item in items if item.get("booking_split_summary")), None)
     if split_summary:
         first = items[0] if items else {}
@@ -2214,7 +2239,7 @@ async def health_check(response: Response):
     # ⚡ Cache-Control: s-maxage=5 ทำให้ CDN/Render ตอบ health check ได้ทันที ไม่ต้อง round-trip ถึง Python
     response.headers["Cache-Control"] = "no-store"
     response.headers["Connection"] = "keep-alive"
-    return {"status": "ok", "version": "1.9.8", "timestamp": time.time()}
+    return {"status": "ok", "version": "1.9.9", "timestamp": time.time()}
 
 def sync_document_summary_reports(summaries: list):
     if not summaries:
@@ -2285,10 +2310,13 @@ def save_document_summary(data: DocumentSummaryBatchData, background_tasks: Back
         })
 
     if data.persist_overrides:
+        persistent_items = [item for item in normalized if item.get("is_hidden") or any(
+            int(item.get(field) or 0) > 0 for field in ("m", "red", "blue", "green", "black", "pallet")
+        )]
         # ยอดที่ผู้ใช้แก้ต้องลง BigQuery สำเร็จก่อนตอบกลับ เพื่อไม่ให้ขึ้นว่าบันทึกแล้วแต่หายหลัง restart
-        record_document_overrides_to_bq(copy.deepcopy(normalized), emp_id)
+        record_document_overrides_to_bq(copy.deepcopy(persistent_items), emp_id)
         with document_overrides_lock:
-            for item in normalized:
+            for item in persistent_items:
                 wave_ov = document_overrides_overlay.setdefault(item["wave"], {})
                 wave_ov[item["branch"]] = {
                     **{field: item[field] for field in ("m", "red", "blue", "green", "black", "total", "pallet")},
