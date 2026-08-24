@@ -515,7 +515,7 @@ def write_delivery_report_summaries(summaries: list):
             except Exception as fe:
                 print(f"⚠️ Formula copy warning: {fe}")
 
-        # เรียง วันที่ -> เวลา -> Wave -> Booking -> รหัสสาขา โดยคงหัวตารางแถวแรกไว้
+        # เรียง วันที่ -> เวลา โดยคงหัวตารางแถวแรกไว้
         if current_append_row > 2:
             try:
                 sort_request = {"requests": [{"sortRange": {
@@ -523,10 +523,7 @@ def write_delivery_report_summaries(summaries: list):
                               "endRowIndex": current_append_row - 1, "startColumnIndex": 0, "endColumnIndex": 26},
                     "sortSpecs": [
                         {"dimensionIndex": 0, "sortOrder": "ASCENDING"},
-                        {"dimensionIndex": 1, "sortOrder": "ASCENDING"},
-                        {"dimensionIndex": 2, "sortOrder": "ASCENDING"},
-                        {"dimensionIndex": 18, "sortOrder": "ASCENDING"},
-                        {"dimensionIndex": 3, "sortOrder": "ASCENDING"}
+                        {"dimensionIndex": 1, "sortOrder": "ASCENDING"}
                     ]
                 }}]}
                 sorted_response = session.post(f"{base}:batchUpdate", json=sort_request, timeout=60)
@@ -2235,7 +2232,7 @@ async def health_check(response: Response):
     # ⚡ Cache-Control: s-maxage=5 ทำให้ CDN/Render ตอบ health check ได้ทันที ไม่ต้อง round-trip ถึง Python
     response.headers["Cache-Control"] = "no-store"
     response.headers["Connection"] = "keep-alive"
-    return {"status": "ok", "version": "1.9.3", "timestamp": time.time()}
+    return {"status": "ok", "version": "1.9.4", "timestamp": time.time()}
 
 def sync_document_summary_reports(summaries: list):
     if not summaries:
