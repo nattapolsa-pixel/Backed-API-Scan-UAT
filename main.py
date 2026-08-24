@@ -2214,7 +2214,7 @@ async def health_check(response: Response):
     # ⚡ Cache-Control: s-maxage=5 ทำให้ CDN/Render ตอบ health check ได้ทันที ไม่ต้อง round-trip ถึง Python
     response.headers["Cache-Control"] = "no-store"
     response.headers["Connection"] = "keep-alive"
-    return {"status": "ok", "version": "1.9.7", "timestamp": time.time()}
+    return {"status": "ok", "version": "1.9.8", "timestamp": time.time()}
 
 def sync_document_summary_reports(summaries: list):
     if not summaries:
@@ -2359,6 +2359,22 @@ def get_document_overrides_endpoint(wave_no: str):
     if not clean_w:
         return {"overrides": {}}
     return {"wave_no": clean_w, "overrides": get_document_overrides_for_wave(clean_w)}
+
+@app.get("/api/transport-meta")
+def get_transport_meta(booking: str):
+    """ข้อมูลรถและขนส่งสำหรับหัวเอกสารใบขาดเกินจาก Data Booking&Car."""
+    clean_booking = str(booking or "").strip().upper()
+    if not clean_booking:
+        return {"booking": "", "carrier": "", "driver": "", "plate": ""}
+    session = get_sheets_session()
+    cars, _ = load_delivery_lookup_maps(session)
+    meta = cars.get(clean_booking) or {}
+    return {
+        "booking": clean_booking,
+        "carrier": str(meta.get("carrier") or ""),
+        "driver": str(meta.get("driver") or ""),
+        "plate": str(meta.get("plate") or ""),
+    }
 
 def transaction_already_processed(transaction_id: str) -> bool:
     tx_id = str(transaction_id or "").strip()
