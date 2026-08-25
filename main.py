@@ -141,7 +141,12 @@ def write_member_history_summaries(summaries: list):
         target_wave = str(int(summary["wave"]))
         target_branch = str(summary["branch"]).strip().upper()
         key = (target_wave, target_branch)
-        
+
+        # Intentional zero corrections may clear an existing row, but never create a new zero row.
+        if int(summary.get("total") or 0) <= 0 and key not in existing_map:
+            print(f"Member Data zero update skipped (no existing row) | {target_wave}/{target_branch}")
+            continue
+
         if key in existing_map:
             target_row = existing_map[key]
         else:
@@ -158,6 +163,9 @@ def write_member_history_summaries(summaries: list):
             "range": f"Member Data!A{target_row}:P{target_row}",
             "values": row_values
         })
+
+    if not batch_data:
+        return
 
     batch_payload = {
         "valueInputOption": "USER_ENTERED",
@@ -302,10 +310,10 @@ def get_document_overrides_for_wave(wave_no: str) -> dict:
     wave_key = str(int(clean_wave))
     with document_overrides_lock:
         if wave_key in document_overrides_overlay:
+            # Intentional zero overrides must survive refresh and restart.
             return {
                 branch: copy.deepcopy(value)
                 for branch, value in document_overrides_overlay[wave_key].items()
-                if value.get("is_hidden") or any(int(value.get(field) or 0) > 0 for field in ("m", "red", "blue", "green", "black", "pallet"))
             }
 
     overrides = {}
@@ -336,10 +344,6 @@ def get_document_overrides_for_wave(wave_no: str) -> dict:
             # ใช้เฉพาะแถวที่มี marker ใหม่ เพื่อไม่ให้ยอดเก่าค้างทับผลสแกนในอนาคต
             raw_emp_id = str(r["Emp_ID"] or "")
             if not raw_emp_id.startswith(MANUAL_OVERRIDE_EMP_PREFIX):
-                continue
-            if not bool(r["Is_Hidden"]) and not any(int(r[field] or 0) > 0 for field in
-                    ("M_Count", "Red_Count", "Blue_Count", "Green_Count", "Black_Count", "Pallet_Count")):
-                # ศูนย์ทั้งแถวอาจเกิดจากหน้าจอที่ยังโหลดไม่เสร็จ ห้ามใช้ล็อกทับยอดสแกนจริง
                 continue
             seen_branches.add(b)
             overrides[b] = {
@@ -476,6 +480,10 @@ def write_delivery_report_summaries(summaries: list):
             elif not summary.get("booking_split") and legacy_key in existing_map:
                 target_row = existing_map[legacy_key]
             else:
+                # Zero corrections update existing rows only; they never create new zero reports.
+                if int(summary.get("total") or 0) <= 0:
+                    print(f"Delivery zero update skipped (no existing row) | {booking}/{wave}/{branch}")
+                    continue
                 target_row = current_append_row
                 existing_map[key] = target_row
                 current_append_row += 1
@@ -506,6 +514,9 @@ def write_delivery_report_summaries(summaries: list):
                                     "endRowIndex": target_row, "startColumnIndex": 0, "endColumnIndex": 20},
                     "pasteType": "PASTE_FORMULA", "pasteOrientation": "NORMAL"
                 }})
+
+        if not batch_data:
+            return
 
         # Send 1 single values:batchUpdate request
         base = f"https://sheets.googleapis.com/v4/spreadsheets/{DELIVERY_REPORT_SPREADSHEET_ID}"
@@ -650,6 +661,7 @@ def apply_document_override_to_summary(summary: dict) -> dict:
             result[field] = max(0, int(override.get(field) or 0))
     result["total"] = sum(int(result.get(field) or 0) for field in ("m", "red", "blue", "green", "black"))
     result["is_hidden"] = bool(override.get("is_hidden", False))
+    result["allow_zero_update"] = True
     return result
 
 
@@ -696,18 +708,33 @@ def get_durable_close_summaries(wave: str, branches) -> dict:
         return {}
     try:
         query = """
-            SELECT
+            WITH LatestClose AS (
+              SELECT
                 TRIM(UPPER(CAST(Branch_Code AS STRING))) AS branch,
                 CAST(Color AS STRING) AS payload,
                 SAFE_CAST(Timestamp AS TIMESTAMP) AS closed_at
-            FROM `pro-analytics-db.logistics_db.app_scan_transactions`
-            WHERE SAFE_CAST(REGEXP_REPLACE(TRIM(CAST(Wave_Number AS STRING)), r'[^0-9]', '') AS INT64) = @wave
-              AND UPPER(TRIM(CAST(Scan_Type AS STRING))) = 'CLOSE_SUMMARY'
-              AND TRIM(UPPER(CAST(Branch_Code AS STRING))) IN UNNEST(@branches)
-            QUALIFY ROW_NUMBER() OVER (
+              FROM `pro-analytics-db.logistics_db.app_scan_transactions`
+              WHERE SAFE_CAST(REGEXP_REPLACE(TRIM(CAST(Wave_Number AS STRING)), r'[^0-9]', '') AS INT64) = @wave
+                AND UPPER(TRIM(CAST(Scan_Type AS STRING))) = 'CLOSE_SUMMARY'
+                AND TRIM(UPPER(CAST(Branch_Code AS STRING))) IN UNNEST(@branches)
+              QUALIFY ROW_NUMBER() OVER (
                 PARTITION BY TRIM(UPPER(CAST(Branch_Code AS STRING)))
                 ORDER BY SAFE_CAST(Timestamp AS TIMESTAMP) DESC, CAST(LPN AS STRING) DESC
-            ) = 1
+              ) = 1
+            )
+            SELECT c.*,
+              EXISTS (
+                SELECT 1
+                FROM `pro-analytics-db.logistics_db.app_scan_transactions` t
+                WHERE SAFE_CAST(REGEXP_REPLACE(TRIM(CAST(t.Wave_Number AS STRING)), r'[^0-9]', '') AS INT64) = @wave
+                  AND TRIM(UPPER(CAST(t.Branch_Code AS STRING))) = c.branch
+                  AND SAFE_CAST(t.Timestamp AS TIMESTAMP) > c.closed_at
+                  AND (
+                    UPPER(TRIM(CAST(t.Scan_Type AS STRING))) IN ('RESET_BOX', 'CANCEL_COMBINE')
+                    OR STARTS_WITH(UPPER(TRIM(CAST(t.Scan_Type AS STRING))), 'CORRECTION|')
+                  )
+              ) AS has_post_close_correction
+            FROM LatestClose c
         """
         job_config = bigquery.QueryJobConfig(query_parameters=[
             bigquery.ScalarQueryParameter("wave", "INT64", int(str(wave))),
@@ -722,6 +749,8 @@ def get_durable_close_summaries(wave: str, branches) -> dict:
                 continue
             summary = normalize_report_summary(payload, str(wave), branch)
             if summary.get("total", 0) > 0:
+                summary["_closed_at"] = row["closed_at"].isoformat() if row["closed_at"] else ""
+                summary["_has_post_close_correction"] = bool(row["has_post_close_correction"])
                 durable[branch] = summary
         return durable
     except Exception as exc:
@@ -740,8 +769,8 @@ def queue_report_summary_snapshots(summaries: list, delay_seconds: float = REPOR
     with report_sync_pending_lock:
         for raw in summaries or []:
             summary = normalize_report_summary(raw)
-            # รายงานปฏิบัติการต้องไม่สร้าง/เขียนทับด้วย 0; งาน 0 ให้คงเฉพาะสถานะในระบบสแกน
-            if summary.get("total", 0) <= 0:
+            # Automatic zero snapshots are ignored; an intentional zero correction may clear an existing row.
+            if summary.get("total", 0) <= 0 and not summary.get("allow_zero_update"):
                 continue
             key = _report_sync_key(summary.get("wave"), summary.get("branch"), "snapshot")
             if not key[0] or not key[1]:
@@ -825,12 +854,13 @@ def _build_reconciled_summaries(entries: list) -> list:
             durable = durable_summaries.get(branch)
             # CLOSE_SUMMARY คือยอดที่เห็นจริงตอนกดปิดและเก็บถาวรพร้อม CLOSE_JOB
             # ใช้เป็น fallback/กันข้อมูล BigQuery ที่เข้าช้าหรือหายบางส่วน แล้วให้ manual override ชนะท้ายสุด
-            if durable and int(durable.get("total") or 0) > int(calculated.get("total") or 0):
+            if (durable and not durable.get("_has_post_close_correction")
+                    and int(durable.get("total") or 0) > int(calculated.get("total") or 0)):
                 summary = {**calculated, **durable, "wave": wave, "branch": branch, "is_closed": True}
             else:
                 summary = calculated
             summary = normalize_report_summary(apply_document_override_to_summary(summary), wave, branch)
-            if summary.get("total", 0) > 0:
+            if summary.get("total", 0) > 0 or summary.get("allow_zero_update"):
                 summaries.append(summary)
     return summaries
 
@@ -2316,12 +2346,14 @@ async def health_check(response: Response):
     # ⚡ Cache-Control: s-maxage=5 ทำให้ CDN/Render ตอบ health check ได้ทันที ไม่ต้อง round-trip ถึง Python
     response.headers["Cache-Control"] = "no-store"
     response.headers["Connection"] = "keep-alive"
-    return {"status": "ok", "version": "1.10.0", "timestamp": time.time()}
+    return {"status": "ok", "version": "1.10.1", "timestamp": time.time()}
 
 def sync_document_summary_reports(summaries: list):
-    # ชั้นป้องกันสุดท้าย: ห้ามยอด 0 สร้างแถวใหม่หรือเขียนทับยอดจริงในทั้งสอง Sheet
+    # Automatic zero snapshots must not create report rows.
+    # Intentional zero corrections may pass through to clear an existing row only.
     summaries = [normalize_report_summary(summary) for summary in summaries or []]
-    summaries = [summary for summary in summaries if summary.get("total", 0) > 0]
+    summaries = [summary for summary in summaries
+                 if summary.get("total", 0) > 0 or summary.get("allow_zero_update")]
     if not summaries:
         return
     failures = []
@@ -2390,9 +2422,10 @@ def save_document_summary(data: DocumentSummaryBatchData, background_tasks: Back
         })
 
     if data.persist_overrides:
-        persistent_items = [item for item in normalized if item.get("is_hidden") or any(
-            int(item.get(field) or 0) > 0 for field in ("m", "red", "blue", "green", "black", "pallet")
-        )]
+        # The frontend sends dirty branches only. Persist zero so old totals cannot return later.
+        persistent_items = normalized
+        for item in persistent_items:
+            item["allow_zero_update"] = True
         # ยอดที่ผู้ใช้แก้ต้องลง BigQuery สำเร็จก่อนตอบกลับ เพื่อไม่ให้ขึ้นว่าบันทึกแล้วแต่หายหลัง restart
         record_document_overrides_to_bq(copy.deepcopy(persistent_items), emp_id)
         with document_overrides_lock:
