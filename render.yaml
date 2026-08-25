@@ -8,7 +8,7 @@ services:
     # ⚡ Standard Plan: 1 CPU dedicated
     # Standard มี 1 CPU: ใช้ async worker เดียวเพื่อให้ cache/คิวซิงก์ยอดเป็นชุดเดียวกันทุก request
     # FastAPI ยังรองรับหลาย Handheld พร้อมกันผ่าน async + threadpool โดยไม่แบ่ง state เป็นคนละ process
-    startCommand: gunicorn main:app -w 1 -k uvicorn.workers.UvicornWorker --worker-connections 1000 --bind 0.0.0.0:$PORT --timeout 120 --keep-alive 5 --max-requests 2000 --max-requests-jitter 200
+    startCommand: gunicorn main:app -w 1 -k uvicorn.workers.UvicornWorker --worker-connections 1000 --bind 0.0.0.0:$PORT --timeout 120 --keep-alive 5
     healthCheckPath: /api/health
     autoDeploy: true
     envVars:

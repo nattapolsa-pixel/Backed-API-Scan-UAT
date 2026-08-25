@@ -664,6 +664,69 @@ report_sync_pending_lock = Lock()
 report_sync_wakeup = threading.Event()
 report_sync_worker_started = False
 report_sync_worker_start_lock = Lock()
+REPORT_BOX_FIELDS = ("m", "red", "blue", "green", "black")
+
+
+def normalize_report_summary(raw: dict, wave: str = "", branch: str = "") -> dict:
+    """Normalize one report snapshot and always recalculate the box total."""
+    summary = copy.deepcopy(raw or {})
+    clean_wave = re.sub(r"\D", "", str(wave or summary.get("wave") or ""))
+    summary["wave"] = str(int(clean_wave)) if clean_wave else ""
+    summary["branch"] = str(branch or summary.get("branch") or "").strip().upper()
+    for field in ("label_count", *REPORT_BOX_FIELDS, "pallet"):
+        try:
+            summary[field] = max(0, int(float(summary.get(field) or 0)))
+        except (TypeError, ValueError):
+            summary[field] = 0
+    summary["total"] = sum(summary[field] for field in REPORT_BOX_FIELDS)
+    summary["booking"] = str(summary.get("booking") or "").strip().upper()
+    summary["branch_name"] = str(summary.get("branch_name") or summary["branch"]).strip()
+    summary["bu"] = member_data_bu(summary.get("bu"))
+    return summary
+
+
+def report_summary_has_boxes(summary: dict) -> bool:
+    return int(normalize_report_summary(summary).get("total") or 0) > 0
+
+
+def get_durable_close_summaries(wave: str, branches) -> dict:
+    """Read the exact positive totals saved atomically with CLOSE_JOB."""
+    clean_branches = sorted({str(branch or "").strip().upper() for branch in branches or [] if branch})
+    if not clean_branches:
+        return {}
+    try:
+        query = """
+            SELECT
+                TRIM(UPPER(CAST(Branch_Code AS STRING))) AS branch,
+                CAST(Color AS STRING) AS payload,
+                SAFE_CAST(Timestamp AS TIMESTAMP) AS closed_at
+            FROM `pro-analytics-db.logistics_db.app_scan_transactions`
+            WHERE SAFE_CAST(REGEXP_REPLACE(TRIM(CAST(Wave_Number AS STRING)), r'[^0-9]', '') AS INT64) = @wave
+              AND UPPER(TRIM(CAST(Scan_Type AS STRING))) = 'CLOSE_SUMMARY'
+              AND TRIM(UPPER(CAST(Branch_Code AS STRING))) IN UNNEST(@branches)
+            QUALIFY ROW_NUMBER() OVER (
+                PARTITION BY TRIM(UPPER(CAST(Branch_Code AS STRING)))
+                ORDER BY SAFE_CAST(Timestamp AS TIMESTAMP) DESC, CAST(LPN AS STRING) DESC
+            ) = 1
+        """
+        job_config = bigquery.QueryJobConfig(query_parameters=[
+            bigquery.ScalarQueryParameter("wave", "INT64", int(str(wave))),
+            bigquery.ArrayQueryParameter("branches", "STRING", clean_branches),
+        ])
+        durable = {}
+        for row in client.query(query, job_config=job_config).result(timeout=BQ_JOB_TIMEOUT_SECONDS):
+            branch = str(row["branch"] or "").strip().upper()
+            try:
+                payload = json.loads(str(row["payload"] or "{}"))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            summary = normalize_report_summary(payload, str(wave), branch)
+            if summary.get("total", 0) > 0:
+                durable[branch] = summary
+        return durable
+    except Exception as exc:
+        print(f"⚠️ CLOSE SUMMARY READ skipped | Wave: {wave} | {exc}")
+        return {}
 
 
 def _report_sync_key(wave: str, branch: str, mode: str) -> tuple:
@@ -676,7 +739,10 @@ def queue_report_summary_snapshots(summaries: list, delay_seconds: float = REPOR
     now = time.time()
     with report_sync_pending_lock:
         for raw in summaries or []:
-            summary = copy.deepcopy(raw)
+            summary = normalize_report_summary(raw)
+            # รายงานปฏิบัติการต้องไม่สร้าง/เขียนทับด้วย 0; งาน 0 ให้คงเฉพาะสถานะในระบบสแกน
+            if summary.get("total", 0) <= 0:
+                continue
             key = _report_sync_key(summary.get("wave"), summary.get("branch"), "snapshot")
             if not key[0] or not key[1]:
                 continue
@@ -748,14 +814,24 @@ def _build_reconciled_summaries(entries: list) -> list:
                 requested.update(available_branches)
             else:
                 requested.add(entry["branch"])
+        durable_summaries = get_durable_close_summaries(wave, requested)
         for branch in sorted(requested):
             branch_items = [item for item in fresh.get("lpn_list", [])
                             if str(item.get("branch") or "").strip().upper() == branch]
             # Google Sheets เป็นรายงานงานที่ปิดจบแล้วเท่านั้น ห้ามสร้างแถว 0/ยอดระหว่างทำงาน
             if not any(item.get("branch_closed_at") for item in branch_items):
                 continue
-            summary = summarize_branch_for_member_data(fresh, branch)
-            summaries.append(apply_document_override_to_summary(summary))
+            calculated = normalize_report_summary(summarize_branch_for_member_data(fresh, branch), wave, branch)
+            durable = durable_summaries.get(branch)
+            # CLOSE_SUMMARY คือยอดที่เห็นจริงตอนกดปิดและเก็บถาวรพร้อม CLOSE_JOB
+            # ใช้เป็น fallback/กันข้อมูล BigQuery ที่เข้าช้าหรือหายบางส่วน แล้วให้ manual override ชนะท้ายสุด
+            if durable and int(durable.get("total") or 0) > int(calculated.get("total") or 0):
+                summary = {**calculated, **durable, "wave": wave, "branch": branch, "is_closed": True}
+            else:
+                summary = calculated
+            summary = normalize_report_summary(apply_document_override_to_summary(summary), wave, branch)
+            if summary.get("total", 0) > 0:
+                summaries.append(summary)
     return summaries
 
 
@@ -1472,6 +1548,7 @@ def fetch_wave_data_from_bq(search_wave_id: int) -> dict:
              AND r.Scan_Branch = lr.Scan_Branch
             WHERE r.Is_Reset = 0
               AND IFNULL(r.Qty, 0) > 0
+              AND UPPER(IFNULL(r.Scan_Type, '')) != 'CLOSE_SUMMARY'
               AND (lr.Reset_Timestamp IS NULL OR r.Timestamp > lr.Reset_Timestamp)
         ),
         PalletColorAggregatedScans AS (
@@ -2239,9 +2316,12 @@ async def health_check(response: Response):
     # ⚡ Cache-Control: s-maxage=5 ทำให้ CDN/Render ตอบ health check ได้ทันที ไม่ต้อง round-trip ถึง Python
     response.headers["Cache-Control"] = "no-store"
     response.headers["Connection"] = "keep-alive"
-    return {"status": "ok", "version": "1.9.9", "timestamp": time.time()}
+    return {"status": "ok", "version": "1.10.0", "timestamp": time.time()}
 
 def sync_document_summary_reports(summaries: list):
+    # ชั้นป้องกันสุดท้าย: ห้ามยอด 0 สร้างแถวใหม่หรือเขียนทับยอดจริงในทั้งสอง Sheet
+    summaries = [normalize_report_summary(summary) for summary in summaries or []]
+    summaries = [summary for summary in summaries if summary.get("total", 0) > 0]
     if not summaries:
         return
     failures = []
@@ -3242,9 +3322,20 @@ def close_job(data: CloseJobData, background_tasks: BackgroundTasks):
     def esc(val):
         return str(val or "").replace("\\", "\\\\").replace("'", "\\'")
 
-    branch = esc(data.branch.strip().upper())
+    branch = data.branch.strip().upper()
+    branch_sql = esc(branch)
     emp_id = esc((data.emp_id or "").strip())
     completed_at = esc((data.completed_at or "").strip())
+
+    frontend_summary = None
+    if data.summary:
+        frontend_summary = normalize_report_summary(data.summary.dict(), wave_clean, branch)
+        frontend_summary["is_closed"] = True
+        if int(frontend_summary.get("label_count") or 0) > 0 and frontend_summary.get("total", 0) <= 0:
+            raise HTTPException(
+                status_code=409,
+                detail="ยังปิดสาขาไม่ได้: พบรายการ LPN แต่ยอดรวมเป็น 0 กรุณารีเฟรชข้อมูลและตรวจคิวส่งก่อนกดปิดอีกครั้ง",
+            )
 
     insert_zero_query = f"""
         INSERT INTO `pro-analytics-db.logistics_db.app_scan_transactions`
@@ -3253,7 +3344,7 @@ def close_job(data: CloseJobData, background_tasks: BackgroundTasks):
             SELECT TRIM(UPPER(CAST(LPN AS STRING))) AS LPN
             FROM `pro-analytics-db.logistics_db.wave_lpn_detail_record`
             WHERE SAFE_CAST(REGEXP_REPLACE(TRIM(CAST(Wave_Number AS STRING)), r'[^0-9]', '') AS INT64) = {wave_clean}
-              AND TRIM(UPPER(CAST(Branch_Code AS STRING))) = '{branch}'
+              AND TRIM(UPPER(CAST(Branch_Code AS STRING))) = '{branch_sql}'
         ),
         Scanned AS (
             SELECT TRIM(UPPER(CAST(LPN AS STRING))) AS LPN
@@ -3278,22 +3369,33 @@ def close_job(data: CloseJobData, background_tasks: BackgroundTasks):
         "Emp_ID": emp_id,
         "Pallet_No": 0,
     }
+    marker_rows = [marker_row]
+    marker_row_ids = [f"close-{wave_clean}-{branch}-{marker_timestamp}"]
+    if frontend_summary and frontend_summary.get("total", 0) > 0:
+        marker_rows.append({
+            "Wave_Number": wave_clean,
+            "LPN": f"BRANCH_SUMMARY_{branch}",
+            "Scan_Type": "CLOSE_SUMMARY",
+            "Color": json.dumps(frontend_summary, ensure_ascii=False, separators=(",", ":")),
+            "Qty": int(frontend_summary["total"]),
+            "Timestamp": marker_timestamp,
+            "Branch_Code": branch,
+            "Branch_Name": frontend_summary.get("branch_name") or branch,
+            "Emp_ID": emp_id,
+            "Pallet_No": int(frontend_summary.get("pallet") or 0),
+        })
+        marker_row_ids.append(f"close-summary-{wave_clean}-{branch}-{marker_timestamp}")
     marker_errors = client.insert_rows_json(
         client.dataset("logistics_db").table("app_scan_transactions"),
-        [marker_row],
-        row_ids=[f"close-{wave_clean}-{branch}-{marker_timestamp}"],
+        marker_rows,
+        row_ids=marker_row_ids,
     )
     if marker_errors:
         raise HTTPException(status_code=503, detail=f"บันทึกสถานะปิดสาขายังไม่สำเร็จ: {marker_errors}")
 
     record_shared_branch_closed(wave_clean, branch, completed_at, emp_id)
 
-    frontend_summary = None
-    if data.summary:
-        frontend_summary = data.summary.dict()
-        frontend_summary["wave"] = wave_clean
-        frontend_summary["branch"] = branch
-        frontend_summary["is_closed"] = True
+    if frontend_summary:
         # Fast snapshot from the exact numbers visible on screen; server reconciliation follows.
         queue_report_summary_snapshots([frontend_summary], delay_seconds=0.0)
 
