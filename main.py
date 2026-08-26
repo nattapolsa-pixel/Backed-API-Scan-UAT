@@ -85,12 +85,19 @@ delivery_report_lock = Lock()
 delivery_lookup_cache = {"expires_at": 0.0, "cars": {}, "branches": {}}
 delivery_report_row_cache = {"expires_at": 0.0, "existing_map": {}, "last_data_row": 1}
 SHEET_ROW_CACHE_TTL_SECONDS = 5 * 60
+SHEETS_HTTP_TIMEOUT = (5, 30)
+_sheets_session_local = threading.local()
 
 def get_sheets_session():
+    session = getattr(_sheets_session_local, "session", None)
+    if session is not None:
+        return session
     credentials = client._credentials
     if hasattr(credentials, "with_scopes"):
         credentials = credentials.with_scopes(["https://www.googleapis.com/auth/spreadsheets"])
-    return AuthorizedSession(credentials)
+    session = AuthorizedSession(credentials)
+    _sheets_session_local.session = session
+    return session
 
 def member_data_bu(owner) -> str:
     """แปลงรหัส BU จากข้อมูล Wave ให้เป็นชื่อที่หน้างานใช้ใน Member Data."""
@@ -114,7 +121,7 @@ def write_member_history_summaries(summaries: list):
         last_data_row = int(member_history_row_cache["last_data_row"] or 1)
     else:
         lookup_range = urllib.parse.quote("Member Data!A:D", safe="")
-        read_res = session.get(f"{base}/values/{lookup_range}", timeout=45)
+        read_res = session.get(f"{base}/values/{lookup_range}", timeout=SHEETS_HTTP_TIMEOUT)
         read_res.raise_for_status()
         values = read_res.json().get("values") or []
         existing_map = {}
@@ -171,7 +178,7 @@ def write_member_history_summaries(summaries: list):
         "valueInputOption": "USER_ENTERED",
         "data": batch_data
     }
-    response = session.post(f"{base}/values:batchUpdate", json=batch_payload, timeout=45)
+    response = session.post(f"{base}/values:batchUpdate", json=batch_payload, timeout=SHEETS_HTTP_TIMEOUT)
     response.raise_for_status()
 
     member_history_row_cache["existing_map"] = dict(existing_map)
@@ -189,7 +196,7 @@ def write_member_history_summary(summary: dict):
 def _sheet_values(session, spreadsheet_id: str, a1_range: str) -> list:
     encoded = urllib.parse.quote(a1_range, safe="")
     url = f"https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}/values/{encoded}"
-    response = session.get(url, timeout=60)
+    response = session.get(url, timeout=SHEETS_HTTP_TIMEOUT)
     response.raise_for_status()
     return response.json().get("values") or []
 
@@ -520,7 +527,7 @@ def write_delivery_report_summaries(summaries: list):
 
         # Send 1 single values:batchUpdate request
         base = f"https://sheets.googleapis.com/v4/spreadsheets/{DELIVERY_REPORT_SPREADSHEET_ID}"
-        response = session.post(f"{base}/values:batchUpdate", json={"valueInputOption": "RAW", "data": batch_data}, timeout=60)
+        response = session.post(f"{base}/values:batchUpdate", json={"valueInputOption": "RAW", "data": batch_data}, timeout=SHEETS_HTTP_TIMEOUT)
         response.raise_for_status()
 
         delivery_report_row_cache["existing_map"] = dict(existing_map)
@@ -529,7 +536,7 @@ def write_delivery_report_summaries(summaries: list):
 
         if formula_requests:
             try:
-                copied = session.post(f"{base}:batchUpdate", json={"requests": formula_requests}, timeout=60)
+                copied = session.post(f"{base}:batchUpdate", json={"requests": formula_requests}, timeout=SHEETS_HTTP_TIMEOUT)
                 copied.raise_for_status()
             except Exception as fe:
                 print(f"⚠️ Formula copy warning: {fe}")
@@ -1230,14 +1237,27 @@ valid_lpns_cache_lock = Lock()
 
 # --- ULTRA-FAST WAVE AND BOOKING SEARCH CACHE ---
 WAVE_CACHE_TTL = 1800  # 30 นาที cache (Standard Plan: 2GB RAM เพียงพอ)
-wave_cache = {}  # wave_detail_str -> {"data": dict, "expires_at": float}
+WAVE_FORCE_REFRESH_COOLDOWN_SECONDS = 2.0
+wave_cache = {}  # wave_detail_str -> {"data": dict, "expires_at": float, "fetched_at": float}
 wave_cache_lock = Lock()
 wave_query_locks = {}
 wave_query_locks_guard = Lock()
 
 BOOKING_WAVES_CACHE_TTL = 1800  # 30 นาที cache
-booking_waves_cache = {}  # booking_clean -> {"mapping": dict, "expires_at": float}
+BOOKING_FORCE_REFRESH_COOLDOWN_SECONDS = 5.0
+booking_waves_cache = {}  # booking_clean -> {"mapping": dict, "expires_at": float, "fetched_at": float}
 booking_waves_cache_lock = Lock()
+booking_waves_query_locks = {}
+booking_waves_query_locks_guard = Lock()
+BOOKING_METADATA_CACHE_TTL_SECONDS = 15
+booking_assignments_cache = {"data": {}, "expires_at": 0.0}
+booking_assignments_cache_lock = Lock()
+booking_splits_cache = {"data": {}, "expires_at": 0.0}
+booking_splits_cache_lock = Lock()
+booking_override_table_ready = False
+booking_override_table_lock = Lock()
+booking_split_table_ready = False
+booking_split_table_lock = Lock()
 
 # Local scans overlay to ensure instant read-after-write across all users.
 # Key: wave_clean -> {(lpn_upper, branch_upper): latest scan state including qty/color/pallet_no}
@@ -1871,10 +1891,12 @@ def get_wave_data_internal(wave_no: str, force_refresh: bool = False) -> dict:
     now = time.time()
 
     data = None
-    if not force_refresh:
-        with wave_cache_lock:
-            cached = wave_cache.get(wave_detail_str)
-            if cached and cached["expires_at"] > now:
+    with wave_cache_lock:
+        cached = wave_cache.get(wave_detail_str)
+        if cached:
+            cache_fresh = float(cached.get("expires_at") or 0) > now
+            fetched_recently = now - float(cached.get("fetched_at") or 0) < WAVE_FORCE_REFRESH_COOLDOWN_SECONDS
+            if (not force_refresh and cache_fresh) or (force_refresh and cache_fresh and fetched_recently):
                 data = copy.deepcopy(cached["data"])
 
     if data is None:
@@ -1882,18 +1904,23 @@ def get_wave_data_internal(wave_no: str, force_refresh: bool = False) -> dict:
         with wave_query_locks_guard:
             query_lock = wave_query_locks.setdefault(wave_detail_str, Lock())
         with query_lock:
-            if not force_refresh:
-                with wave_cache_lock:
-                    cached = wave_cache.get(wave_detail_str)
-                    if cached and cached["expires_at"] > time.time():
+            with wave_cache_lock:
+                cached = wave_cache.get(wave_detail_str)
+                current_time = time.time()
+                if cached:
+                    cache_fresh = float(cached.get("expires_at") or 0) > current_time
+                    fetched_recently = current_time - float(cached.get("fetched_at") or 0) < WAVE_FORCE_REFRESH_COOLDOWN_SECONDS
+                    if (not force_refresh and cache_fresh) or (force_refresh and cache_fresh and fetched_recently):
                         data = copy.deepcopy(cached["data"])
 
             if data is None:
                 data = fetch_wave_data_from_bq(search_wave_id)
+                fetched_at = time.time()
                 with wave_cache_lock:
                     wave_cache[wave_detail_str] = {
                         "data": data,
-                        "expires_at": time.time() + WAVE_CACHE_TTL
+                        "expires_at": fetched_at + WAVE_CACHE_TTL,
+                        "fetched_at": fetched_at,
                     }
                 data = copy.deepcopy(data)
 
@@ -2028,19 +2055,34 @@ def fetch_booking_waves_from_bq(booking_no: str) -> dict:
 def get_booking_waves_mapping(booking_no: str, force_refresh: bool = False) -> dict:
     clean_booking = booking_no.strip().upper()
     now = time.time()
-    if not force_refresh:
-        with booking_waves_cache_lock:
-            cached = booking_waves_cache.get(clean_booking)
-            if cached and cached["expires_at"] > now:
+    with booking_waves_cache_lock:
+        cached = booking_waves_cache.get(clean_booking)
+        if cached:
+            cache_fresh = float(cached.get("expires_at") or 0) > now
+            fetched_recently = now - float(cached.get("fetched_at") or 0) < BOOKING_FORCE_REFRESH_COOLDOWN_SECONDS
+            if (not force_refresh and cache_fresh) or (force_refresh and cache_fresh and fetched_recently):
                 return cached["mapping"]
                 
-    mapping = fetch_booking_waves_from_bq(booking_no)
-    with booking_waves_cache_lock:
-        booking_waves_cache[clean_booking] = {
-            "mapping": mapping,
-            "expires_at": now + BOOKING_WAVES_CACHE_TTL
-        }
-    return mapping
+    with booking_waves_query_locks_guard:
+        query_lock = booking_waves_query_locks.setdefault(clean_booking, Lock())
+    with query_lock:
+        with booking_waves_cache_lock:
+            cached = booking_waves_cache.get(clean_booking)
+            current_time = time.time()
+            if cached:
+                cache_fresh = float(cached.get("expires_at") or 0) > current_time
+                fetched_recently = current_time - float(cached.get("fetched_at") or 0) < BOOKING_FORCE_REFRESH_COOLDOWN_SECONDS
+                if (not force_refresh and cache_fresh) or (force_refresh and cache_fresh and fetched_recently):
+                    return cached["mapping"]
+        mapping = fetch_booking_waves_from_bq(booking_no)
+        fetched_at = time.time()
+        with booking_waves_cache_lock:
+            booking_waves_cache[clean_booking] = {
+                "mapping": mapping,
+                "expires_at": fetched_at + BOOKING_WAVES_CACHE_TTL,
+                "fetched_at": fetched_at,
+            }
+        return mapping
 
 def get_booking_data_internal(booking_no: str, force_refresh: bool = False) -> dict:
     mapping = get_booking_waves_mapping(booking_no, force_refresh)
@@ -2061,8 +2103,8 @@ def get_booking_data_internal(booking_no: str, force_refresh: bool = False) -> d
     waves_included = set()
     wave_results = []
     
-    # Fetch all waves in parallel using ThreadPoolExecutor to prevent slow sequential BigQuery queries
-    with ThreadPoolExecutor(max_workers=max(1, len(waves))) as executor:
+    # จำกัด fan-out ไม่ให้ Booking ที่มีหลาย Wave ยิง BigQuery พร้อมกันจนคิว API อั้นทั้งระบบ
+    with ThreadPoolExecutor(max_workers=max(1, min(6, len(waves)))) as executor:
         futures = {executor.submit(get_wave_data_internal, wave, force_refresh): wave for wave in waves}
         for future in futures:
             wave = futures[future]
@@ -2283,56 +2325,88 @@ class CloseJobData(BaseModel):
     summary: Optional[DocumentSummaryData] = None
 
 def ensure_booking_override_table():
-    client.query("""
-        CREATE TABLE IF NOT EXISTS `pro-analytics-db.logistics_db.booking_branch_overrides` (
-            Event_ID STRING, Wave_Number STRING, Branch_Code STRING,
-            Previous_Booking STRING, Assigned_Booking STRING,
-            Reason STRING, Note STRING, Emp_ID STRING, Created_At TIMESTAMP
-        )
-    """).result(timeout=BQ_JOB_TIMEOUT_SECONDS)
-
-def get_booking_branch_assignments() -> dict:
-    try:
-        ensure_booking_override_table()
-        rows = client.query("""
-            SELECT Wave_Number, Branch_Code, Previous_Booking, Assigned_Booking,
-                   Reason, Note, Emp_ID, Created_At
-            FROM `pro-analytics-db.logistics_db.booking_branch_overrides`
-            QUALIFY ROW_NUMBER() OVER (
-                PARTITION BY TRIM(Wave_Number), UPPER(TRIM(Branch_Code))
-                ORDER BY Created_At DESC, Event_ID DESC
-            ) = 1
+    global booking_override_table_ready
+    if booking_override_table_ready:
+        return
+    with booking_override_table_lock:
+        if booking_override_table_ready:
+            return
+        client.query("""
+            CREATE TABLE IF NOT EXISTS `pro-analytics-db.logistics_db.booking_branch_overrides` (
+                Event_ID STRING, Wave_Number STRING, Branch_Code STRING,
+                Previous_Booking STRING, Assigned_Booking STRING,
+                Reason STRING, Note STRING, Emp_ID STRING, Created_At TIMESTAMP
+            )
         """).result(timeout=BQ_JOB_TIMEOUT_SECONDS)
-        return {(str(row["Wave_Number"]).strip(), str(row["Branch_Code"]).strip().upper()): dict(row.items()) for row in rows}
-    except Exception as exc:
-        print(f"BOOKING OVERRIDE READ ERROR: {exc}")
-        return {}
+        booking_override_table_ready = True
+
+def get_booking_branch_assignments(force_refresh: bool = False) -> dict:
+    now = time.time()
+    with booking_assignments_cache_lock:
+        if not force_refresh and booking_assignments_cache["expires_at"] > now:
+            return copy.deepcopy(booking_assignments_cache["data"])
+        try:
+            ensure_booking_override_table()
+            rows = client.query("""
+                SELECT Wave_Number, Branch_Code, Previous_Booking, Assigned_Booking,
+                       Reason, Note, Emp_ID, Created_At
+                FROM `pro-analytics-db.logistics_db.booking_branch_overrides`
+                QUALIFY ROW_NUMBER() OVER (
+                    PARTITION BY TRIM(Wave_Number), UPPER(TRIM(Branch_Code))
+                    ORDER BY Created_At DESC, Event_ID DESC
+                ) = 1
+            """).result(timeout=BQ_JOB_TIMEOUT_SECONDS)
+            data = {(str(row["Wave_Number"]).strip(), str(row["Branch_Code"]).strip().upper()): dict(row.items()) for row in rows}
+            booking_assignments_cache.update({
+                "data": data,
+                "expires_at": time.time() + BOOKING_METADATA_CACHE_TTL_SECONDS,
+            })
+            return copy.deepcopy(data)
+        except Exception as exc:
+            print(f"BOOKING OVERRIDE READ ERROR: {exc}")
+            return copy.deepcopy(booking_assignments_cache["data"])
 
 def ensure_booking_split_table():
-    client.query("""
-        CREATE TABLE IF NOT EXISTS `pro-analytics-db.logistics_db.booking_branch_splits` (
-            Event_ID STRING, Wave_Number STRING, Branch_Code STRING,
-            Source_Booking STRING, Target_Booking STRING,
-            M_Count INT64, Red_Count INT64, Blue_Count INT64, Green_Count INT64, Black_Count INT64,
-            Pallet_Count INT64, Is_Active BOOL, Reason STRING, Note STRING, Emp_ID STRING, Created_At TIMESTAMP
-        )
-    """).result(timeout=BQ_JOB_TIMEOUT_SECONDS)
-
-def get_booking_branch_splits() -> dict:
-    try:
-        ensure_booking_split_table()
-        rows = client.query("""
-            SELECT * FROM `pro-analytics-db.logistics_db.booking_branch_splits`
-            QUALIFY ROW_NUMBER() OVER (
-                PARTITION BY TRIM(Wave_Number), UPPER(TRIM(Branch_Code)), UPPER(TRIM(Target_Booking))
-                ORDER BY Created_At DESC, Event_ID DESC
-            ) = 1
+    global booking_split_table_ready
+    if booking_split_table_ready:
+        return
+    with booking_split_table_lock:
+        if booking_split_table_ready:
+            return
+        client.query("""
+            CREATE TABLE IF NOT EXISTS `pro-analytics-db.logistics_db.booking_branch_splits` (
+                Event_ID STRING, Wave_Number STRING, Branch_Code STRING,
+                Source_Booking STRING, Target_Booking STRING,
+                M_Count INT64, Red_Count INT64, Blue_Count INT64, Green_Count INT64, Black_Count INT64,
+                Pallet_Count INT64, Is_Active BOOL, Reason STRING, Note STRING, Emp_ID STRING, Created_At TIMESTAMP
+            )
         """).result(timeout=BQ_JOB_TIMEOUT_SECONDS)
-        return {(str(row["Wave_Number"]).strip(), str(row["Branch_Code"]).strip().upper(),
-                 str(row["Target_Booking"]).strip().upper()): dict(row.items()) for row in rows}
-    except Exception as exc:
-        print(f"BOOKING SPLIT READ ERROR: {exc}")
-        return {}
+        booking_split_table_ready = True
+
+def get_booking_branch_splits(force_refresh: bool = False) -> dict:
+    now = time.time()
+    with booking_splits_cache_lock:
+        if not force_refresh and booking_splits_cache["expires_at"] > now:
+            return copy.deepcopy(booking_splits_cache["data"])
+        try:
+            ensure_booking_split_table()
+            rows = client.query("""
+                SELECT * FROM `pro-analytics-db.logistics_db.booking_branch_splits`
+                QUALIFY ROW_NUMBER() OVER (
+                    PARTITION BY TRIM(Wave_Number), UPPER(TRIM(Branch_Code)), UPPER(TRIM(Target_Booking))
+                    ORDER BY Created_At DESC, Event_ID DESC
+                ) = 1
+            """).result(timeout=BQ_JOB_TIMEOUT_SECONDS)
+            data = {(str(row["Wave_Number"]).strip(), str(row["Branch_Code"]).strip().upper(),
+                     str(row["Target_Booking"]).strip().upper()): dict(row.items()) for row in rows}
+            booking_splits_cache.update({
+                "data": data,
+                "expires_at": time.time() + BOOKING_METADATA_CACHE_TTL_SECONDS,
+            })
+            return copy.deepcopy(data)
+        except Exception as exc:
+            print(f"BOOKING SPLIT READ ERROR: {exc}")
+            return copy.deepcopy(booking_splits_cache["data"])
 
 # ==================== ROUTES & APIs ====================
 
@@ -2346,7 +2420,7 @@ async def health_check(response: Response):
     # ⚡ Cache-Control: s-maxage=5 ทำให้ CDN/Render ตอบ health check ได้ทันที ไม่ต้อง round-trip ถึง Python
     response.headers["Cache-Control"] = "no-store"
     response.headers["Connection"] = "keep-alive"
-    return {"status": "ok", "version": "1.10.1", "timestamp": time.time()}
+    return {"status": "ok", "version": "1.10.2", "timestamp": time.time()}
 
 def sync_document_summary_reports(summaries: list):
     # Automatic zero snapshots must not create report rows.
@@ -2716,6 +2790,8 @@ def move_booking_branch(data: BookingBranchMoveData):
         bigquery.ScalarQueryParameter("emp_id", "STRING", emp_id),
     ])
     client.query(query, job_config=config).result(timeout=BQ_JOB_TIMEOUT_SECONDS)
+    with booking_assignments_cache_lock:
+        booking_assignments_cache["expires_at"] = 0.0
     with booking_waves_cache_lock:
         booking_waves_cache.pop(previous, None)
         booking_waves_cache.pop(target, None)
@@ -2772,6 +2848,8 @@ def split_booking_branch(data: BookingBranchSplitData):
         bigquery.ScalarQueryParameter("emp_id", "STRING", emp_id),
     ]
     client.query(query, job_config=bigquery.QueryJobConfig(query_parameters=params)).result(timeout=BQ_JOB_TIMEOUT_SECONDS)
+    with booking_splits_cache_lock:
+        booking_splits_cache["expires_at"] = 0.0
     with booking_waves_cache_lock:
         booking_waves_cache.pop(source, None)
         booking_waves_cache.pop(target, None)
@@ -2901,8 +2979,8 @@ def submit_pallet(data: PalletSubmitData):
     if errors:
         raise HTTPException(status_code=500, detail=f"ส่งสถานะพาเลทไม่สำเร็จ: {errors}")
     record_shared_pallet_state(wave_ids, branch, pallet_no, color=color, submitted=True)
-    queue_branch_totals_reconciliation([(str(wave_id), branch) for wave_id in wave_ids], delay_seconds=0.5)
-    return {"status": "success", "pallet_no": pallet_no, "submitted_by": emp_id, "report_sync": "queued"}
+    # รายงาน Google Sheet ใช้เฉพาะยอดตอนปิดสาขา จึงไม่ต้อง query BigQuery ซ้ำตอนส่งทุกพาเลท
+    return {"status": "success", "pallet_no": pallet_no, "submitted_by": emp_id, "report_sync": "not_needed"}
 
 def encode_correction_audit(payload: dict) -> str:
     raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
@@ -3001,6 +3079,7 @@ def correct_lpn(data: CorrectionData, background_tasks: BackgroundTasks):
         SELECT @wave_str, @lpn, @audit_type, @audit_color, 0, @audit_time, @branch, @branch_name, @emp_id, @old_pallet
         UNION ALL
         SELECT @wave_str, @lpn, @new_type, @new_color, @new_qty, @new_time, @branch, @branch_name, @emp_id, @new_pallet
+        FROM UNNEST([1]) AS guard_row
         WHERE @new_qty > 0
     """
     config = bigquery.QueryJobConfig(query_parameters=[
@@ -3163,9 +3242,8 @@ def process_scan(data: ScanData, background_tasks: BackgroundTasks):
             raise Exception(f"BigQuery streaming errors: {errors}")
         mark_transaction_processed(transaction_id)
         record_local_scan(wave_clean, lpn_val, branch_val, data.qty, type_val, color_val, pallet_no_val, base_pallet_breakdown)
-        queue_branch_totals_reconciliation([(wave_clean, branch_val)])
         print(f"✅ SAVED | LPN: {lpn_val}")
-        return {"status": "success", "message": "Saved", "report_sync": "queued"}
+        return {"status": "success", "message": "Saved", "report_sync": "not_needed"}
     except Exception as e:
         # ห้าม fallback ด้วย SQL INSERT เพราะ response หลุดหลัง BigQuery รับแล้วจะทำให้ยอดซ้ำ
         # Frontend จะ retry ด้วย transaction_id/insertId เดิม จึง dedupe ได้อย่างปลอดภัย
@@ -3286,7 +3364,6 @@ def process_scan_batch(data: ScanBatchData, background_tasks: BackgroundTasks):
                 mark_transaction_processed(scan[7])
                 if scan[7]:
                     processed_transaction_ids.append(scan[7])
-            queue_branch_totals_reconciliation({(scan[0], scan[2]) for scan in streamed_scans})
             error_by_index = {int(error.get("index")): error for error in errors if error.get("index") is not None}
             for index in sorted(failed_indexes):
                 scan = accepted_scans[index]
@@ -3301,15 +3378,13 @@ def process_scan_batch(data: ScanBatchData, background_tasks: BackgroundTasks):
                 "failed_count": len(failed_scans),
                 "processed_transaction_ids": processed_transaction_ids,
                 "errors": failed_scans,
-                "report_sync": "queued" if streamed_scans else "not_queued",
+                "report_sync": "not_needed",
             }
         for scan in accepted_scans:
             record_local_scan(*scan[:7])
             mark_transaction_processed(scan[7])
             if scan[7]:
                 processed_transaction_ids.append(scan[7])
-        queue_branch_totals_reconciliation({(scan[0], scan[2]) for scan in accepted_scans})
-        
         print(f"✅ BATCH SAVED | Processed: {len(rows_to_insert)} | Failed: {len(failed_scans)}")
         return {
             "status": "success", 
@@ -3318,7 +3393,7 @@ def process_scan_batch(data: ScanBatchData, background_tasks: BackgroundTasks):
             "failed_count": len(failed_scans),
             "processed_transaction_ids": processed_transaction_ids,
             "errors": failed_scans,
-            "report_sync": "queued",
+            "report_sync": "not_needed",
         }
     except Exception as e:
         # ไม่ยิง SQL ซ้ำทั้งชุดเมื่อไม่รู้ว่า BigQuery รับไปแล้วหรือยัง
@@ -3520,22 +3595,33 @@ def _startup_warm_cache():
     except Exception as e:
         print(f"⚠️ Startup cache warm-up failed (non-critical): {e}")
 
+    # เตรียม metadata Booking ล่วงหน้า เพื่อให้การค้นหา Booking ครั้งแรกไม่ต้องรอ DDL + 2 queries
+    try:
+        get_booking_branch_assignments()
+        get_booking_branch_splits()
+    except Exception as exc:
+        print(f"⚠️ Booking metadata warm-up skipped: {exc}")
+
     # โหลดประวัติกล่องจาก Member Data ไว้ล่วงหน้า ไม่ให้การค้นหา Wave แรกต้องรอ Google Sheet
     load_member_history()
 
 
 def recover_recent_report_syncs():
-    """Recover Sheet updates if Render restarted after accepting a scan but before writing reports."""
+    """Recover only closed/corrected branches; open scans must not trigger Sheet/BigQuery rebuilds."""
     try:
         query = """
             SELECT DISTINCT
                 CAST(SAFE_CAST(REGEXP_REPLACE(TRIM(CAST(Wave_Number AS STRING)), r'[^0-9]', '') AS INT64) AS STRING) AS wave,
                 TRIM(UPPER(CAST(Branch_Code AS STRING))) AS branch
             FROM `pro-analytics-db.logistics_db.app_scan_transactions`
-            WHERE SAFE_CAST(Timestamp AS TIMESTAMP) >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 6 HOUR)
+            WHERE SAFE_CAST(Timestamp AS TIMESTAMP) >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 24 HOUR)
               AND SAFE_CAST(REGEXP_REPLACE(TRIM(CAST(Wave_Number AS STRING)), r'[^0-9]', '') AS INT64) IS NOT NULL
               AND NULLIF(TRIM(CAST(Branch_Code AS STRING)), '') IS NOT NULL
-            LIMIT 2000
+              AND (
+                    UPPER(TRIM(CAST(Scan_Type AS STRING))) IN ('CLOSE_JOB', 'CLOSE_SUMMARY')
+                    OR STARTS_WITH(UPPER(TRIM(CAST(Scan_Type AS STRING))), 'CORRECTION|')
+                  )
+            LIMIT 500
         """
         rows = list(client.query(query).result(timeout=BQ_JOB_TIMEOUT_SECONDS))
         pairs = {(str(row["wave"] or ""), str(row["branch"] or "").strip().upper()) for row in rows}
