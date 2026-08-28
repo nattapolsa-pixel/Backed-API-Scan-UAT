@@ -33,6 +33,7 @@ ALLOWED_ORIGINS = [
     "http://localhost:3000",
     "http://localhost:5500",
     "http://127.0.0.1:5500",
+    "https://pro-scanner-uat.onrender.com",
 ]
 app.add_middleware(
     CORSMiddleware,
@@ -59,6 +60,11 @@ BQ_JOB_TIMEOUT_SECONDS = 45
 #    เปลี่ยนเป็น True เมื่อต้องการเปิดใช้งานระบบ QC
 QC_FEATURE_ENABLED = False
 
+# UAT Google Sheets migration. Production code lives in a separate worktree/branch.
+APP_ENV = os.environ.get("APP_ENV", "uat").strip().lower()
+UAT_SHEETS_ONLY = os.environ.get("UAT_SHEETS_ONLY", "true").strip().lower() in ("1", "true", "yes", "on")
+SCAN_FEATURE_ENABLED = os.environ.get("SCAN_FEATURE_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
+
 NUMERIC_BRANCH_MASTER_SPREADSHEET_ID = "1zI5YAq0JvlM-WsaCfDVYVZgiCn5pWx_HVJjQMiTFwoI"
 NUMERIC_BRANCH_MASTER_SHEET_NAME = "Master"
 NUMERIC_BRANCH_MASTER_GID = "606346592"
@@ -68,7 +74,7 @@ numeric_branch_master_lock = Lock()
 
 # ไฟล์ Control Outbound ที่ใช้งานจริง (Member Data เป็นแท็บแรก)
 MEMBER_HISTORY_SPREADSHEET_ID = "1MO3lu1GssPZZvaruwQ5trUB045dzh4HUHdH35mbyOtc"
-MEMBER_HISTORY_GID = "0"
+MEMBER_HISTORY_GID = "1628470483"
 MEMBER_HISTORY_CACHE_TTL_SECONDS = 10 * 60
 member_history_cache = {"expires_at": 0.0, "data": {}}
 member_history_lock = Lock()
@@ -88,6 +94,36 @@ SHEET_ROW_CACHE_TTL_SECONDS = 5 * 60
 SHEETS_HTTP_TIMEOUT = (5, 30)
 _sheets_session_local = threading.local()
 
+# ฐานข้อมูลเหตุการณ์ของ UAT (แทนตาราง BigQuery ที่เคยรับข้อมูลเขียนจากหน้าเว็บ)
+UAT_DATABASE_SPREADSHEET_ID = os.environ.get(
+    "UAT_DATABASE_SPREADSHEET_ID", "1RJcsrbWnGO7gMiq9bhBR4bA9Twh1NjqP6816dXOW9DI"
+)
+UAT_EVENT_SHEETS = {
+    "Document Overrides": [
+        "Event_ID", "Action", "Wave_Number", "Booking_No", "Branch_Code", "Branch_Name",
+        "M_Count", "Red_Count", "Blue_Count", "Green_Count", "Black_Count", "Total_Count",
+        "Pallet_Count", "Is_Hidden", "Reason", "Emp_ID", "Created_At"
+    ],
+    "Booking Branch Moves": [
+        "Event_ID", "Wave_Number", "Branch_Code", "Previous_Booking", "Assigned_Booking",
+        "Reason", "Note", "Emp_ID", "Created_At"
+    ],
+    "Booking Branch Splits": [
+        "Event_ID", "Wave_Number", "Branch_Code", "Source_Booking", "Target_Booking",
+        "M_Count", "Red_Count", "Blue_Count", "Green_Count", "Black_Count", "Pallet_Count",
+        "Is_Active", "Reason", "Note", "Emp_ID", "Created_At"
+    ],
+    "Branch Close Status": [
+        "Event_ID", "Wave_Number", "Booking_No", "Branch_Code", "Branch_Name", "Status",
+        "M_Count", "Red_Count", "Blue_Count", "Green_Count", "Black_Count", "Total_Count",
+        "Pallet_Count", "Emp_ID", "Completed_At", "Created_At"
+    ],
+}
+uat_event_sheet_lock = Lock()
+uat_event_sheets_ready = False
+uat_event_cache = {}
+UAT_EVENT_CACHE_TTL_SECONDS = 15
+
 def get_sheets_session():
     session = getattr(_sheets_session_local, "session", None)
     if session is not None:
@@ -98,6 +134,86 @@ def get_sheets_session():
     session = AuthorizedSession(credentials)
     _sheets_session_local.session = session
     return session
+
+
+def _uat_now_iso() -> str:
+    return datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=7))).isoformat()
+
+
+def ensure_uat_event_sheets():
+    """Create UAT event-log tabs and headers once. Safe to call repeatedly."""
+    global uat_event_sheets_ready
+    if uat_event_sheets_ready:
+        return
+    with uat_event_sheet_lock:
+        if uat_event_sheets_ready:
+            return
+        session = get_sheets_session()
+        base = f"https://sheets.googleapis.com/v4/spreadsheets/{UAT_DATABASE_SPREADSHEET_ID}"
+        metadata = session.get(base, params={"fields": "sheets.properties(title)"}, timeout=SHEETS_HTTP_TIMEOUT)
+        metadata.raise_for_status()
+        existing = {str(item.get("properties", {}).get("title") or "") for item in metadata.json().get("sheets", [])}
+        missing = [name for name in UAT_EVENT_SHEETS if name not in existing]
+        if missing:
+            response = session.post(
+                f"{base}:batchUpdate",
+                json={"requests": [{"addSheet": {"properties": {"title": name}}} for name in missing]},
+                timeout=SHEETS_HTTP_TIMEOUT,
+            )
+            response.raise_for_status()
+        header_data = [
+            {"range": f"'{name}'!A1:{chr(64 + len(headers))}1", "values": [headers]}
+            for name, headers in UAT_EVENT_SHEETS.items()
+        ]
+        response = session.post(
+            f"{base}/values:batchUpdate",
+            json={"valueInputOption": "RAW", "data": header_data},
+            timeout=SHEETS_HTTP_TIMEOUT,
+        )
+        response.raise_for_status()
+        uat_event_sheets_ready = True
+
+
+def append_uat_event_rows(sheet_name: str, rows: list):
+    if not rows:
+        return
+    headers = UAT_EVENT_SHEETS[sheet_name]
+    ensure_uat_event_sheets()
+    values = [[row.get(header, "") for header in headers] for row in rows]
+    session = get_sheets_session()
+    encoded_range = urllib.parse.quote(f"'{sheet_name}'!A:{chr(64 + len(headers))}", safe="")
+    url = f"https://sheets.googleapis.com/v4/spreadsheets/{UAT_DATABASE_SPREADSHEET_ID}/values/{encoded_range}:append"
+    response = session.post(
+        url,
+        params={"valueInputOption": "USER_ENTERED", "insertDataOption": "INSERT_ROWS"},
+        json={"values": values},
+        timeout=SHEETS_HTTP_TIMEOUT,
+    )
+    response.raise_for_status()
+    uat_event_cache.pop(sheet_name, None)
+
+
+def read_uat_event_records(sheet_name: str, force: bool = False) -> list:
+    now = time.time()
+    cached = uat_event_cache.get(sheet_name)
+    if cached and not force and cached["expires_at"] > now:
+        return copy.deepcopy(cached["records"])
+    ensure_uat_event_sheets()
+    headers = UAT_EVENT_SHEETS[sheet_name]
+    rows = _sheet_values(get_sheets_session(), UAT_DATABASE_SPREADSHEET_ID, f"'{sheet_name}'!A:{chr(64 + len(headers))}")
+    records = []
+    for row in rows[1:]:
+        values = list(row) + [""] * max(0, len(headers) - len(row))
+        records.append(dict(zip(headers, values[:len(headers)])))
+    uat_event_cache[sheet_name] = {"records": records, "expires_at": now + UAT_EVENT_CACHE_TTL_SECONDS}
+    return copy.deepcopy(records)
+
+
+def scan_hold_error():
+    raise HTTPException(
+        status_code=423,
+        detail="UAT นี้ Hold ระบบสแกน LPN/Tote ชั่วคราว กรุณาใช้งานเฉพาะเมนูเอกสาร",
+    )
 
 def member_data_bu(owner) -> str:
     """แปลงรหัส BU จากข้อมูล Wave ให้เป็นชื่อที่หน้างานใช้ใน Member Data."""
@@ -228,16 +344,16 @@ BOOKING_WAVE_SHEET_GID = "499980322"
 booking_wave_sheet_cache = {"expires_at": 0.0, "bookings": {}, "waves": {}}
 booking_wave_sheet_lock = Lock()
 
-def load_booking_wave_sheet_meta() -> tuple:
+def load_booking_wave_sheet_meta(force: bool = False) -> tuple:
     now = time.time()
     with booking_wave_sheet_lock:
-        if booking_wave_sheet_cache["expires_at"] > now:
+        if not force and booking_wave_sheet_cache["expires_at"] > now:
             return booking_wave_sheet_cache["bookings"], booking_wave_sheet_cache["waves"]
 
     booking_map = {}
     wave_map = {}
     try:
-        tq = "SELECT K, L, Q, R WHERE K IS NOT NULL OR L IS NOT NULL"
+        tq = "SELECT K, L, P, Q, R WHERE K IS NOT NULL OR L IS NOT NULL"
         url = f"https://docs.google.com/spreadsheets/d/{BOOKING_WAVE_SHEET_ID}/gviz/tq?gid={BOOKING_WAVE_SHEET_GID}&tqx=out:json&tq={urllib.parse.quote(tq)}"
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
         with urllib.request.urlopen(req, timeout=10) as resp:
@@ -254,8 +370,9 @@ def load_booking_wave_sheet_meta() -> tuple:
                         return ""
                     b = get_val(0)
                     w = get_val(1)
-                    sender = get_val(2)
-                    plate = get_val(3)
+                    carrier = get_val(2)
+                    sender = get_val(3)
+                    plate = get_val(4)
 
                     waves = [str(int(x)) for x in re.findall(r"\b\d{5,}\b", w)]
                     clean_b = re.sub(r"\s+", "", b.upper())
@@ -265,6 +382,7 @@ def load_booking_wave_sheet_meta() -> tuple:
                     entry = {
                         "booking": clean_b,
                         "waves": waves,
+                        "carrier": carrier,
                         "sender": sender,
                         "plate": plate
                     }
@@ -325,62 +443,48 @@ def get_document_overrides_for_wave(wave_no: str) -> dict:
 
     overrides = {}
     try:
-        query = f"""
-            SELECT Branch_Code, M_Count, Red_Count, Blue_Count, Green_Count, Black_Count, Total_Count, Pallet_Count, Is_Hidden, Emp_ID, Updated_At
-            FROM `pro-analytics-db.logistics_db.wave_document_overrides`
-            WHERE SAFE_CAST(REGEXP_REPLACE(TRIM(CAST(Wave_Number AS STRING)), r'[^0-9]', '') AS INT64) = {int(clean_wave)}
-            ORDER BY Updated_At DESC
-        """
-        rows = list(client.query(query).result(timeout=BQ_JOB_TIMEOUT_SECONDS))
-        latest_reset_time = None
-        for r in rows:
-            if str(r["Branch_Code"]).strip().upper() == "RESET_ALL":
-                latest_reset_time = r["Updated_At"]
-                break
-
+        rows = [row for row in read_uat_event_records("Document Overrides")
+                if re.sub(r"\D", "", str(row.get("Wave_Number") or "")) == clean_wave]
         seen_branches = set()
-        for r in rows:
-            b = str(r["Branch_Code"]).strip().upper()
-            if not b or b == "RESET_ALL":
+        for row in reversed(rows):
+            action = str(row.get("Action") or "").strip().upper()
+            if action == "RESET_ALL" or str(row.get("Branch_Code") or "").strip().upper() == "RESET_ALL":
+                break
+            branch = str(row.get("Branch_Code") or "").strip().upper()
+            if not branch or branch in seen_branches:
                 continue
-            if latest_reset_time and r["Updated_At"] and r["Updated_At"] <= latest_reset_time:
-                continue
-            if b in seen_branches:
-                continue
-            # ก่อน v1.8.1 ยอด snapshot อัตโนมัติถูกเขียนปนกับยอดที่ผู้ใช้แก้จริง
-            # ใช้เฉพาะแถวที่มี marker ใหม่ เพื่อไม่ให้ยอดเก่าค้างทับผลสแกนในอนาคต
-            raw_emp_id = str(r["Emp_ID"] or "")
-            if not raw_emp_id.startswith(MANUAL_OVERRIDE_EMP_PREFIX):
-                continue
-            seen_branches.add(b)
-            overrides[b] = {
-                "m": r["M_Count"],
-                "red": r["Red_Count"],
-                "blue": r["Blue_Count"],
-                "green": r["Green_Count"],
-                "black": r["Black_Count"],
-                "total": r["Total_Count"],
-                "pallet": r["Pallet_Count"],
-                "is_hidden": bool(r["Is_Hidden"]),
-                "emp_id": raw_emp_id[len(MANUAL_OVERRIDE_EMP_PREFIX):],
-                "updated_at": r["Updated_At"].isoformat() if r["Updated_At"] else ""
+            seen_branches.add(branch)
+            overrides[branch] = {
+                "m": _history_int(row.get("M_Count")),
+                "red": _history_int(row.get("Red_Count")),
+                "blue": _history_int(row.get("Blue_Count")),
+                "green": _history_int(row.get("Green_Count")),
+                "black": _history_int(row.get("Black_Count")),
+                "total": _history_int(row.get("Total_Count")),
+                "pallet": _history_int(row.get("Pallet_Count")),
+                "is_hidden": str(row.get("Is_Hidden") or "").strip().lower() in ("1", "true", "yes"),
+                "emp_id": str(row.get("Emp_ID") or "").strip(),
+                "updated_at": str(row.get("Created_At") or "").strip(),
             }
         with document_overrides_lock:
             document_overrides_overlay[wave_key] = copy.deepcopy(overrides)
     except Exception as e:
-        print(f"⚠️ Error reading document overrides from BQ: {e}")
+        print(f"⚠️ Error reading document overrides from UAT Sheet: {e}")
     return overrides
 
-def record_document_overrides_to_bq(summaries: list, emp_id: str):
+def record_document_overrides(summaries: list, emp_id: str, reason: str = ""):
     if not summaries:
         return
-    now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    now_iso = _uat_now_iso()
     rows_to_insert = []
     for s in summaries:
         rows_to_insert.append({
+            "Event_ID": str(uuid.uuid4()),
+            "Action": "UPSERT",
             "Wave_Number": str(s["wave"]),
             "Booking_No": str(s.get("booking") or ""),
             "Branch_Code": str(s["branch"]).upper(),
+            "Branch_Name": str(s.get("branch_name") or ""),
             "M_Count": int(s.get("m", 0) or 0),
             "Red_Count": int(s.get("red", 0) or 0),
             "Blue_Count": int(s.get("blue", 0) or 0),
@@ -389,22 +493,20 @@ def record_document_overrides_to_bq(summaries: list, emp_id: str):
             "Total_Count": int(s.get("total", 0) or 0),
             "Pallet_Count": int(s.get("pallet", 0) or 0),
             "Is_Hidden": 1 if s.get("is_hidden") else 0,
-            # Marker แยกยอดที่ผู้ใช้ตั้งใจแก้ ออกจาก snapshot อัตโนมัติอย่างถาวร
-            "Emp_ID": f"{MANUAL_OVERRIDE_EMP_PREFIX}{str(emp_id or '').strip()}",
-            "Updated_At": now_iso
+            "Reason": str(reason or "").strip(),
+            "Emp_ID": str(emp_id or "").strip(),
+            "Created_At": now_iso,
         })
-    try:
-        table_ref = client.dataset("logistics_db").table("wave_document_overrides")
-        errors = client.insert_rows_json(table_ref, rows_to_insert)
-        if errors:
-            raise RuntimeError(f"BigQuery override insert errors: {errors}")
-        else:
-            print(f"✅ Saved {len(rows_to_insert)} document overrides to BigQuery")
-    except Exception as e:
-        print(f"⚠️ Exception saving document overrides to BQ: {e}")
-        raise
+    append_uat_event_rows("Document Overrides", rows_to_insert)
+    print(f"✅ Saved {len(rows_to_insert)} document overrides to UAT Sheet")
 
 def get_delivery_wave_meta(wave: str) -> dict:
+    if UAT_SHEETS_ONLY:
+        meta = get_sheet_meta_for_wave(wave)
+        return {
+            "pick_date": None,
+            "booking": str(meta.get("booking") or "").strip().upper(),
+        }
     query = """
         SELECT MAX(Planned_Pick_Date) AS planned_pick_date,
                COALESCE(MAX(NULLIF(TRIM(Vehicle_Booking_No), '')), '') AS booking_no
@@ -1019,6 +1121,30 @@ def merge_member_history(raw_data: dict, wave_no: str) -> dict:
     result["lpn_list"] = existing
     result["historical_summary_source"] = "Member Data"
     return result
+
+
+def build_uat_wave_data(wave_no: str) -> dict:
+    """Build the UAT document model entirely from Member Data + Booking & Wave Sheets."""
+    try:
+        wave = str(int(str(wave_no).strip()))
+    except ValueError:
+        raise HTTPException(status_code=400, detail="รหัส Wave ต้องเป็นตัวเลขเท่านั้น")
+    items = build_member_history_items(wave)
+    if not items:
+        raise HTTPException(status_code=404, detail=f"ไม่พบ Wave [{wave}] ใน Member Data")
+    meta = get_sheet_meta_for_wave(wave)
+    return {
+        "wave_no": f"{int(wave):010d}",
+        "booking_no": str(meta.get("booking") or "").strip().upper(),
+        "license_plate": str(meta.get("plate") or "").strip(),
+        "carrier": str(meta.get("carrier") or "").strip(),
+        "sender": str(meta.get("sender") or "").strip(),
+        "lpn_list": items,
+        "zone_summary": [],
+        "document_overrides": get_document_overrides_for_wave(wave),
+        "source": "Google Sheets UAT",
+        "scan_feature_enabled": False,
+    }
 
 DIRECT_QTY_PREFIXES = ("PP", "SP")
 PACK_CASE_MAP_PATH = os.path.join(os.path.dirname(__file__), "pack_case_map.json")
@@ -1881,6 +2007,13 @@ def fetch_wave_data_from_bq(search_wave_id: int) -> dict:
     }
 
 def get_wave_data_internal(wave_no: str, force_refresh: bool = False) -> dict:
+    if UAT_SHEETS_ONLY:
+        if force_refresh:
+            with member_history_lock:
+                member_history_cache["expires_at"] = 0.0
+            with booking_wave_sheet_lock:
+                booking_wave_sheet_cache["expires_at"] = 0.0
+        return build_uat_wave_data(wave_no)
     try:
         search_wave_id = int(wave_no.strip())
     except ValueError:
@@ -2006,6 +2139,16 @@ def get_valid_lpns_for_wave(wave_no: str) -> set:
 
 
 def fetch_booking_waves_from_bq(booking_no: str) -> dict:
+    if UAT_SHEETS_ONLY:
+        sheet_meta = get_sheet_meta_for_booking(booking_no)
+        if not sheet_meta or not sheet_meta.get("waves"):
+            raise HTTPException(status_code=404, detail=f"ไม่พบ Booking [{booking_no}] ใน Sheet Booking & Wave")
+        return {
+            "waves": list(sheet_meta.get("waves") or []),
+            "license_plate": str(sheet_meta.get("plate") or ""),
+            "carrier": str(sheet_meta.get("carrier") or ""),
+            "sender": str(sheet_meta.get("sender") or ""),
+        }
     clean_booking = booking_no.strip().upper()
     raw_booking = booking_no.strip()
     # ✅ ใช้ query parameters แทนการต่อสตริง (อุด SQL injection ผ่านเลข Booking)
@@ -2193,6 +2336,8 @@ def get_booking_data_internal(booking_no: str, force_refresh: bool = False) -> d
     return {
         "booking_no": booking_no,
         "license_plate": license_plate,
+        "carrier": str(mapping.get("carrier") or ""),
+        "sender": str(mapping.get("sender") or ""),
         "waves": list(waves_included),
         "lpn_list": lpn_list,
         "zone_summary": list(zones_calc.values()),
@@ -2331,13 +2476,7 @@ def ensure_booking_override_table():
     with booking_override_table_lock:
         if booking_override_table_ready:
             return
-        client.query("""
-            CREATE TABLE IF NOT EXISTS `pro-analytics-db.logistics_db.booking_branch_overrides` (
-                Event_ID STRING, Wave_Number STRING, Branch_Code STRING,
-                Previous_Booking STRING, Assigned_Booking STRING,
-                Reason STRING, Note STRING, Emp_ID STRING, Created_At TIMESTAMP
-            )
-        """).result(timeout=BQ_JOB_TIMEOUT_SECONDS)
+        ensure_uat_event_sheets()
         booking_override_table_ready = True
 
 def get_booking_branch_assignments(force_refresh: bool = False) -> dict:
@@ -2347,16 +2486,12 @@ def get_booking_branch_assignments(force_refresh: bool = False) -> dict:
             return copy.deepcopy(booking_assignments_cache["data"])
         try:
             ensure_booking_override_table()
-            rows = client.query("""
-                SELECT Wave_Number, Branch_Code, Previous_Booking, Assigned_Booking,
-                       Reason, Note, Emp_ID, Created_At
-                FROM `pro-analytics-db.logistics_db.booking_branch_overrides`
-                QUALIFY ROW_NUMBER() OVER (
-                    PARTITION BY TRIM(Wave_Number), UPPER(TRIM(Branch_Code))
-                    ORDER BY Created_At DESC, Event_ID DESC
-                ) = 1
-            """).result(timeout=BQ_JOB_TIMEOUT_SECONDS)
-            data = {(str(row["Wave_Number"]).strip(), str(row["Branch_Code"]).strip().upper()): dict(row.items()) for row in rows}
+            rows = read_uat_event_records("Booking Branch Moves", force=force_refresh)
+            data = {}
+            for row in reversed(rows):
+                key = (str(row.get("Wave_Number") or "").strip(), str(row.get("Branch_Code") or "").strip().upper())
+                if all(key) and key not in data:
+                    data[key] = row
             booking_assignments_cache.update({
                 "data": data,
                 "expires_at": time.time() + BOOKING_METADATA_CACHE_TTL_SECONDS,
@@ -2373,14 +2508,7 @@ def ensure_booking_split_table():
     with booking_split_table_lock:
         if booking_split_table_ready:
             return
-        client.query("""
-            CREATE TABLE IF NOT EXISTS `pro-analytics-db.logistics_db.booking_branch_splits` (
-                Event_ID STRING, Wave_Number STRING, Branch_Code STRING,
-                Source_Booking STRING, Target_Booking STRING,
-                M_Count INT64, Red_Count INT64, Blue_Count INT64, Green_Count INT64, Black_Count INT64,
-                Pallet_Count INT64, Is_Active BOOL, Reason STRING, Note STRING, Emp_ID STRING, Created_At TIMESTAMP
-            )
-        """).result(timeout=BQ_JOB_TIMEOUT_SECONDS)
+        ensure_uat_event_sheets()
         booking_split_table_ready = True
 
 def get_booking_branch_splits(force_refresh: bool = False) -> dict:
@@ -2390,15 +2518,13 @@ def get_booking_branch_splits(force_refresh: bool = False) -> dict:
             return copy.deepcopy(booking_splits_cache["data"])
         try:
             ensure_booking_split_table()
-            rows = client.query("""
-                SELECT * FROM `pro-analytics-db.logistics_db.booking_branch_splits`
-                QUALIFY ROW_NUMBER() OVER (
-                    PARTITION BY TRIM(Wave_Number), UPPER(TRIM(Branch_Code)), UPPER(TRIM(Target_Booking))
-                    ORDER BY Created_At DESC, Event_ID DESC
-                ) = 1
-            """).result(timeout=BQ_JOB_TIMEOUT_SECONDS)
-            data = {(str(row["Wave_Number"]).strip(), str(row["Branch_Code"]).strip().upper(),
-                     str(row["Target_Booking"]).strip().upper()): dict(row.items()) for row in rows}
+            rows = read_uat_event_records("Booking Branch Splits", force=force_refresh)
+            data = {}
+            for row in reversed(rows):
+                key = (str(row.get("Wave_Number") or "").strip(), str(row.get("Branch_Code") or "").strip().upper(),
+                       str(row.get("Target_Booking") or "").strip().upper())
+                if all(key) and key not in data:
+                    data[key] = row
             booking_splits_cache.update({
                 "data": data,
                 "expires_at": time.time() + BOOKING_METADATA_CACHE_TTL_SECONDS,
@@ -2412,7 +2538,13 @@ def get_booking_branch_splits(force_refresh: bool = False) -> dict:
 
 @app.get("/")
 async def read_root():
-    return {"status": "ok", "message": "Scanner API is running perfectly!"}
+    return {
+        "status": "ok",
+        "message": "Scanner API UAT is running",
+        "environment": APP_ENV,
+        "data_source": "google_sheets" if UAT_SHEETS_ONLY else "bigquery",
+        "scan_feature_enabled": SCAN_FEATURE_ENABLED,
+    }
 
 # ✅ Health Check Endpoint: ตอบสนองเร็ว <5ms สำหรับ keep-alive heartbeat
 @app.get("/api/health")
@@ -2420,9 +2552,18 @@ async def health_check(response: Response):
     # ⚡ Cache-Control: s-maxage=5 ทำให้ CDN/Render ตอบ health check ได้ทันที ไม่ต้อง round-trip ถึง Python
     response.headers["Cache-Control"] = "no-store"
     response.headers["Connection"] = "keep-alive"
-    return {"status": "ok", "version": "1.10.2", "timestamp": time.time()}
+    return {
+        "status": "ok", "version": "uat-sheets-1.0", "timestamp": time.time(),
+        "environment": APP_ENV,
+        "data_source": "google_sheets" if UAT_SHEETS_ONLY else "bigquery",
+        "scan_feature_enabled": SCAN_FEATURE_ENABLED,
+    }
 
 def sync_document_summary_reports(summaries: list):
+    if UAT_SHEETS_ONLY:
+        # UAT ห้ามแก้ Member Data / Delivery report ซึ่งเป็นข้อมูลใช้งานจริง
+        print(f"UAT report propagation skipped | summaries={len(summaries or [])}")
+        return
     # Automatic zero snapshots must not create report rows.
     # Intentional zero corrections may pass through to clear an existing row only.
     summaries = [normalize_report_summary(summary) for summary in summaries or []]
@@ -2500,8 +2641,8 @@ def save_document_summary(data: DocumentSummaryBatchData, background_tasks: Back
         persistent_items = normalized
         for item in persistent_items:
             item["allow_zero_update"] = True
-        # ยอดที่ผู้ใช้แก้ต้องลง BigQuery สำเร็จก่อนตอบกลับ เพื่อไม่ให้ขึ้นว่าบันทึกแล้วแต่หายหลัง restart
-        record_document_overrides_to_bq(copy.deepcopy(persistent_items), emp_id)
+        # UAT บันทึกหลักฐานลง Google Sheets ก่อนตอบกลับ เพื่อไม่ให้แจ้งสำเร็จทั้งที่ข้อมูลยังไม่ถูกเก็บ
+        record_document_overrides(copy.deepcopy(persistent_items), emp_id, data.reason or "")
         with document_overrides_lock:
             for item in persistent_items:
                 wave_ov = document_overrides_overlay.setdefault(item["wave"], {})
@@ -2537,9 +2678,11 @@ def reset_document_overrides(data: ResetDocumentOverridesData, background_tasks:
 
     waves_to_clear = list(dict.fromkeys(waves_to_clear))
     if waves_to_clear:
-        def tombstone_bq_overrides(waves, emp):
-            now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        def tombstone_sheet_overrides(waves, emp):
+            now_iso = _uat_now_iso()
             rows = [{
+                    "Event_ID": str(uuid.uuid4()),
+                    "Action": "RESET_ALL",
                     "Wave_Number": str(w),
                     "Booking_No": "",
                     "Branch_Code": "RESET_ALL",
@@ -2548,19 +2691,17 @@ def reset_document_overrides(data: ResetDocumentOverridesData, background_tasks:
                     "Blue_Count": 0,
                     "Green_Count": 0,
                     "Black_Count": 0,
-                    "Total_Count": -1,
+                    "Total_Count": 0,
                     "Pallet_Count": 0,
                     "Is_Hidden": 0,
-                    "Emp_ID": f"RESET_OVERRIDE|{str(emp or '').strip()}",
-                    "Updated_At": now_iso
+                    "Reason": "RESET_OVERRIDE",
+                    "Emp_ID": str(emp or "").strip(),
+                    "Created_At": now_iso,
                 } for w in waves]
-            table_ref = client.dataset("logistics_db").table("wave_document_overrides")
-            errors = client.insert_rows_json(table_ref, rows)
-            if errors:
-                raise RuntimeError(f"BigQuery reset override errors: {errors}")
-            print(f"✅ Tombstoned document overrides for waves {waves} in BigQuery")
+            append_uat_event_rows("Document Overrides", rows)
+            print(f"✅ Tombstoned document overrides for waves {waves} in UAT Sheet")
         # เช่นเดียวกับการแก้ยอด: reset ต้อง durable ก่อนจึงแจ้งว่าสำเร็จ
-        tombstone_bq_overrides(waves_to_clear, data.emp_id)
+        tombstone_sheet_overrides(waves_to_clear, data.emp_id)
         with document_overrides_lock:
             for w in waves_to_clear:
                 document_overrides_overlay[w] = {}
@@ -2581,6 +2722,14 @@ def get_transport_meta(booking: str):
     clean_booking = str(booking or "").strip().upper()
     if not clean_booking:
         return {"booking": "", "carrier": "", "driver": "", "plate": ""}
+    if UAT_SHEETS_ONLY:
+        meta = get_sheet_meta_for_booking(clean_booking)
+        return {
+            "booking": clean_booking,
+            "carrier": str(meta.get("carrier") or ""),
+            "driver": str(meta.get("sender") or ""),
+            "plate": str(meta.get("plate") or ""),
+        }
     session = get_sheets_session()
     cars, _ = load_delivery_lookup_maps(session)
     meta = cars.get(clean_booking) or {}
@@ -2773,23 +2922,11 @@ def move_booking_branch(data: BookingBranchMoveData):
         raise HTTPException(status_code=409, detail=f"สาขา {branch} อยู่ใน Booking {target} แล้ว")
     # ปลายทางต้องเป็น Booking จริงที่มีอยู่ เพื่อป้องกันพิมพ์ผิดแล้วสาขาหายจากเอกสาร
     get_booking_waves_mapping(target, force_refresh=True)
-    ensure_booking_override_table()
-    query = """
-        INSERT INTO `pro-analytics-db.logistics_db.booking_branch_overrides`
-        (Event_ID, Wave_Number, Branch_Code, Previous_Booking, Assigned_Booking, Reason, Note, Emp_ID, Created_At)
-        VALUES (@event_id, @wave, @branch, @previous, @target, @reason, @note, @emp_id, CURRENT_TIMESTAMP())
-    """
-    config = bigquery.QueryJobConfig(query_parameters=[
-        bigquery.ScalarQueryParameter("event_id", "STRING", str(uuid.uuid4())),
-        bigquery.ScalarQueryParameter("wave", "STRING", wave_clean),
-        bigquery.ScalarQueryParameter("branch", "STRING", branch),
-        bigquery.ScalarQueryParameter("previous", "STRING", previous),
-        bigquery.ScalarQueryParameter("target", "STRING", target),
-        bigquery.ScalarQueryParameter("reason", "STRING", reason),
-        bigquery.ScalarQueryParameter("note", "STRING", str(data.note or "").strip()),
-        bigquery.ScalarQueryParameter("emp_id", "STRING", emp_id),
-    ])
-    client.query(query, job_config=config).result(timeout=BQ_JOB_TIMEOUT_SECONDS)
+    append_uat_event_rows("Booking Branch Moves", [{
+        "Event_ID": str(uuid.uuid4()), "Wave_Number": wave_clean, "Branch_Code": branch,
+        "Previous_Booking": previous, "Assigned_Booking": target, "Reason": reason,
+        "Note": str(data.note or "").strip(), "Emp_ID": emp_id, "Created_At": _uat_now_iso(),
+    }])
     with booking_assignments_cache_lock:
         booking_assignments_cache["expires_at"] = 0.0
     with booking_waves_cache_lock:
@@ -2826,28 +2963,14 @@ def split_booking_branch(data: BookingBranchSplitData):
         if value > remaining:
             raise HTTPException(status_code=409, detail=f"ยอด {field} ที่แบ่ง ({value}) มากกว่ายอดคงเหลือ ({remaining})")
     get_booking_waves_mapping(target, force_refresh=True)
-    ensure_booking_split_table()
-    query = """
-        INSERT INTO `pro-analytics-db.logistics_db.booking_branch_splits`
-        (Event_ID, Wave_Number, Branch_Code, Source_Booking, Target_Booking,
-         M_Count, Red_Count, Blue_Count, Green_Count, Black_Count, Pallet_Count,
-         Is_Active, Reason, Note, Emp_ID, Created_At)
-        VALUES (@event_id, @wave, @branch, @source, @target,
-                @m, @red, @blue, @green, @black, @pallet,
-                TRUE, @reason, @note, @emp_id, CURRENT_TIMESTAMP())
-    """
-    params = [
-        bigquery.ScalarQueryParameter("event_id", "STRING", str(uuid.uuid4())),
-        bigquery.ScalarQueryParameter("wave", "STRING", wave_clean),
-        bigquery.ScalarQueryParameter("branch", "STRING", branch),
-        bigquery.ScalarQueryParameter("source", "STRING", source),
-        bigquery.ScalarQueryParameter("target", "STRING", target),
-        *[bigquery.ScalarQueryParameter(field, "INT64", requested[field]) for field in ("m", "red", "blue", "green", "black", "pallet")],
-        bigquery.ScalarQueryParameter("reason", "STRING", reason),
-        bigquery.ScalarQueryParameter("note", "STRING", str(data.note or "").strip()),
-        bigquery.ScalarQueryParameter("emp_id", "STRING", emp_id),
-    ]
-    client.query(query, job_config=bigquery.QueryJobConfig(query_parameters=params)).result(timeout=BQ_JOB_TIMEOUT_SECONDS)
+    append_uat_event_rows("Booking Branch Splits", [{
+        "Event_ID": str(uuid.uuid4()), "Wave_Number": wave_clean, "Branch_Code": branch,
+        "Source_Booking": source, "Target_Booking": target,
+        "M_Count": requested["m"], "Red_Count": requested["red"], "Blue_Count": requested["blue"],
+        "Green_Count": requested["green"], "Black_Count": requested["black"],
+        "Pallet_Count": requested["pallet"], "Is_Active": True, "Reason": reason,
+        "Note": str(data.note or "").strip(), "Emp_ID": emp_id, "Created_At": _uat_now_iso(),
+    }])
     with booking_splits_cache_lock:
         booking_splits_cache["expires_at"] = 0.0
     with booking_waves_cache_lock:
@@ -2871,6 +2994,8 @@ def split_booking_branch(data: BookingBranchSplitData):
 @app.post("/api/start-pallet")
 def start_pallet(data: PalletStartData):
     """Allocate one branch-wide pallet number so multiple handhelds cannot reuse the same number."""
+    if not SCAN_FEATURE_ENABLED:
+        scan_hold_error()
     wave_ids = {int(str(w).strip()) for w in data.waves if str(w).strip().isdigit()}
     if (data.booking_no or "").strip():
         try:
@@ -2942,6 +3067,8 @@ def start_pallet(data: PalletStartData):
 @app.post("/api/submit-pallet")
 def submit_pallet(data: PalletSubmitData):
     """Share a completed pallet with every handheld while keeping an auditable marker in BigQuery."""
+    if not SCAN_FEATURE_ENABLED:
+        scan_hold_error()
     wave_ids = {int(str(w).strip()) for w in data.waves if str(w).strip().isdigit()}
     if (data.booking_no or "").strip():
         try:
@@ -2996,6 +3123,8 @@ def decode_correction_audit(scan_type: str) -> Optional[dict]:
 
 @app.post("/api/correct-lpn")
 def correct_lpn(data: CorrectionData, background_tasks: BackgroundTasks):
+    if not SCAN_FEATURE_ENABLED:
+        scan_hold_error()
     try:
         wave_clean = str(int((data.wave_no or "").strip()))
     except ValueError:
@@ -3140,6 +3269,8 @@ def get_corrections(waves: str, branch: str, lpn: Optional[str] = None):
 # 🚀 [API 2] บันทึกข้อมูลสแกนทีละกล่อง
 @app.post("/api/scan")
 def process_scan(data: ScanData, background_tasks: BackgroundTasks):
+    if not SCAN_FEATURE_ENABLED:
+        scan_hold_error()
     try:
         wave_clean = str(int(data.wave_no))
     except ValueError:
@@ -3254,6 +3385,8 @@ def process_scan(data: ScanData, background_tasks: BackgroundTasks):
 # 🚀 [API 2.5] บันทึกข้อมูลสแกนเป็นชุด (Batch)
 @app.post("/api/scan-batch")
 def process_scan_batch(data: ScanBatchData, background_tasks: BackgroundTasks):
+    if not SCAN_FEATURE_ENABLED:
+        scan_hold_error()
     if not data.scans:
         return {"status": "success", "message": "No scans to process", "processed_count": 0}
 
@@ -3422,6 +3555,8 @@ def run_close_job_queries_in_background(wave_clean: str, branch: str, insert_zer
 # 🚀 [API 5] ปิดจบงานสาขา
 @app.post("/api/close-job")
 def close_job(data: CloseJobData, background_tasks: BackgroundTasks):
+    if not SCAN_FEATURE_ENABLED:
+        scan_hold_error()
     try:
         wave_clean = str(int(data.wave.strip()))
     except ValueError:
@@ -3546,6 +3681,35 @@ def member_history_status():
 
 
 def query_pending_waves_from_bigquery():
+    if UAT_SHEETS_ONLY:
+        def history_sort_key(row):
+            try:
+                return datetime.datetime.strptime(
+                    f"{str(row.get('date') or '').strip()} {str(row.get('time') or '').strip()}",
+                    "%d/%m/%Y %H:%M",
+                )
+            except ValueError:
+                return datetime.datetime.min
+
+        # Member Data อาจมี Wave เก่าที่กรอกเลขผิด จึงเรียงตามวัน/เวลาบันทึกจริง
+        # และคืนแต่ละ Wave เพียงครั้งเดียว แทนการเรียงจากเลข Wave อย่างเดียว
+        recent_rows = sorted(load_member_history().values(), key=history_sort_key, reverse=True)
+        wave_ids = []
+        seen = set()
+        for row in recent_rows:
+            wave = str(row.get("wave") or "").strip()
+            if not wave.isdigit() or wave in seen:
+                continue
+            seen.add(wave)
+            wave_ids.append(int(wave))
+            if len(wave_ids) >= 50:
+                break
+        return {
+            "success": True,
+            "waves": [{"wave_no": f"{wave_id:010d}"} for wave_id in wave_ids],
+            "cached": False,
+            "source": "Member Data",
+        }
     query = """
         WITH Waves AS (
             SELECT DISTINCT
@@ -3605,9 +3769,20 @@ def _startup_warm_cache():
     # โหลดประวัติกล่องจาก Member Data ไว้ล่วงหน้า ไม่ให้การค้นหา Wave แรกต้องรอ Google Sheet
     load_member_history()
 
+    if UAT_SHEETS_ONLY:
+        try:
+            load_booking_wave_sheet_meta(force=True)
+            ensure_uat_event_sheets()
+            print("✅ UAT Google Sheets data source ready")
+        except Exception as exc:
+            # ไม่ทำให้ Service ล้มตอนเริ่ม หากเพิ่งแชร์ Sheet หรือ API สะดุดชั่วคราว
+            print(f"⚠️ UAT Sheet setup skipped at startup: {exc}")
+
 
 def recover_recent_report_syncs():
     """Recover only closed/corrected branches; open scans must not trigger Sheet/BigQuery rebuilds."""
+    if UAT_SHEETS_ONLY:
+        return
     try:
         query = """
             SELECT DISTINCT

@@ -1,8 +1,8 @@
 services:
   - type: web
-    name: dc-scanner-api-nattapol
+    name: dc-scanner-api-uat-nattapol
     runtime: python
-    plan: standard
+    plan: free
     region: singapore
     buildCommand: pip install -r requirements.txt
     # ⚡ Standard Plan: 1 CPU dedicated
@@ -16,3 +16,9 @@ services:
         value: pro-analytics-db
       - key: GOOGLE_APPLICATION_CREDENTIALS
         value: /etc/secrets/bq-key.json
+      - key: APP_ENV
+        value: uat
+      - key: UAT_SHEETS_ONLY
+        value: "true"
+      - key: SCAN_FEATURE_ENABLED
+        value: "false"
