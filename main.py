@@ -3,6 +3,7 @@ from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel
 from typing import List, Optional       # ✅ แก้ไข #1: เพิ่ม Optional
 from google.cloud import bigquery
+import google.auth
 from google.auth.transport.requests import AuthorizedSession
 import csv
 import json
@@ -49,7 +50,13 @@ if not os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
     if os.path.exists(local_key_path):
         os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = local_key_path
 
-client = bigquery.Client(
+# UAT must not initialize a BigQuery client at all.  Google credentials are
+# loaded lazily by get_sheets_session() only when a Sheet operation is needed.
+APP_ENV = os.environ.get("APP_ENV", "uat").strip().lower()
+UAT_SHEETS_ONLY = os.environ.get("UAT_SHEETS_ONLY", "true").strip().lower() in ("1", "true", "yes", "on")
+SCAN_FEATURE_ENABLED = os.environ.get("SCAN_FEATURE_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
+
+client = None if UAT_SHEETS_ONLY else bigquery.Client(
     project=os.environ.get("GOOGLE_CLOUD_PROJECT", "pro-analytics-db")
 )
 
@@ -61,9 +68,6 @@ BQ_JOB_TIMEOUT_SECONDS = 45
 QC_FEATURE_ENABLED = False
 
 # UAT Google Sheets migration. Production code lives in a separate worktree/branch.
-APP_ENV = os.environ.get("APP_ENV", "uat").strip().lower()
-UAT_SHEETS_ONLY = os.environ.get("UAT_SHEETS_ONLY", "true").strip().lower() in ("1", "true", "yes", "on")
-SCAN_FEATURE_ENABLED = os.environ.get("SCAN_FEATURE_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
 
 NUMERIC_BRANCH_MASTER_SPREADSHEET_ID = "1zI5YAq0JvlM-WsaCfDVYVZgiCn5pWx_HVJjQMiTFwoI"
 NUMERIC_BRANCH_MASTER_SHEET_NAME = "Master"
@@ -128,9 +132,13 @@ def get_sheets_session():
     session = getattr(_sheets_session_local, "session", None)
     if session is not None:
         return session
-    credentials = client._credentials
-    if hasattr(credentials, "with_scopes"):
-        credentials = credentials.with_scopes(["https://www.googleapis.com/auth/spreadsheets"])
+    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+    if client is not None:
+        credentials = client._credentials
+        if hasattr(credentials, "with_scopes"):
+            credentials = credentials.with_scopes(scopes)
+    else:
+        credentials, _ = google.auth.default(scopes=scopes)
     session = AuthorizedSession(credentials)
     _sheets_session_local.session = session
     return session
