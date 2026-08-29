@@ -1,19 +1,15 @@
 services:
   - type: web
-    name: dc-scanner-api-uat-nattapol
+    name: backed-api-scan-uat
     runtime: python
     plan: free
     region: singapore
+    branch: main
     buildCommand: pip install -r requirements.txt
-    # ⚡ Standard Plan: 1 CPU dedicated
-    # Standard มี 1 CPU: ใช้ async worker เดียวเพื่อให้ cache/คิวซิงก์ยอดเป็นชุดเดียวกันทุก request
-    # FastAPI ยังรองรับหลาย Handheld พร้อมกันผ่าน async + threadpool โดยไม่แบ่ง state เป็นคนละ process
     startCommand: gunicorn main:app -w 1 -k uvicorn.workers.UvicornWorker --worker-connections 1000 --bind 0.0.0.0:$PORT --timeout 120 --keep-alive 5
     healthCheckPath: /api/health
     autoDeploy: true
     envVars:
-      - key: GOOGLE_CLOUD_PROJECT
-        value: pro-analytics-db
       - key: GOOGLE_APPLICATION_CREDENTIALS
         value: /etc/secrets/bq-key.json
       - key: APP_ENV
@@ -22,3 +18,5 @@ services:
         value: "true"
       - key: SCAN_FEATURE_ENABLED
         value: "false"
+      - key: UAT_DATABASE_SPREADSHEET_ID
+        value: 1RJcsrbWnGO7gMiq9bhBR4bA9Twh1NjqP6816dXOW9DI
