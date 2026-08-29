@@ -1987,7 +1987,11 @@ def fetch_wave_data_from_bq(search_wave_id: int) -> dict:
             "branch_pallet_nos": list(row["branch_pallet_nos"] or []),
             "pallet_color": row["pallet_color"] or "",
             "branch_submitted_pallet_nos": list(row["branch_submitted_pallet_nos"] or []),
-            "branch_closed_at": row["branch_closed_at"].isoformat() if row["branch_closed_at"] else "",
+            "branch_closed_at": (
+                row["branch_closed_at"].isoformat()
+                if row["branch_closed_at"] and hasattr(row["branch_closed_at"], "isoformat")
+                else str(row["branch_closed_at"] or "")
+            ),
             "branch_closed_by": row["branch_closed_by"] or "",
             # 🔒 QC_FEATURE_ENABLED=False → hold QC, เปลี่ยนเป็น True เมื่อเปิดใช้งาน
             "qc_required": bool(row["qc_required"]) and QC_FEATURE_ENABLED,
@@ -2288,7 +2292,11 @@ def get_booking_data_internal(booking_no: str, force_refresh: bool = False) -> d
                         "assigned_booking": assigned_booking,
                         "reason": assignment.get("Reason") or "",
                         "emp_id": assignment.get("Emp_ID") or "",
-                        "created_at": assignment.get("Created_At").isoformat() if assignment.get("Created_At") else ""
+                        "created_at": (
+                            assignment.get("Created_At").isoformat()
+                            if assignment.get("Created_At") and hasattr(assignment.get("Created_At"), "isoformat")
+                            else str(assignment.get("Created_At") or "")
+                        )
                     }
                     lpn_list.append(item)
                 continue
