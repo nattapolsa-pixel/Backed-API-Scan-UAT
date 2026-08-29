@@ -415,18 +415,18 @@ def load_booking_wave_sheet_meta(force: bool = False) -> tuple:
 
     return booking_map, wave_map
 
-def get_sheet_meta_for_wave(wave_no: str) -> dict:
+def get_sheet_meta_for_wave(wave_no: str, force: bool = False) -> dict:
     clean_wave = re.sub(r"\D", "", str(wave_no or ""))
     if not clean_wave:
         return {}
-    _, wave_map = load_booking_wave_sheet_meta()
+    _, wave_map = load_booking_wave_sheet_meta(force=force)
     return wave_map.get(str(int(clean_wave))) or {}
 
-def get_sheet_meta_for_booking(booking_no: str) -> dict:
+def get_sheet_meta_for_booking(booking_no: str, force: bool = False) -> dict:
     clean_b = re.sub(r"\s+", "", str(booking_no or "").upper())
     if not clean_b:
         return {}
-    booking_map, _ = load_booking_wave_sheet_meta()
+    booking_map, _ = load_booking_wave_sheet_meta(force=force)
     compact = clean_b.replace("-", "")
     raw_num = re.sub(r"^B0*1*", "", compact)
     return booking_map.get(clean_b) or booking_map.get(compact) or booking_map.get(raw_num) or booking_map.get(f"B001-{raw_num}") or {}
@@ -2152,7 +2152,7 @@ def get_valid_lpns_for_wave(wave_no: str) -> set:
 
 def fetch_booking_waves_from_bq(booking_no: str) -> dict:
     if UAT_SHEETS_ONLY:
-        sheet_meta = get_sheet_meta_for_booking(booking_no)
+        sheet_meta = get_sheet_meta_for_booking(booking_no, force=True)
         if not sheet_meta or not sheet_meta.get("waves"):
             raise HTTPException(status_code=404, detail=f"ไม่พบ Booking [{booking_no}] ใน Sheet Booking & Wave")
         return {
@@ -2831,6 +2831,10 @@ def clear_device_states(data: DeviceStateData):
 @app.get("/api/check-wave")
 def check_wave(wave_no: str, force: bool = False):
     try:
+        # UAT ใช้ Google Sheet เป็น source of truth: ทุกการค้นหาใหม่ต้องล้าง
+        # mapping เดิมหนึ่งครั้ง เพื่อไม่ให้เลข Booking เก่าค้างหลังแก้ Sheet
+        if UAT_SHEETS_ONLY:
+            force = True
         # Load wave data (either from cache or by querying BigQuery if not cached)
         try:
             raw_data = get_wave_data_internal(wave_no, force_refresh=force)
@@ -2855,6 +2859,8 @@ def check_wave(wave_no: str, force: bool = False):
 @app.get("/api/check-booking")
 def check_booking(booking_no: str, force: bool = False):
     try:
+        if UAT_SHEETS_ONLY:
+            force = True
         booking_data = get_booking_data_internal(booking_no, force_refresh=force)
         return booking_data
     except HTTPException:
