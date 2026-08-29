@@ -217,6 +217,27 @@ def read_uat_event_records(sheet_name: str, force: bool = False) -> list:
     return copy.deepcopy(records)
 
 
+INVALID_BRANCH_STRINGS = {
+    "", "-", "NONE", "NULL", "UNKNOWN", "FALSE", "TRUE",
+    "#N/A", "#REF!", "#VALUE!", "#NAME?", "#DIV/0!", "#NUM!", "#NULL!", "N/A"
+}
+
+def _is_valid_wave_branch(wave_val, branch_val) -> bool:
+    """Check whether a row contains a valid, non-error Wave number and Branch code."""
+    wave_digits = re.sub(r"\D", "", str(wave_val or ""))
+    branch_clean = str(branch_val or "").strip().upper()
+    if not wave_digits or not branch_clean:
+        return False
+    if branch_clean in INVALID_BRANCH_STRINGS:
+        return False
+    try:
+        if int(wave_digits) <= 0:
+            return False
+    except ValueError:
+        return False
+    return True
+
+
 def scan_hold_error():
     raise HTTPException(
         status_code=423,
@@ -252,11 +273,13 @@ def write_member_history_summaries(summaries: list):
         last_data_row = 1
         for index in range(len(values), 1, -1):
             row = list(values[index - 1]) + [""] * max(0, 4 - len(values[index - 1]))
-            wave_digits = re.sub(r"\D", "", str(row[2] or ""))
-            branch_code = str(row[3] or "").strip().upper()
-            if (wave_digits or branch_code) and index > last_data_row:
-                last_data_row = index
-            if wave_digits and branch_code:
+            wave_raw = row[2] if len(row) > 2 else ""
+            branch_raw = row[3] if len(row) > 3 else ""
+            if _is_valid_wave_branch(wave_raw, branch_raw):
+                if index > last_data_row:
+                    last_data_row = index
+                wave_digits = re.sub(r"\D", "", str(wave_raw or ""))
+                branch_code = str(branch_raw or "").strip().upper()
                 key = (str(int(wave_digits)), branch_code)
                 if key not in existing_map:
                     existing_map[key] = index
@@ -562,13 +585,15 @@ def write_delivery_report_summaries(summaries: list):
             last_data_row = 1
             for index in range(len(existing), 1, -1):
                 row = list(existing[index - 1]) + [""] * max(0, 22 - len(existing[index - 1]))
-                row_wave = re.sub(r"\D", "", str(row[2] or ""))
-                row_branch = str(row[3] or "").strip().upper()
+                row_wave = row[2] if len(row) > 2 else ""
+                row_branch = row[3] if len(row) > 3 else ""
                 row_booking = str(row[18] or "").strip().upper()
-                if (row_wave or row_branch) and index > last_data_row:
-                    last_data_row = index
-                if row_wave and row_branch:
-                    wave_branch = (str(int(row_wave)), row_branch)
+                if _is_valid_wave_branch(row_wave, row_branch):
+                    if index > last_data_row:
+                        last_data_row = index
+                    wave_digits = re.sub(r"\D", "", str(row_wave or ""))
+                    branch_clean = str(row_branch or "").strip().upper()
+                    wave_branch = (str(int(wave_digits)), branch_clean)
                     exact_key = (row_booking, *wave_branch)
                     existing_map.setdefault(exact_key, index)
                     existing_map.setdefault(("", *wave_branch), index)
