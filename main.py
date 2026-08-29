@@ -26,7 +26,7 @@ from fastapi.middleware.cors import CORSMiddleware
 app = FastAPI()
 
 # ✅ GZip Compression: ลด payload size สำหรับ response ขนาดใหญ่ (Wave data)
-app.add_middleware(GZipMiddleware, minimum_size=1000)
+app.add_middleware(GZipMiddleware, minimum_size=512)  # ✅ Standard: compress aggressively from 512 bytes
 
 # ✅ จำกัด CORS: อนุญาตเฉพาะหน้าเว็บบน GitHub Pages (*.github.io) + localhost สำหรับทดสอบ
 #    ถ้าใช้โดเมนอื่น (custom domain) ให้เพิ่ม origin นั้นใน ALLOWED_ORIGINS ด้วย
@@ -60,8 +60,8 @@ client = None if UAT_SHEETS_ONLY else bigquery.Client(
     project=os.environ.get("GOOGLE_CLOUD_PROJECT", "pro-analytics-db")
 )
 
-# ✅ BigQuery Job Timeout: Standard Plan → เพิ่มเป็น 45 วินาที (ไม่มีปัญหา cold start อีกต่อไป)
-BQ_JOB_TIMEOUT_SECONDS = 45
+# ✅ BigQuery Job Timeout: Standard Plan 1 CPU + 2 GB RAM → 60 วินาที
+BQ_JOB_TIMEOUT_SECONDS = 60
 
 # 🔒 QC Feature Toggle: ตั้ง False เพื่อ Hold ระบบ QC ไว้ก่อน
 #    เปลี่ยนเป็น True เมื่อต้องการเปิดใช้งานระบบ QC
@@ -94,8 +94,8 @@ DELIVERY_BRANCH_SHEET_NAME = "Sheet3"
 delivery_report_lock = Lock()
 delivery_lookup_cache = {"expires_at": 0.0, "cars": {}, "branches": {}}
 delivery_report_row_cache = {"expires_at": 0.0, "existing_map": {}, "last_data_row": 1}
-SHEET_ROW_CACHE_TTL_SECONDS = 5 * 60
-SHEETS_HTTP_TIMEOUT = (5, 30)
+SHEET_ROW_CACHE_TTL_SECONDS = 10 * 60  # ✅ Standard: เพิ่ม cache row เป็น 10 นาที ลด API round-trips
+SHEETS_HTTP_TIMEOUT = (3, 45)           # ✅ Standard: connect 3s (เร็วกว่า), read 45s (รองรับ large sheet)
 _sheets_session_local = threading.local()
 
 # ฐานข้อมูลเหตุการณ์ของ UAT (แทนตาราง BigQuery ที่เคยรับข้อมูลเขียนจากหน้าเว็บ)
@@ -126,7 +126,7 @@ UAT_EVENT_SHEETS = {
 uat_event_sheet_lock = Lock()
 uat_event_sheets_ready = False
 uat_event_cache = {}
-UAT_EVENT_CACHE_TTL_SECONDS = 15
+UAT_EVENT_CACHE_TTL_SECONDS = 30  # ✅ Standard: UAT event cache 30s เพื่อลด Sheets API calls
 
 def get_sheets_session():
     session = getattr(_sheets_session_local, "session", None)
