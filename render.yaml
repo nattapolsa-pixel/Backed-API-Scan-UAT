@@ -2,11 +2,11 @@ services:
   - type: web
     name: backed-api-scan-uat
     runtime: python
-    plan: free
+    plan: standard
     region: singapore
     branch: main
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn main:app -w 1 -k uvicorn.workers.UvicornWorker --worker-connections 1000 --bind 0.0.0.0:$PORT --timeout 120 --keep-alive 5
+    startCommand: gunicorn main:app -w 3 -k uvicorn.workers.UvicornWorker --worker-connections 2000 --backlog 2048 --bind 0.0.0.0:$PORT --timeout 90 --keep-alive 10 --graceful-timeout 30
     healthCheckPath: /api/health
     autoDeploy: true
     envVars:
