@@ -3015,13 +3015,77 @@ async def health_check(response: Response):
     # ⚡ Cache-Control: s-maxage=5 ทำให้ CDN/Render ตอบ health check ได้ทันที ไม่ต้อง round-trip ถึง Python
     response.headers["Cache-Control"] = "no-store"
     response.headers["Connection"] = "keep-alive"
+    # ตรวจสอบสถานะ Google credentials
+    creds_source = "none"
+    creds_ok = False
+    creds_error = None
+    try:
+        if os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip():
+            creds_source = "GOOGLE_SERVICE_ACCOUNT_JSON"
+        elif os.path.exists(os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "")):
+            creds_source = f"file:{os.environ.get('GOOGLE_APPLICATION_CREDENTIALS')}"
+        else:
+            creds_source = "default_adc"
+        get_sheets_session()
+        creds_ok = True
+    except Exception as e:
+        creds_error = str(e)[:200]
     return {
         "status": "ok", "version": APP_VERSION, "timestamp": time.time(),
         "environment": APP_ENV,
         "data_source": "google_sheets" if UAT_SHEETS_ONLY else "bigquery",
         "legacy_transport_workbook": "read_only",
         "scan_feature_enabled": SCAN_FEATURE_ENABLED,
+        "google_credentials": {
+            "source": creds_source,
+            "ok": creds_ok,
+            "error": creds_error,
+        },
     }
+
+
+@app.get("/api/test-sheets-write")
+def test_sheets_write():
+    """ทดสอบการเขียน Google Sheets จริงๆ — ใช้สำหรับ debug เท่านั้น"""
+    results = {}
+    # ทดสอบ auth
+    try:
+        session = get_sheets_session()
+        results["auth"] = "ok"
+    except Exception as e:
+        results["auth"] = f"FAIL: {e}"
+        return {"success": False, "results": results}
+    # ทดสอบ read Member Data
+    try:
+        lookup_range = urllib.parse.quote("Member Data!A1:D3", safe="")
+        read_res = session.get(
+            f"https://sheets.googleapis.com/v4/spreadsheets/{MEMBER_HISTORY_SPREADSHEET_ID}/values/{lookup_range}",
+            timeout=SHEETS_HTTP_TIMEOUT
+        )
+        read_res.raise_for_status()
+        results["member_data_read"] = f"ok ({len(read_res.json().get('values', []))} rows)"
+    except Exception as e:
+        results["member_data_read"] = f"FAIL: {e}"
+    # ทดสอบ read UAT Report
+    try:
+        lookup_range = urllib.parse.quote(f"'{UAT_REPORT_TEST_SHEET_NAME}'!A1:D3", safe="")
+        read_res = session.get(
+            f"https://sheets.googleapis.com/v4/spreadsheets/{UAT_REPORT_TEST_SPREADSHEET_ID}/values/{lookup_range}",
+            timeout=SHEETS_HTTP_TIMEOUT
+        )
+        read_res.raise_for_status()
+        results["uat_report_read"] = f"ok ({len(read_res.json().get('values', []))} rows)"
+    except Exception as e:
+        results["uat_report_read"] = f"FAIL: {e}"
+    return {
+        "success": all("FAIL" not in str(v) for v in results.values()),
+        "spreadsheets": {
+            "member_data": f"https://docs.google.com/spreadsheets/d/{MEMBER_HISTORY_SPREADSHEET_ID}",
+            "uat_report": f"https://docs.google.com/spreadsheets/d/{UAT_REPORT_TEST_SPREADSHEET_ID}",
+        },
+        "results": results
+    }
+
 
 
 @app.get("/api/branch-provinces")
