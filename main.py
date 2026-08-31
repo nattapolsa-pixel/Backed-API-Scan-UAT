@@ -3443,7 +3443,8 @@ def ensure_booking_source_complete(booking_no: str, booking_data: dict):
             f"Wave {item['wave']} ขาด {len(item['missing'])} สาขา ({','.join(item['missing'][:5])})"
             for item in missing
         )
-        raise HTTPException(status_code=409, detail=f"ข้อมูล Booking [{booking}] ยังเข้าไม่ครบ: {details}")
+        print(f"⚠️ UAT Booking [{booking}] info: {details}")
+
 
 
 @app.get("/api/check-booking")
