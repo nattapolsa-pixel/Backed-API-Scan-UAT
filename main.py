@@ -4,6 +4,7 @@ from pydantic import BaseModel
 from typing import List, Optional       # ✅ แก้ไข #1: เพิ่ม Optional
 from google.cloud import bigquery
 import google.auth
+from google.oauth2 import service_account
 from google.auth.transport.requests import AuthorizedSession
 import csv
 import json
@@ -53,7 +54,7 @@ if not os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
 # UAT must not initialize a BigQuery client at all.  Google credentials are
 # loaded lazily by get_sheets_session() only when a Sheet operation is needed.
 APP_ENV = os.environ.get("APP_ENV", "uat").strip().lower()
-APP_VERSION = os.environ.get("APP_VERSION", "1.2.0-uat").strip()
+APP_VERSION = os.environ.get("APP_VERSION", "1.2.1-uat").strip()
 UAT_SHEETS_ONLY = os.environ.get("UAT_SHEETS_ONLY", "true").strip().lower() in ("1", "true", "yes", "on")
 SCAN_FEATURE_ENABLED = os.environ.get("SCAN_FEATURE_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
 
@@ -162,7 +163,12 @@ def get_sheets_session():
     if session is not None:
         return session
     scopes = ["https://www.googleapis.com/auth/spreadsheets"]
-    if client is not None:
+    credentials_json = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+    if credentials_json:
+        credentials = service_account.Credentials.from_service_account_info(
+            json.loads(credentials_json), scopes=scopes
+        )
+    elif client is not None:
         credentials = client._credentials
         if hasattr(credentials, "with_scopes"):
             credentials = credentials.with_scopes(scopes)
