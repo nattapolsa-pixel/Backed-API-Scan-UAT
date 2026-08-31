@@ -94,6 +94,8 @@ DELIVERY_CAR_SHEET_NAME = "Data Booking&Car"
 DELIVERY_BRANCH_SHEET_NAME = "Sheet3"
 delivery_report_lock = Lock()
 delivery_lookup_cache = {"expires_at": 0.0, "cars": {}, "branches": {}}
+branch_province_cache = {"expires_at": 0.0, "data": {}}
+branch_province_refresh_lock = Lock()
 delivery_report_row_cache = {"expires_at": 0.0, "existing_map": {}, "last_data_row": 1}
 SHEET_ROW_CACHE_TTL_SECONDS = 10 * 60  # ✅ Standard: เพิ่ม cache row เป็น 10 นาที ลด API round-trips
 SHEETS_HTTP_TIMEOUT = (3, 45)           # ✅ Standard: connect 3s (เร็วกว่า), read 45s (รองรับ large sheet)
@@ -379,6 +381,36 @@ def load_delivery_lookup_maps(session) -> tuple:
                 branches[code] = {"province": str(row[3] or "").strip(), "region": str(row[5] or "").strip()}
         delivery_lookup_cache.update({"expires_at": now + 600, "cars": cars, "branches": branches})
         return cars, branches
+
+
+def load_branch_province_map(session, force: bool = False) -> dict:
+    now = time.time()
+    if not force and branch_province_cache["expires_at"] > now:
+        return copy.deepcopy(branch_province_cache["data"])
+
+    with branch_province_refresh_lock:
+        now = time.time()
+        if not force and branch_province_cache["expires_at"] > now:
+            return copy.deepcopy(branch_province_cache["data"])
+
+        rows = _sheet_values(
+            session,
+            DELIVERY_REPORT_SPREADSHEET_ID,
+            f"'{DELIVERY_BRANCH_SHEET_NAME}'!A:D",
+        )
+        province_map = {}
+        for row in rows[1:]:
+            row = list(row) + [""] * max(0, 4 - len(row))
+            code = str(row[0] or "").strip().upper()
+            province = str(row[3] or "").strip()
+            if code and province:
+                province_map[code] = province
+
+        branch_province_cache.update({
+            "expires_at": time.time() + 600,
+            "data": province_map,
+        })
+        return copy.deepcopy(province_map)
 
 BOOKING_WAVE_SHEET_ID = "1jOnJnnwlWZ491FEAFXAMgc7BftssHZcZp8x17LOQj6k"
 BOOKING_WAVE_SHEET_GID = "499980322"
@@ -2630,17 +2662,8 @@ async def health_check(response: Response):
 @app.get("/api/branch-provinces")
 def get_branch_provinces(force: bool = False):
     """Serve the branch master using authenticated Google Sheets access."""
-    if force:
-        with delivery_report_lock:
-            delivery_lookup_cache["expires_at"] = 0.0
-
     session = get_sheets_session()
-    _, branches = load_delivery_lookup_maps(session)
-    province_map = {
-        str(code).strip().upper(): str(meta.get("province") or "").strip()
-        for code, meta in branches.items()
-        if str(code).strip() and str(meta.get("province") or "").strip()
-    }
+    province_map = load_branch_province_map(session, force=force)
     return {
         "success": True,
         "source": DELIVERY_BRANCH_SHEET_NAME,
