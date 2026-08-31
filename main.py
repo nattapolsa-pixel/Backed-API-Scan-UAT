@@ -3260,8 +3260,23 @@ def check_wave(wave_no: str, force: bool = False):
 @app.get("/api/check-booking")
 def check_booking(booking_no: str, force: bool = False):
     try:
-        booking_data = get_booking_data_internal(booking_no, force_refresh=force)
-        return booking_data
+        try:
+            return get_booking_data_internal(booking_no, force_refresh=force)
+        except HTTPException as first_error:
+            if not UAT_SHEETS_ONLY or first_error.status_code != 404:
+                raise
+            # Member Data is populated progressively. Re-read one consistent
+            # snapshot before declaring a multi-Wave Booking incomplete.
+            time.sleep(1.0)
+            try:
+                return get_booking_data_internal(booking_no, force_refresh=True)
+            except HTTPException as retry_error:
+                if retry_error.status_code == 404:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f"ข้อมูล Booking [{booking_no.strip().upper()}] ยังเข้า Member Data ไม่ครบ กรุณารอสักครู่แล้วค้นหาใหม่",
+                    )
+                raise
     except HTTPException:
         raise
     except Exception as e:
