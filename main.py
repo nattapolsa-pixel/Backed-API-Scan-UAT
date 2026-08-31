@@ -2684,8 +2684,8 @@ def get_booking_data_internal(booking_no: str, force_refresh: bool = False) -> d
         load_member_history()
         load_booking_wave_sheet_meta(force=True)
         wave_force_refresh = False
-    assignments = get_booking_branch_assignments()
-    splits = get_booking_branch_splits()
+    assignments = get_booking_branch_assignments(force_refresh=force_refresh)
+    splits = get_booking_branch_splits(force_refresh=force_refresh)
     override_waves = [wave for (wave, branch), move in assignments.items()
                       if str(move.get("Assigned_Booking") or "").strip().upper() == booking_clean]
     split_waves = [wave for (wave, branch, target), split in splits.items()
