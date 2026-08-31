@@ -54,7 +54,7 @@ if not os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
 # UAT must not initialize a BigQuery client at all.  Google credentials are
 # loaded lazily by get_sheets_session() only when a Sheet operation is needed.
 APP_ENV = os.environ.get("APP_ENV", "uat").strip().lower()
-APP_VERSION = os.environ.get("APP_VERSION", "1.2.3-uat").strip()
+APP_VERSION = os.environ.get("APP_VERSION", "1.2.4-uat").strip()
 UAT_SHEETS_ONLY = os.environ.get("UAT_SHEETS_ONLY", "true").strip().lower() in ("1", "true", "yes", "on")
 SCAN_FEATURE_ENABLED = os.environ.get("SCAN_FEATURE_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
 
@@ -721,6 +721,8 @@ def get_document_overrides_for_wave(wave_no: str) -> dict:
                 "is_hidden": str(row.get("Is_Hidden") or "").strip().lower() in ("1", "true", "yes"),
                 "emp_id": str(row.get("Emp_ID") or "").strip(),
                 "updated_at": str(row.get("Created_At") or "").strip(),
+                "branch_name": str(row.get("Branch_Name") or branch).strip(),
+                "booking": str(row.get("Booking_No") or "").strip().upper(),
             }
         with document_overrides_lock:
             document_overrides_overlay[wave_key] = copy.deepcopy(overrides)
@@ -1536,6 +1538,36 @@ def build_uat_wave_data(wave_no: str) -> dict:
     except ValueError:
         raise HTTPException(status_code=400, detail="รหัส Wave ต้องเป็นตัวเลขเท่านั้น")
     items = build_member_history_items(wave)
+    overrides = get_document_overrides_for_wave(wave)
+    existing_branches = {str(item.get("branch") or "").strip().upper() for item in items}
+    # A manual correction is durable UAT source data too.  Do not make the
+    # document disappear (or snap back) merely because Member Data is delayed
+    # or temporarily unreadable.
+    for branch, override in overrides.items():
+        if branch in existing_branches or bool(override.get("is_hidden")):
+            continue
+        values = [("M", "None", "Carton", "m"), ("RED", "Red", "TOTE", "red"),
+                  ("BLUE", "Blue", "TOTE", "blue"), ("GREEN", "Green", "TOTE", "green"),
+                  ("BLACK", "Black", "TOTE", "black")]
+        for category, color, scan_type, field in values:
+            qty = _history_int(override.get(field))
+            if qty <= 0:
+                continue
+            items.append({
+                "lpn": f"OVERRIDE-{wave}-{branch}-{category}", "zone": "OVERRIDE",
+                "branch": branch,
+                "branch_name": str(override.get("branch_name") or branch),
+                "status": "Scanned", "total_qty": qty, "qty": qty,
+                "scan_type": scan_type, "owner": str(override.get("bu") or "Unknown"),
+                "color": color, "color_breakdown": [{"color": color, "qty": qty, "type": scan_type}],
+                "pallet_breakdown": [], "pallet_no": 0,
+                "branch_pallet_nos": list(range(1, _history_int(override.get("pallet")) + 1)),
+                "pallet_color": "", "branch_submitted_pallet_nos": [],
+                "branch_closed_at": str(override.get("updated_at") or ""),
+                "branch_closed_by": str(override.get("emp_id") or "Manual override"),
+                "wave_no": f"{int(wave):010d}", "historical_summary": True,
+                "historical_label_count": _history_int(override.get("label_count")),
+            })
     if not items:
         raise HTTPException(status_code=404, detail=f"ไม่พบ Wave [{wave}] ใน Member Data")
     meta = get_sheet_meta_for_wave(wave)
@@ -1547,7 +1579,7 @@ def build_uat_wave_data(wave_no: str) -> dict:
         "sender": str(meta.get("sender") or "").strip(),
         "lpn_list": items,
         "zone_summary": [],
-        "document_overrides": get_document_overrides_for_wave(wave),
+        "document_overrides": overrides,
         "source": "Google Sheets UAT",
         "scan_feature_enabled": False,
     }
@@ -3109,6 +3141,10 @@ def save_document_summary(data: DocumentSummaryBatchData, background_tasks: Back
                     "is_hidden": bool(item.get("is_hidden")),
                     "emp_id": emp_id,
                     "updated_at": now_iso,
+                    "branch_name": item.get("branch_name") or item["branch"],
+                    "bu": item.get("bu") or "Unknown",
+                    "booking": item.get("booking") or "",
+                    "label_count": item.get("label_count") or 0,
                 }
         override_sheet_error = None
         try:
@@ -3328,6 +3364,9 @@ def ensure_booking_source_complete(booking_no: str, booking_data: dict):
             for item in build_member_history_items(wave)
             if str(item.get("branch") or "").strip()
         }
+        # Saved manual corrections are complete, durable branch records even
+        # while the large Member Data import is delayed.
+        actual.update(get_document_overrides_for_wave(wave).keys())
         absent = sorted(expected - actual)
         if absent:
             missing.append({"wave": wave, "missing": absent, "expected": len(expected), "actual": len(actual)})
