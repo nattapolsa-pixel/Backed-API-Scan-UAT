@@ -3388,13 +3388,23 @@ def split_booking_branch(data: BookingBranchSplitData):
     split_report_summaries = []
     for booking in (source, target):
         booking_view = get_booking_data_internal(booking, force_refresh=True)
+        # A booking can contain the same branch in several waves. Build the
+        # report from the exact Wave+Branch only, otherwise another wave's
+        # split summary can overwrite this row or make one side look missing.
+        branch_view_items = [
+            item for item in booking_view.get("lpn_list", [])
+            if str(item.get("branch") or "").strip().upper() == branch
+            and re.sub(r"\D", "", str(item.get("wave_no") or ""))
+            and str(int(re.sub(r"\D", "", str(item.get("wave_no") or "")))) == wave_clean
+        ]
+        if not branch_view_items:
+            continue
         summary = summarize_branch_for_member_data(
-            {"wave_no": wave_clean, "booking_no": booking, "lpn_list": booking_view.get("lpn_list", [])}, branch
+            {"wave_no": wave_clean, "booking_no": booking, "lpn_list": branch_view_items}, branch
         )
-        branch_view_items = [item for item in booking_view.get("lpn_list", [])
-                             if str(item.get("branch") or "").strip().upper() == branch]
-        if branch_view_items and any(item.get("branch_closed_at") for item in branch_view_items):
-            summary.update({"booking": booking, "booking_split": True, "is_closed": True})
+        is_closed = any(item.get("branch_closed_at") for item in branch_view_items)
+        if UAT_SHEETS_ONLY or is_closed:
+            summary.update({"booking": booking, "booking_split": True, "is_closed": is_closed})
             split_report_summaries.append(summary)
     queue_report_summary_snapshots(split_report_summaries, delay_seconds=0.0)
     return {"status": "success", "message": "แบ่งยอดเข้าสอง Booking เรียบร้อย",
