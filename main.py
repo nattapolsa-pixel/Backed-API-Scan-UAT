@@ -87,6 +87,12 @@ member_history_row_cache = {"expires_at": 0.0, "existing_map": {}, "last_data_ro
 
 DELIVERY_REPORT_SPREADSHEET_ID = "14kBtY2tdMXi3I9rbNleokmyJ_WWGRmKXPPU2VaVstZQ"
 DELIVERY_REPORT_SHEET_NAME = "Delivery report"
+# UAT only: isolated reconciliation target.  This is deliberately separate
+# from the live Delivery report while the direct-write path is being verified.
+UAT_REPORT_TEST_SPREADSHEET_ID = os.environ.get(
+    "UAT_REPORT_TEST_SPREADSHEET_ID", "1Am1cC8ORHgRfbyA_kfBEWQpDQZlKm1Ii8-wsx39o4xQ"
+)
+UAT_REPORT_TEST_SHEET_NAME = "Delivery report"
 DELIVERY_SOURCE_SHEET_NAME = "วางข้อมูล"
 DELIVERY_SOURCE_SHEET_ID = 0
 DELIVERY_REPORT_SHEET_ID = 1686001204
@@ -99,7 +105,10 @@ delivery_report_lock = Lock()
 delivery_lookup_cache = {"expires_at": 0.0, "cars": {}, "branches": {}}
 branch_province_cache = {"expires_at": 0.0, "data": {}}
 branch_province_refresh_lock = Lock()
+branch_report_cache = {"expires_at": 0.0, "data": {}}
+branch_report_refresh_lock = Lock()
 delivery_report_row_cache = {"expires_at": 0.0, "existing_map": {}, "last_data_row": 1}
+uat_report_test_row_cache = {"expires_at": 0.0, "existing_map": {}, "last_data_row": 1}
 SHEET_ROW_CACHE_TTL_SECONDS = 10 * 60  # ✅ Standard: เพิ่ม cache row เป็น 10 นาที ลด API round-trips
 SHEETS_HTTP_TIMEOUT = (3, 45)           # ✅ Standard: connect 3s (เร็วกว่า), read 45s (รองรับ large sheet)
 _sheets_session_local = threading.local()
@@ -429,6 +438,41 @@ def load_branch_province_map(session, force: bool = False) -> dict:
         })
         return copy.deepcopy(province_map)
 
+
+def load_branch_report_map(force: bool = False) -> dict:
+    """Read province and region from the branch master, never from the staging tab."""
+    now = time.time()
+    if not force and branch_report_cache["expires_at"] > now:
+        return copy.deepcopy(branch_report_cache["data"])
+
+    with branch_report_refresh_lock:
+        now = time.time()
+        if not force and branch_report_cache["expires_at"] > now:
+            return copy.deepcopy(branch_report_cache["data"])
+        try:
+            query = urllib.parse.urlencode({
+                "tqx": "out:csv",
+                "sheet": BRANCH_MASTER_SHEET_NAME,
+                "tq": "select A,D,E",
+            })
+            url = f"https://docs.google.com/spreadsheets/d/{BRANCH_MASTER_SPREADSHEET_ID}/gviz/tq?{query}"
+            request = urllib.request.Request(url, headers={"User-Agent": "Pro-Scanner-UAT/1.0"})
+            with urllib.request.urlopen(request, timeout=15) as response:
+                rows = list(csv.reader(io.StringIO(response.read().decode("utf-8-sig"))))
+        except Exception as source_error:
+            print(f"Branch report source read unavailable: {source_error}")
+            branch_report_cache["expires_at"] = now + 60
+            return copy.deepcopy(branch_report_cache["data"])
+
+        branch_map = {}
+        for row in rows[1:]:
+            row = list(row) + [""] * max(0, 3 - len(row))
+            code = str(row[0] or "").strip().upper()
+            if code:
+                branch_map[code] = {"province": str(row[1] or "").strip(), "region": str(row[2] or "").strip()}
+        branch_report_cache.update({"expires_at": time.time() + 600, "data": branch_map})
+        return copy.deepcopy(branch_map)
+
 BOOKING_WAVE_SHEET_ID = "1jOnJnnwlWZ491FEAFXAMgc7BftssHZcZp8x17LOQj6k"
 BOOKING_WAVE_SHEET_GID = "499980322"
 booking_wave_sheet_cache = {"expires_at": 0.0, "bookings": {}, "waves": {}}
@@ -634,6 +678,97 @@ def delivery_business_dates(pick_date):
 
 def _date_serial(value):
     return (value - datetime.date(1899, 12, 30)).days if isinstance(value, datetime.date) else ""
+
+
+def write_uat_report_test_summaries(summaries: list):
+    """Upsert direct report rows to the isolated UAT reconciliation Sheet.
+
+    The test Sheet has the final 20 report columns, so this path intentionally
+    does not write or read the production \"วางข้อมูล\" staging tab.
+    """
+    if not summaries:
+        return
+    session = get_sheets_session()
+    branch_map = load_branch_report_map()
+    now_bkk = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=7)))
+    with delivery_report_lock:
+        now = time.time()
+        if uat_report_test_row_cache["existing_map"] and uat_report_test_row_cache["expires_at"] > now:
+            existing_map = dict(uat_report_test_row_cache["existing_map"])
+            last_data_row = int(uat_report_test_row_cache["last_data_row"] or 1)
+        else:
+            existing = _sheet_values(session, UAT_REPORT_TEST_SPREADSHEET_ID, f"'{UAT_REPORT_TEST_SHEET_NAME}'!A:T")
+            existing_map = {}
+            last_data_row = 1
+            for index, raw_row in enumerate(existing[1:], start=2):
+                row = list(raw_row) + [""] * max(0, 20 - len(raw_row))
+                booking = str(row[7] or "").strip().upper()
+                wave_digits = re.sub(r"\D", "", str(row[9] or ""))
+                branch = str(row[10] or "").strip().upper()
+                if wave_digits and branch:
+                    existing_map[(booking, str(int(wave_digits)), branch)] = index
+                    last_data_row = max(last_data_row, index)
+
+        batch_data = []
+        current_append_row = last_data_row + 1
+        meta_cache = {}
+        for summary in summaries:
+            wave = str(int(str(summary["wave"]).strip()))
+            branch = str(summary["branch"] or "").strip().upper()
+            if wave not in meta_cache:
+                meta_cache[wave] = get_sheet_meta_for_wave(wave)
+            meta = meta_cache[wave]
+            booking = str(summary.get("booking") or meta.get("booking") or "").strip().upper()
+            key = (booking, wave, branch)
+            target_row = existing_map.get(key)
+            if not target_row:
+                if int(summary.get("total") or 0) <= 0:
+                    continue
+                target_row = current_append_row
+                current_append_row += 1
+                existing_map[key] = target_row
+            branch_meta = branch_map.get(branch, {})
+            pick_date = now_bkk.date()
+            order_date, delivery_date = delivery_business_dates(pick_date)
+            row = [[
+                target_row - 1,
+                order_date.strftime("%d/%m/%Y") if order_date else "",
+                pick_date.strftime("%d/%m/%Y"),
+                delivery_date.strftime("%d/%m/%Y") if delivery_date else "",
+                str(meta.get("carrier") or "").strip(),
+                str(meta.get("sender") or "").strip(),
+                str(meta.get("plate") or "").strip(),
+                booking,
+                member_data_bu(summary.get("bu")),
+                wave,
+                branch,
+                clean_branch_display_name(summary.get("branch_name")),
+                branch_meta.get("province", ""),
+                branch_meta.get("region", ""),
+                _history_int(summary.get("m")),
+                _history_int(summary.get("red")),
+                _history_int(summary.get("blue")),
+                _history_int(summary.get("green")),
+                _history_int(summary.get("black")),
+                _history_int(summary.get("total")),
+            ]]
+            batch_data.append({"range": f"'{UAT_REPORT_TEST_SHEET_NAME}'!A{target_row}:T{target_row}", "values": row})
+
+        if not batch_data:
+            return
+        base = f"https://sheets.googleapis.com/v4/spreadsheets/{UAT_REPORT_TEST_SPREADSHEET_ID}"
+        response = session.post(
+            f"{base}/values:batchUpdate",
+            json={"valueInputOption": "RAW", "data": batch_data}, timeout=SHEETS_HTTP_TIMEOUT
+        )
+        response.raise_for_status()
+        uat_report_test_row_cache.update({
+            "existing_map": dict(existing_map),
+            "last_data_row": max(last_data_row, current_append_row - 1),
+            "expires_at": time.time() + SHEET_ROW_CACHE_TTL_SECONDS,
+        })
+        print(f"⚡ UAT test Delivery report updated | {len(batch_data)} branches")
+
 
 def write_delivery_report_summaries(summaries: list):
     """Upsert multiple Wave+Branch into the source tab using batchUpdate in 1 single HTTP request."""
@@ -2690,8 +2825,13 @@ def get_branch_provinces(force: bool = False):
 
 def sync_document_summary_reports(summaries: list):
     if UAT_SHEETS_ONLY:
-        # UAT ห้ามแก้ Member Data / Delivery report ซึ่งเป็นข้อมูลใช้งานจริง
-        print(f"UAT report propagation skipped | summaries={len(summaries or [])}")
+        # UAT ห้ามแก้ Member Data / Delivery report ที่ใช้งานจริง แต่ให้ตรวจ
+        # ความถูกต้องผ่านปลายทางทดสอบที่แยกไว้ได้
+        test_summaries = [normalize_report_summary(summary) for summary in summaries or []]
+        test_summaries = [summary for summary in test_summaries
+                          if not summary.get("is_hidden") and
+                          (summary.get("total", 0) > 0 or summary.get("allow_zero_update"))]
+        write_uat_report_test_summaries(test_summaries)
         return
     # Automatic zero snapshots must not create report rows.
     # Intentional zero corrections may pass through to clear an existing row only.
@@ -2781,13 +2921,15 @@ def save_document_summary(data: DocumentSummaryBatchData, background_tasks: Back
                     "emp_id": emp_id,
                     "updated_at": now_iso,
                 }
-    # ยังเก็บ manual override ได้ตามเดิม แต่ส่งเข้า Sheets เฉพาะสาขาที่ปิดจบแล้ว
-    closed_summaries = [item for item in normalized if item.get("is_closed")]
-    queue_report_summary_snapshots(copy.deepcopy(closed_summaries))
+    # UAT mirror ใช้ยอดล่าสุดที่หน้าเอกสารแสดง เพื่อทดสอบยอดก่อนตัด staging tab;
+    # production ยังคงส่งเฉพาะสาขาที่ปิดจบแล้วตามกติกาเดิม.
+    report_summaries = (normalized if UAT_SHEETS_ONLY
+                        else [item for item in normalized if item.get("is_closed")])
+    queue_report_summary_snapshots(copy.deepcopy(report_summaries))
     return {
         "status": "success",
-        "updated": len(closed_summaries),
-        "report_sync": "queued" if closed_summaries else "waiting_for_branch_close",
+        "updated": len(report_summaries),
+        "report_sync": "queued" if report_summaries else "waiting_for_branch_close",
         "persist_overrides": bool(data.persist_overrides),
     }
 
