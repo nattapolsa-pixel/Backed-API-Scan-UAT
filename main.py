@@ -53,7 +53,7 @@ if not os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
 # UAT must not initialize a BigQuery client at all.  Google credentials are
 # loaded lazily by get_sheets_session() only when a Sheet operation is needed.
 APP_ENV = os.environ.get("APP_ENV", "uat").strip().lower()
-APP_VERSION = os.environ.get("APP_VERSION", "1.1.1-uat").strip()
+APP_VERSION = os.environ.get("APP_VERSION", "1.2.0-uat").strip()
 UAT_SHEETS_ONLY = os.environ.get("UAT_SHEETS_ONLY", "true").strip().lower() in ("1", "true", "yes", "on")
 SCAN_FEATURE_ENABLED = os.environ.get("SCAN_FEATURE_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
 
@@ -2996,13 +2996,24 @@ def get_branch_provinces(force: bool = False):
 
 def sync_document_summary_reports(summaries: list):
     if UAT_SHEETS_ONLY:
-        # UAT ห้ามแก้ Member Data / Delivery report ที่ใช้งานจริง แต่ให้ตรวจ
-        # ความถูกต้องผ่านปลายทางทดสอบที่แยกไว้ได้
+        # Manual document totals must update both UAT sources before the API
+        # reports success. The legacy transport workbook remains read-only.
         test_summaries = [normalize_report_summary(summary) for summary in summaries or []]
         test_summaries = [summary for summary in test_summaries
                           if not summary.get("is_hidden") and
                           (summary.get("total", 0) > 0 or summary.get("allow_zero_update"))]
-        write_uat_report_test_summaries(test_summaries)
+        member_summaries = [summary for summary in test_summaries if not summary.get("booking_split")]
+        failures = []
+        try:
+            write_member_history_summaries(member_summaries)
+        except Exception as exc:
+            failures.append(f"Member Data: {exc}")
+        try:
+            write_uat_report_test_summaries(test_summaries)
+        except Exception as exc:
+            failures.append(f"UAT Delivery report: {exc}")
+        if failures:
+            raise RuntimeError(" | ".join(failures))
         return
     # Automatic zero snapshots must not create report rows.
     # Intentional zero corrections may pass through to clear an existing row only.
@@ -3097,11 +3108,21 @@ def save_document_summary(data: DocumentSummaryBatchData, background_tasks: Back
     # production ยังคงส่งเฉพาะสาขาที่ปิดจบแล้วตามกติกาเดิม.
     report_summaries = (normalized if UAT_SHEETS_ONLY
                         else [item for item in normalized if item.get("is_closed")])
-    queue_report_summary_snapshots(copy.deepcopy(report_summaries))
+    if data.persist_overrides:
+        # A manual save is transactional from the user's perspective: do not
+        # say success until every totals Sheet has accepted the new values.
+        try:
+            sync_document_summary_reports(copy.deepcopy(report_summaries))
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"บันทึกยอดลง Google Sheets ไม่ครบ: {exc}")
+        report_sync = "completed"
+    else:
+        queue_report_summary_snapshots(copy.deepcopy(report_summaries))
+        report_sync = "queued" if report_summaries else "waiting_for_branch_close"
     return {
         "status": "success",
         "updated": len(report_summaries),
-        "report_sync": "queued" if report_summaries else "waiting_for_branch_close",
+        "report_sync": report_sync,
         "persist_overrides": bool(data.persist_overrides),
     }
 
