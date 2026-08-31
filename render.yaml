@@ -13,7 +13,7 @@ services:
     autoDeployTrigger: commit
     envVars:
       - key: GOOGLE_APPLICATION_CREDENTIALS
-        value: /etc/secrets/bq-key.json
+        value: /etc/secrets/pro-scanner-uat.json
       - key: APP_ENV
         value: uat
       - key: UAT_SHEETS_ONLY

@@ -1,4 +1,6 @@
 bq-key.json
+*-service-account*.json
+pro-scanner-uat*.json
 *.json.key
 .env
 .env.*
