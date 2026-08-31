@@ -115,7 +115,7 @@ branch_province_cache = {"expires_at": 0.0, "data": {}}
 branch_province_refresh_lock = Lock()
 branch_report_cache = {"expires_at": 0.0, "data": {}}
 branch_report_refresh_lock = Lock()
-wave_monitoring_pick_date_cache = {"expires_at": 0.0, "exact": {}, "waves": {}}
+wave_monitoring_pick_date_cache = {"expires_at": 0.0, "exact": {}, "waves": {}, "branches": {}}
 wave_monitoring_pick_date_lock = Lock()
 delivery_report_row_cache = {"expires_at": 0.0, "existing_map": {}, "last_data_row": 1}
 uat_report_test_row_cache = {"expires_at": 0.0, "existing_map": {}, "last_data_row": 1}
@@ -614,35 +614,40 @@ def load_wave_monitoring_pick_dates(force: bool = False) -> tuple:
     with wave_monitoring_pick_date_lock:
         if not force and wave_monitoring_pick_date_cache["expires_at"] > now:
             return (copy.deepcopy(wave_monitoring_pick_date_cache["exact"]),
-                    copy.deepcopy(wave_monitoring_pick_date_cache["waves"]))
+                    copy.deepcopy(wave_monitoring_pick_date_cache["waves"]),
+                    copy.deepcopy(wave_monitoring_pick_date_cache["branches"]))
 
     exact = {}
     wave_dates = {}
+    expected_branches = {}
     try:
         query = urllib.parse.urlencode({
             "gid": WAVE_MONITORING_SHEET_GID,
             "tqx": "out:csv",
-            "tq": "select A,B,I where A is not null and B is not null",
+            "tq": "select A,B,I,K where A is not null and B is not null",
         })
         url = f"https://docs.google.com/spreadsheets/d/{WAVE_MONITORING_SPREADSHEET_ID}/gviz/tq?{query}"
         request = urllib.request.Request(url, headers={"User-Agent": "Pro-Scanner-UAT/1.0"})
         with urllib.request.urlopen(request, timeout=15) as response:
             rows = list(csv.reader(io.StringIO(response.read().decode("utf-8-sig"))))
         for row in rows[1:]:
-            row = list(row) + [""] * max(0, 3 - len(row))
+            row = list(row) + [""] * max(0, 4 - len(row))
             pick_date = _parse_pick_date(row[1])
             booking = re.sub(r"\s+", "", str(row[2] or "").upper())
+            branch = str(row[3] or "").strip().upper()
             if not pick_date:
                 continue
             for wave in _wave_tokens(row[0]):
                 if booking:
                     exact[(booking, wave)] = pick_date
                     exact[(booking.replace("-", ""), wave)] = pick_date
+                    if branch:
+                        expected_branches.setdefault((booking, wave), set()).add(branch)
                 wave_dates.setdefault(wave, pick_date)
         with wave_monitoring_pick_date_lock:
             wave_monitoring_pick_date_cache.update({
                 "expires_at": time.time() + WAVE_MONITORING_CACHE_TTL_SECONDS,
-                "exact": exact, "waves": wave_dates,
+                "exact": exact, "waves": wave_dates, "branches": expected_branches,
             })
     except Exception as exc:
         print(f"⚠️ Wave Monitoring pick-date read unavailable: {exc}")
@@ -650,8 +655,9 @@ def load_wave_monitoring_pick_dates(force: bool = False) -> tuple:
             if wave_monitoring_pick_date_cache["exact"] or wave_monitoring_pick_date_cache["waves"]:
                 wave_monitoring_pick_date_cache["expires_at"] = time.time() + 30
                 return (copy.deepcopy(wave_monitoring_pick_date_cache["exact"]),
-                        copy.deepcopy(wave_monitoring_pick_date_cache["waves"]))
-    return exact, wave_dates
+                        copy.deepcopy(wave_monitoring_pick_date_cache["waves"]),
+                        copy.deepcopy(wave_monitoring_pick_date_cache["branches"]))
+    return exact, wave_dates, expected_branches
 
 
 def get_wave_monitoring_pick_date(wave_no: str, booking_no: str = ""):
@@ -660,7 +666,7 @@ def get_wave_monitoring_pick_date(wave_no: str, booking_no: str = ""):
         return None
     wave = waves[0]
     booking = re.sub(r"\s+", "", str(booking_no or "").upper())
-    exact, wave_dates = load_wave_monitoring_pick_dates()
+    exact, wave_dates, _ = load_wave_monitoring_pick_dates()
     return (exact.get((booking, wave)) or exact.get((booking.replace("-", ""), wave))
             or wave_dates.get(wave))
 
@@ -3257,24 +3263,59 @@ def check_wave(wave_no: str, force: bool = False):
         raise HTTPException(status_code=500, detail=str(e))
 
 # 🚀 [API 1.5] โหลดข้อมูล Booking
+def ensure_booking_source_complete(booking_no: str, booking_data: dict):
+    """Reject progressive Member Data snapshots until every planned branch exists."""
+    if not UAT_SHEETS_ONLY:
+        return
+    booking = re.sub(r"\s+", "", str(booking_no or "").upper())
+    _, _, expected_map = load_wave_monitoring_pick_dates(force=False)
+    missing = []
+    for raw_wave in booking_data.get("waves") or []:
+        digits = re.sub(r"\D", "", str(raw_wave or ""))
+        if not digits:
+            continue
+        wave = str(int(digits))
+        expected = set(expected_map.get((booking, wave)) or set())
+        if not expected:
+            continue
+        actual = {
+            str(item.get("branch") or "").strip().upper()
+            for item in build_member_history_items(wave)
+            if str(item.get("branch") or "").strip()
+        }
+        absent = sorted(expected - actual)
+        if absent:
+            missing.append({"wave": wave, "missing": absent, "expected": len(expected), "actual": len(actual)})
+    if missing:
+        details = "; ".join(
+            f"Wave {item['wave']} ขาด {len(item['missing'])} สาขา ({','.join(item['missing'][:5])})"
+            for item in missing
+        )
+        raise HTTPException(status_code=409, detail=f"ข้อมูล Booking [{booking}] ยังเข้าไม่ครบ: {details}")
+
+
 @app.get("/api/check-booking")
 def check_booking(booking_no: str, force: bool = False):
     try:
         try:
-            return get_booking_data_internal(booking_no, force_refresh=force)
+            booking_data = get_booking_data_internal(booking_no, force_refresh=force)
+            ensure_booking_source_complete(booking_no, booking_data)
+            return booking_data
         except HTTPException as first_error:
-            if not UAT_SHEETS_ONLY or first_error.status_code != 404:
+            if not UAT_SHEETS_ONLY or first_error.status_code not in (404, 409):
                 raise
             # Member Data is populated progressively. Re-read one consistent
             # snapshot before declaring a multi-Wave Booking incomplete.
             time.sleep(1.0)
             try:
-                return get_booking_data_internal(booking_no, force_refresh=True)
+                booking_data = get_booking_data_internal(booking_no, force_refresh=True)
+                ensure_booking_source_complete(booking_no, booking_data)
+                return booking_data
             except HTTPException as retry_error:
-                if retry_error.status_code == 404:
+                if retry_error.status_code in (404, 409):
                     raise HTTPException(
                         status_code=409,
-                        detail=f"ข้อมูล Booking [{booking_no.strip().upper()}] ยังเข้า Member Data ไม่ครบ กรุณารอสักครู่แล้วค้นหาใหม่",
+                        detail=str(retry_error.detail),
                     )
                 raise
     except HTTPException:
