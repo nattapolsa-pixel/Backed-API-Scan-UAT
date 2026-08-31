@@ -82,6 +82,7 @@ MEMBER_HISTORY_GID = "1628470483"
 MEMBER_HISTORY_CACHE_TTL_SECONDS = 10 * 60
 member_history_cache = {"expires_at": 0.0, "data": {}}
 member_history_lock = Lock()
+member_history_refresh_lock = Lock()
 member_history_row_cache = {"expires_at": 0.0, "existing_map": {}, "last_data_row": 1}
 
 DELIVERY_REPORT_SPREADSHEET_ID = "14kBtY2tdMXi3I9rbNleokmyJ_WWGRmKXPPU2VaVstZQ"
@@ -127,6 +128,7 @@ uat_event_sheet_lock = Lock()
 uat_event_sheets_ready = False
 uat_event_cache = {}
 UAT_EVENT_CACHE_TTL_SECONDS = 30  # ✅ Standard: UAT event cache 30s เพื่อลด Sheets API calls
+uat_event_read_lock = Lock()
 
 def get_sheets_session():
     session = getattr(_sheets_session_local, "session", None)
@@ -198,7 +200,8 @@ def append_uat_event_rows(sheet_name: str, rows: list):
         timeout=SHEETS_HTTP_TIMEOUT,
     )
     response.raise_for_status()
-    uat_event_cache.pop(sheet_name, None)
+    with uat_event_read_lock:
+        uat_event_cache.pop(sheet_name, None)
 
 
 def read_uat_event_records(sheet_name: str, force: bool = False) -> list:
@@ -206,15 +209,22 @@ def read_uat_event_records(sheet_name: str, force: bool = False) -> list:
     cached = uat_event_cache.get(sheet_name)
     if cached and not force and cached["expires_at"] > now:
         return copy.deepcopy(cached["records"])
-    ensure_uat_event_sheets()
-    headers = UAT_EVENT_SHEETS[sheet_name]
-    rows = _sheet_values(get_sheets_session(), UAT_DATABASE_SPREADSHEET_ID, f"'{sheet_name}'!A:{chr(64 + len(headers))}")
-    records = []
-    for row in rows[1:]:
-        values = list(row) + [""] * max(0, len(headers) - len(row))
-        records.append(dict(zip(headers, values[:len(headers)])))
-    uat_event_cache[sheet_name] = {"records": records, "expires_at": now + UAT_EVENT_CACHE_TTL_SECONDS}
-    return copy.deepcopy(records)
+    # Single-flight: คำขอ Wave/Booking ที่เข้าพร้อมกันใช้ผลโหลด Sheet ชุดเดียวกัน
+    # แทนการยิง Google Sheets ซ้ำคนละ thread ตอน cache หมดอายุ
+    with uat_event_read_lock:
+        now = time.time()
+        cached = uat_event_cache.get(sheet_name)
+        if cached and not force and cached["expires_at"] > now:
+            return copy.deepcopy(cached["records"])
+        ensure_uat_event_sheets()
+        headers = UAT_EVENT_SHEETS[sheet_name]
+        rows = _sheet_values(get_sheets_session(), UAT_DATABASE_SPREADSHEET_ID, f"'{sheet_name}'!A:{chr(64 + len(headers))}")
+        records = []
+        for row in rows[1:]:
+            values = list(row) + [""] * max(0, len(headers) - len(row))
+            records.append(dict(zip(headers, values[:len(headers)])))
+        uat_event_cache[sheet_name] = {"records": records, "expires_at": now + UAT_EVENT_CACHE_TTL_SECONDS}
+        return copy.deepcopy(records)
 
 
 INVALID_BRANCH_STRINGS = {
@@ -374,6 +384,8 @@ BOOKING_WAVE_SHEET_ID = "1jOnJnnwlWZ491FEAFXAMgc7BftssHZcZp8x17LOQj6k"
 BOOKING_WAVE_SHEET_GID = "499980322"
 booking_wave_sheet_cache = {"expires_at": 0.0, "bookings": {}, "waves": {}}
 booking_wave_sheet_lock = Lock()
+booking_wave_sheet_refresh_lock = Lock()
+BOOKING_WAVE_SHEET_CACHE_TTL_SECONDS = 10 * 60
 
 def load_booking_wave_sheet_meta(force: bool = False) -> tuple:
     now = time.time()
@@ -381,62 +393,70 @@ def load_booking_wave_sheet_meta(force: bool = False) -> tuple:
         if not force and booking_wave_sheet_cache["expires_at"] > now:
             return booking_wave_sheet_cache["bookings"], booking_wave_sheet_cache["waves"]
 
-    booking_map = {}
-    wave_map = {}
-    try:
-        tq = "SELECT K, L, P, Q, R WHERE K IS NOT NULL OR L IS NOT NULL"
-        url = f"https://docs.google.com/spreadsheets/d/{BOOKING_WAVE_SHEET_ID}/gviz/tq?gid={BOOKING_WAVE_SHEET_GID}&tqx=out:json&tq={urllib.parse.quote(tq)}"
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            text = resp.read().decode("utf-8")
-            m = re.search(r"google\.visualization\.Query\.setResponse\((.*)\);", text, re.DOTALL)
-            if m:
-                data = json.loads(m.group(1))
-                rows = data.get("table", {}).get("rows", [])
-                for r in rows:
-                    c = r.get("c") or []
-                    def get_val(idx):
-                        if idx < len(c) and c[idx]:
-                            return str(c[idx].get("f") or c[idx].get("v") or "").strip()
-                        return ""
-                    b = get_val(0)
-                    w = get_val(1)
-                    carrier = get_val(2)
-                    sender = get_val(3)
-                    plate = get_val(4)
-
-                    waves = [str(int(x)) for x in re.findall(r"\b\d{5,}\b", w)]
-                    clean_b = re.sub(r"\s+", "", b.upper())
-                    compact_b = clean_b.replace("-", "")
-                    raw_num = re.sub(r"^B0*1*", "", compact_b)
-
-                    entry = {
-                        "booking": clean_b,
-                        "waves": waves,
-                        "carrier": carrier,
-                        "sender": sender,
-                        "plate": plate
-                    }
-
-                    if clean_b:
-                        booking_map[clean_b] = entry
-                        booking_map[compact_b] = entry
-                        if raw_num:
-                            booking_map[raw_num] = entry
-                            booking_map[f"B001-{raw_num}"] = entry
-
-                    for wave_id in waves:
-                        wave_map[wave_id] = entry
-                        wave_map[f"{int(wave_id):010d}"] = entry
-
+    with booking_wave_sheet_refresh_lock:
+        now = time.time()
         with booking_wave_sheet_lock:
-            booking_wave_sheet_cache["bookings"] = booking_map
-            booking_wave_sheet_cache["waves"] = wave_map
-            booking_wave_sheet_cache["expires_at"] = now + 120
-    except Exception as e:
-        print(f"⚠️ Error loading Booking & Wave Google Sheet meta: {e}")
+            if not force and booking_wave_sheet_cache["expires_at"] > now:
+                return booking_wave_sheet_cache["bookings"], booking_wave_sheet_cache["waves"]
 
-    return booking_map, wave_map
+        booking_map = {}
+        wave_map = {}
+        try:
+            tq = "SELECT K, L, P, Q, R WHERE K IS NOT NULL OR L IS NOT NULL"
+            url = f"https://docs.google.com/spreadsheets/d/{BOOKING_WAVE_SHEET_ID}/gviz/tq?gid={BOOKING_WAVE_SHEET_GID}&tqx=out:json&tq={urllib.parse.quote(tq)}"
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                text = resp.read().decode("utf-8")
+                m = re.search(r"google\.visualization\.Query\.setResponse\((.*)\);", text, re.DOTALL)
+                if m:
+                    data = json.loads(m.group(1))
+                    rows = data.get("table", {}).get("rows", [])
+                    for r in rows:
+                        c = r.get("c") or []
+
+                        def get_val(idx):
+                            if idx < len(c) and c[idx]:
+                                return str(c[idx].get("f") or c[idx].get("v") or "").strip()
+                            return ""
+
+                        b = get_val(0)
+                        w = get_val(1)
+                        carrier = get_val(2)
+                        sender = get_val(3)
+                        plate = get_val(4)
+                        waves = [str(int(x)) for x in re.findall(r"\b\d{5,}\b", w)]
+                        clean_b = re.sub(r"\s+", "", b.upper())
+                        compact_b = clean_b.replace("-", "")
+                        raw_num = re.sub(r"^B0*1*", "", compact_b)
+                        entry = {
+                            "booking": clean_b,
+                            "waves": waves,
+                            "carrier": carrier,
+                            "sender": sender,
+                            "plate": plate,
+                        }
+                        if clean_b:
+                            booking_map[clean_b] = entry
+                            booking_map[compact_b] = entry
+                            if raw_num:
+                                booking_map[raw_num] = entry
+                                booking_map[f"B001-{raw_num}"] = entry
+                        for wave_id in waves:
+                            wave_map[wave_id] = entry
+                            wave_map[f"{int(wave_id):010d}"] = entry
+
+            with booking_wave_sheet_lock:
+                booking_wave_sheet_cache["bookings"] = booking_map
+                booking_wave_sheet_cache["waves"] = wave_map
+                booking_wave_sheet_cache["expires_at"] = now + BOOKING_WAVE_SHEET_CACHE_TTL_SECONDS
+        except Exception as e:
+            print(f"⚠️ Error loading Booking & Wave Google Sheet meta: {e}")
+            with booking_wave_sheet_lock:
+                if booking_wave_sheet_cache["bookings"] or booking_wave_sheet_cache["waves"]:
+                    booking_wave_sheet_cache["expires_at"] = time.time() + 30
+                    return booking_wave_sheet_cache["bookings"], booking_wave_sheet_cache["waves"]
+
+        return booking_map, wave_map
 
 def get_sheet_meta_for_wave(wave_no: str, force: bool = False) -> dict:
     clean_wave = re.sub(r"\D", "", str(wave_no or ""))
@@ -1072,41 +1092,47 @@ def load_member_history() -> dict:
         cached = member_history_cache.get("data") or {}
         if cached and member_history_cache.get("expires_at", 0) > now:
             return cached
-    url = (
-        f"https://docs.google.com/spreadsheets/d/{MEMBER_HISTORY_SPREADSHEET_ID}"
-        f"/gviz/tq?tqx=out:csv&gid={MEMBER_HISTORY_GID}"
-    )
-    history = {}
-    try:
-        request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(request, timeout=45) as response:
-            rows = csv.reader(io.StringIO(response.read().decode("utf-8-sig")))
-            next(rows, None)
-            for row in rows:
-                row = list(row) + [""] * max(0, 16 - len(row))
-                wave_digits = re.sub(r"\D", "", row[2])
-                branch = str(row[3] or "").strip().upper()
-                if not wave_digits or not branch:
-                    continue
-                wave = str(int(wave_digits))
-                history[(wave, branch)] = {
-                    "date": str(row[0] or "").strip(), "time": str(row[1] or "").strip(),
-                    "wave": wave, "branch": branch, "branch_name": clean_branch_display_name(row[4]),
-                    "bu": str(row[5] or "").strip() or "Unknown", "label_count": _history_int(row[6]),
-                    "m": _history_int(row[8]), "red": _history_int(row[9]), "blue": _history_int(row[10]),
-                    "green": _history_int(row[11]), "black": _history_int(row[12]),
-                    "total": _history_int(row[13]), "pallet": _history_int(row[14])
-                }
+    with member_history_refresh_lock:
+        now = time.time()
         with member_history_lock:
-            member_history_cache["data"] = history
-            member_history_cache["expires_at"] = now + MEMBER_HISTORY_CACHE_TTL_SECONDS
-        print(f"✅ Member Data history loaded: {len(history)} branch summaries")
-        return history
-    except Exception as exc:
-        print(f"⚠️ Member Data history load failed (non-critical): {exc}")
-        with member_history_lock:
-            member_history_cache["expires_at"] = now + 60
-        return cached
+            cached = member_history_cache.get("data") or {}
+            if cached and member_history_cache.get("expires_at", 0) > now:
+                return cached
+        url = (
+            f"https://docs.google.com/spreadsheets/d/{MEMBER_HISTORY_SPREADSHEET_ID}"
+            f"/gviz/tq?tqx=out:csv&gid={MEMBER_HISTORY_GID}"
+        )
+        history = {}
+        try:
+            request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(request, timeout=45) as response:
+                rows = csv.reader(io.StringIO(response.read().decode("utf-8-sig")))
+                next(rows, None)
+                for row in rows:
+                    row = list(row) + [""] * max(0, 16 - len(row))
+                    wave_digits = re.sub(r"\D", "", row[2])
+                    branch = str(row[3] or "").strip().upper()
+                    if not wave_digits or not branch:
+                        continue
+                    wave = str(int(wave_digits))
+                    history[(wave, branch)] = {
+                        "date": str(row[0] or "").strip(), "time": str(row[1] or "").strip(),
+                        "wave": wave, "branch": branch, "branch_name": clean_branch_display_name(row[4]),
+                        "bu": str(row[5] or "").strip() or "Unknown", "label_count": _history_int(row[6]),
+                        "m": _history_int(row[8]), "red": _history_int(row[9]), "blue": _history_int(row[10]),
+                        "green": _history_int(row[11]), "black": _history_int(row[12]),
+                        "total": _history_int(row[13]), "pallet": _history_int(row[14])
+                    }
+            with member_history_lock:
+                member_history_cache["data"] = history
+                member_history_cache["expires_at"] = now + MEMBER_HISTORY_CACHE_TTL_SECONDS
+            print(f"✅ Member Data history loaded: {len(history)} branch summaries")
+            return history
+        except Exception as exc:
+            print(f"⚠️ Member Data history load failed (non-critical): {exc}")
+            with member_history_lock:
+                member_history_cache["expires_at"] = now + 60
+            return cached
 
 def build_member_history_items(wave_no: str) -> list:
     wave = str(int(str(wave_no).strip()))
@@ -3877,6 +3903,7 @@ def run_pending_waves_refresh_in_background():
 # 🚀 [API] โหลดรายการ Wave
 @app.get("/api/pending-waves")
 def get_pending_waves(background_tasks: BackgroundTasks, force: bool = False):
+    global is_refreshing_pending_waves
     now = time.time()
     with pending_waves_cache_lock:
         cached_data = pending_waves_cache["data"]
