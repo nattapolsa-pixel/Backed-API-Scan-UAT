@@ -718,7 +718,7 @@ def write_uat_report_test_summaries(summaries: list):
                     value = str(value or "").strip()
                     try:
                         parsed = datetime.datetime.strptime(value, "%d/%m/%Y").date()
-                        normalized_dates.append(_date_serial(parsed))
+                        normalized_dates.append(parsed.isoformat())
                         changed_dates = True
                     except ValueError:
                         normalized_dates.append(value)
@@ -750,9 +750,9 @@ def write_uat_report_test_summaries(summaries: list):
             order_date, delivery_date = delivery_business_dates(pick_date)
             row = [[
                 target_row - 1,
-                _date_serial(order_date),
-                _date_serial(pick_date),
-                _date_serial(delivery_date),
+                order_date.isoformat() if order_date else "",
+                pick_date.isoformat(),
+                delivery_date.isoformat() if delivery_date else "",
                 str(meta.get("carrier") or "").strip(),
                 str(meta.get("sender") or "").strip(),
                 str(meta.get("plate") or "").strip(),
@@ -777,7 +777,7 @@ def write_uat_report_test_summaries(summaries: list):
         base = f"https://sheets.googleapis.com/v4/spreadsheets/{UAT_REPORT_TEST_SPREADSHEET_ID}"
         response = session.post(
             f"{base}/values:batchUpdate",
-            json={"valueInputOption": "RAW", "data": batch_data}, timeout=SHEETS_HTTP_TIMEOUT
+            json={"valueInputOption": "USER_ENTERED", "data": batch_data}, timeout=SHEETS_HTTP_TIMEOUT
         )
         response.raise_for_status()
         final_row = max(last_data_row, current_append_row - 1)
