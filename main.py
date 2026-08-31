@@ -2882,11 +2882,8 @@ def clear_device_states(data: DeviceStateData):
 @app.get("/api/check-wave")
 def check_wave(wave_no: str, force: bool = False):
     try:
-        # UAT ใช้ Google Sheet เป็น source of truth: ทุกการค้นหาใหม่ต้องล้าง
-        # mapping เดิมหนึ่งครั้ง เพื่อไม่ให้เลข Booking เก่าค้างหลังแก้ Sheet
-        if UAT_SHEETS_ONLY:
-            force = True
-        # Load wave data (either from cache or by querying BigQuery if not cached)
+        # การค้นหาปกติใช้ cache ที่ warm ไว้ ส่วนปุ่มรีเฟรชส่ง force=true เมื่อต้องอ่าน
+        # Google Sheets ใหม่จริง ๆ การบังคับ force ทุกครั้งทำให้โหลด Member Data 39k+ แถวซ้ำ
         try:
             raw_data = get_wave_data_internal(wave_no, force_refresh=force)
         except HTTPException as exc:
@@ -2910,8 +2907,6 @@ def check_wave(wave_no: str, force: bool = False):
 @app.get("/api/check-booking")
 def check_booking(booking_no: str, force: bool = False):
     try:
-        if UAT_SHEETS_ONLY:
-            force = True
         booking_data = get_booking_data_internal(booking_no, force_refresh=force)
         return booking_data
     except HTTPException:
