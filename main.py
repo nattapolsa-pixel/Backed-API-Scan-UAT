@@ -396,7 +396,7 @@ def load_branch_province_map(session, force: bool = False) -> dict:
         rows = _sheet_values(
             session,
             DELIVERY_REPORT_SPREADSHEET_ID,
-            f"'{DELIVERY_BRANCH_SHEET_NAME}'!A:D",
+            f"'{DELIVERY_BRANCH_SHEET_NAME}'!A1:D20000",
         )
         province_map = {}
         for row in rows[1:]:
