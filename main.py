@@ -393,11 +393,19 @@ def load_branch_province_map(session, force: bool = False) -> dict:
         if not force and branch_province_cache["expires_at"] > now:
             return copy.deepcopy(branch_province_cache["data"])
 
-        rows = _sheet_values(
-            session,
-            DELIVERY_REPORT_SPREADSHEET_ID,
-            f"'{DELIVERY_BRANCH_SHEET_NAME}'!A1:D20000",
-        )
+        rows = []
+        chunk_size = 2000
+        max_rows = 20000
+        for start_row in range(1, max_rows + 1, chunk_size):
+            end_row = min(start_row + chunk_size - 1, max_rows)
+            chunk = _sheet_values(
+                session,
+                DELIVERY_REPORT_SPREADSHEET_ID,
+                f"'{DELIVERY_BRANCH_SHEET_NAME}'!A{start_row}:D{end_row}",
+            )
+            rows.extend(chunk)
+            if len(chunk) < chunk_size:
+                break
         province_map = {}
         for row in rows[1:]:
             row = list(row) + [""] * max(0, 4 - len(row))
