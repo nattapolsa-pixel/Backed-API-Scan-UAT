@@ -2623,6 +2623,18 @@ def get_booking_waves_mapping(booking_no: str, force_refresh: bool = False) -> d
 def get_booking_data_internal(booking_no: str, force_refresh: bool = False) -> dict:
     mapping = get_booking_waves_mapping(booking_no, force_refresh)
     booking_clean = booking_no.strip().upper()
+    wave_force_refresh = force_refresh
+    if UAT_SHEETS_ONLY and force_refresh:
+        # Refresh the large Member Data sheet once before fan-out. Refreshing
+        # independently inside every Wave thread is slower and can expose
+        # different snapshots while the Sheet is still updating.
+        with member_history_lock:
+            member_history_cache["expires_at"] = 0.0
+        with booking_wave_sheet_lock:
+            booking_wave_sheet_cache["expires_at"] = 0.0
+        load_member_history()
+        load_booking_wave_sheet_meta(force=True)
+        wave_force_refresh = False
     assignments = get_booking_branch_assignments()
     splits = get_booking_branch_splits()
     override_waves = [wave for (wave, branch), move in assignments.items()
@@ -2641,7 +2653,7 @@ def get_booking_data_internal(booking_no: str, force_refresh: bool = False) -> d
     
     # จำกัด fan-out ไม่ให้ Booking ที่มีหลาย Wave ยิง BigQuery พร้อมกันจนคิว API อั้นทั้งระบบ
     with ThreadPoolExecutor(max_workers=max(1, min(6, len(waves)))) as executor:
-        futures = {executor.submit(get_wave_data_internal, wave, force_refresh): wave for wave in waves}
+        futures = {executor.submit(get_wave_data_internal, wave, wave_force_refresh): wave for wave in waves}
         for future in futures:
             wave = futures[future]
             try:
