@@ -54,7 +54,7 @@ if not os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
 # UAT must not initialize a BigQuery client at all.  Google credentials are
 # loaded lazily by get_sheets_session() only when a Sheet operation is needed.
 APP_ENV = os.environ.get("APP_ENV", "uat").strip().lower()
-APP_VERSION = os.environ.get("APP_VERSION", "1.2.2-uat").strip()
+APP_VERSION = os.environ.get("APP_VERSION", "1.2.3-uat").strip()
 UAT_SHEETS_ONLY = os.environ.get("UAT_SHEETS_ONLY", "true").strip().lower() in ("1", "true", "yes", "on")
 SCAN_FEATURE_ENABLED = os.environ.get("SCAN_FEATURE_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
 
@@ -3099,8 +3099,8 @@ def save_document_summary(data: DocumentSummaryBatchData, background_tasks: Back
         persistent_items = normalized
         for item in persistent_items:
             item["allow_zero_update"] = True
-        # UAT บันทึกหลักฐานลง Google Sheets ก่อนตอบกลับ เพื่อไม่ให้แจ้งสำเร็จทั้งที่ข้อมูลยังไม่ถูกเก็บ
-        record_document_overrides(copy.deepcopy(persistent_items), emp_id, data.reason or "")
+        # Apply the edit to the live web overlay first. A temporary Google auth
+        # outage must never make the UI snap back to the calculated old total.
         with document_overrides_lock:
             for item in persistent_items:
                 wave_ov = document_overrides_overlay.setdefault(item["wave"], {})
@@ -3110,6 +3110,12 @@ def save_document_summary(data: DocumentSummaryBatchData, background_tasks: Back
                     "emp_id": emp_id,
                     "updated_at": now_iso,
                 }
+        override_sheet_error = None
+        try:
+            record_document_overrides(copy.deepcopy(persistent_items), emp_id, data.reason or "")
+        except Exception as exc:
+            override_sheet_error = str(exc)
+            print(f"🚨 Override Sheet pending; web overlay retained: {exc}")
     # UAT mirror ใช้ยอดล่าสุดที่หน้าเอกสารแสดง เพื่อทดสอบยอดก่อนตัด staging tab;
     # production ยังคงส่งเฉพาะสาขาที่ปิดจบแล้วตามกติกาเดิม.
     report_summaries = (normalized if UAT_SHEETS_ONLY
@@ -3120,8 +3126,12 @@ def save_document_summary(data: DocumentSummaryBatchData, background_tasks: Back
         try:
             sync_document_summary_reports(copy.deepcopy(report_summaries))
         except Exception as exc:
-            raise HTTPException(status_code=502, detail=f"บันทึกยอดลง Google Sheets ไม่ครบ: {exc}")
-        report_sync = "completed"
+            print(f"🚨 Manual totals Sheet pending; web overlay retained: {exc}")
+            report_sync = "pending_google_credentials"
+            sheet_warning = str(exc)
+        else:
+            report_sync = "completed" if not override_sheet_error else "pending_google_credentials"
+            sheet_warning = override_sheet_error
     else:
         queue_report_summary_snapshots(copy.deepcopy(report_summaries))
         report_sync = "queued" if report_summaries else "waiting_for_branch_close"
@@ -3130,6 +3140,7 @@ def save_document_summary(data: DocumentSummaryBatchData, background_tasks: Back
         "updated": len(report_summaries),
         "report_sync": report_sync,
         "persist_overrides": bool(data.persist_overrides),
+        "sheet_warning": sheet_warning if data.persist_overrides else None,
     }
 
 @app.post("/api/reset-document-overrides")
