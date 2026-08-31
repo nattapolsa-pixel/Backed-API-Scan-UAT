@@ -93,6 +93,7 @@ UAT_REPORT_TEST_SPREADSHEET_ID = os.environ.get(
     "UAT_REPORT_TEST_SPREADSHEET_ID", "1Am1cC8ORHgRfbyA_kfBEWQpDQZlKm1Ii8-wsx39o4xQ"
 )
 UAT_REPORT_TEST_SHEET_NAME = "Delivery report"
+UAT_REPORT_TEST_SHEET_ID = 0
 DELIVERY_SOURCE_SHEET_NAME = "วางข้อมูล"
 DELIVERY_SOURCE_SHEET_ID = 0
 DELIVERY_REPORT_SHEET_ID = 1686001204
@@ -692,6 +693,7 @@ def write_uat_report_test_summaries(summaries: list):
     branch_map = load_branch_report_map()
     now_bkk = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=7)))
     with delivery_report_lock:
+        existing_date_updates = []
         now = time.time()
         if uat_report_test_row_cache["existing_map"] and uat_report_test_row_cache["expires_at"] > now:
             existing_map = dict(uat_report_test_row_cache["existing_map"])
@@ -708,8 +710,24 @@ def write_uat_report_test_summaries(summaries: list):
                 if wave_digits and branch:
                     existing_map[(booking, str(int(wave_digits)), branch)] = index
                     last_data_row = max(last_data_row, index)
+                # Convert legacy dd/MM/yyyy text to date serials once, so
+                # Google Sheets sorts dates chronologically rather than as text.
+                normalized_dates = []
+                changed_dates = False
+                for value in row[1:4]:
+                    value = str(value or "").strip()
+                    try:
+                        parsed = datetime.datetime.strptime(value, "%d/%m/%Y").date()
+                        normalized_dates.append(_date_serial(parsed))
+                        changed_dates = True
+                    except ValueError:
+                        normalized_dates.append(value)
+                if changed_dates:
+                    existing_date_updates.append({
+                        "range": f"'{UAT_REPORT_TEST_SHEET_NAME}'!B{index}:D{index}", "values": [normalized_dates]
+                    })
 
-        batch_data = []
+        batch_data = list(existing_date_updates)
         current_append_row = last_data_row + 1
         meta_cache = {}
         for summary in summaries:
@@ -732,9 +750,9 @@ def write_uat_report_test_summaries(summaries: list):
             order_date, delivery_date = delivery_business_dates(pick_date)
             row = [[
                 target_row - 1,
-                order_date.strftime("%d/%m/%Y") if order_date else "",
-                pick_date.strftime("%d/%m/%Y"),
-                delivery_date.strftime("%d/%m/%Y") if delivery_date else "",
+                _date_serial(order_date),
+                _date_serial(pick_date),
+                _date_serial(delivery_date),
                 str(meta.get("carrier") or "").strip(),
                 str(meta.get("sender") or "").strip(),
                 str(meta.get("plate") or "").strip(),
@@ -762,11 +780,32 @@ def write_uat_report_test_summaries(summaries: list):
             json={"valueInputOption": "RAW", "data": batch_data}, timeout=SHEETS_HTTP_TIMEOUT
         )
         response.raise_for_status()
-        uat_report_test_row_cache.update({
-            "existing_map": dict(existing_map),
-            "last_data_row": max(last_data_row, current_append_row - 1),
-            "expires_at": time.time() + SHEET_ROW_CACHE_TTL_SECONDS,
-        })
+        final_row = max(last_data_row, current_append_row - 1)
+        # Format dates then sort data rows by pickup date (column C). The sort
+        # excludes headers and runs only in the isolated UAT test sheet.
+        sort_response = session.post(f"{base}:batchUpdate", json={"requests": [
+            {"repeatCell": {
+                "range": {"sheetId": UAT_REPORT_TEST_SHEET_ID, "startRowIndex": 1,
+                          "endRowIndex": final_row, "startColumnIndex": 1, "endColumnIndex": 4},
+                "cell": {"userEnteredFormat": {"numberFormat": {"type": "DATE", "pattern": "dd/MM/yyyy"}}},
+                "fields": "userEnteredFormat.numberFormat"
+            }},
+            {"sortRange": {
+                "range": {"sheetId": UAT_REPORT_TEST_SHEET_ID, "startRowIndex": 1,
+                          "endRowIndex": final_row, "startColumnIndex": 0, "endColumnIndex": 20},
+                "sortSpecs": [{"dimensionIndex": 2, "sortOrder": "ASCENDING"}]
+            }},
+        ]}, timeout=SHEETS_HTTP_TIMEOUT)
+        sort_response.raise_for_status()
+        # Re-number after sorting. Invalidate the row cache because positions
+        # have changed and must be read again before the next upsert.
+        sequence_values = [[row_no - 1] for row_no in range(2, final_row + 1)]
+        sequence_response = session.post(f"{base}/values:batchUpdate", json={
+            "valueInputOption": "RAW",
+            "data": [{"range": f"'{UAT_REPORT_TEST_SHEET_NAME}'!A2:A{final_row}", "values": sequence_values}],
+        }, timeout=SHEETS_HTTP_TIMEOUT)
+        sequence_response.raise_for_status()
+        uat_report_test_row_cache.update({"existing_map": {}, "last_data_row": 1, "expires_at": 0.0})
         print(f"⚡ UAT test Delivery report updated | {len(batch_data)} branches")
 
 
