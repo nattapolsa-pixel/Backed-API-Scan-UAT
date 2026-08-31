@@ -53,7 +53,7 @@ if not os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
 # UAT must not initialize a BigQuery client at all.  Google credentials are
 # loaded lazily by get_sheets_session() only when a Sheet operation is needed.
 APP_ENV = os.environ.get("APP_ENV", "uat").strip().lower()
-APP_VERSION = os.environ.get("APP_VERSION", "1.1.0-uat").strip()
+APP_VERSION = os.environ.get("APP_VERSION", "1.1.1-uat").strip()
 UAT_SHEETS_ONLY = os.environ.get("UAT_SHEETS_ONLY", "true").strip().lower() in ("1", "true", "yes", "on")
 SCAN_FEATURE_ENABLED = os.environ.get("SCAN_FEATURE_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
 
@@ -88,9 +88,11 @@ member_history_row_cache = {"expires_at": 0.0, "existing_map": {}, "last_data_ro
 
 DELIVERY_REPORT_SPREADSHEET_ID = "14kBtY2tdMXi3I9rbNleokmyJ_WWGRmKXPPU2VaVstZQ"
 DELIVERY_REPORT_SHEET_NAME = "Delivery report"
-LEGACY_DELIVERY_REPORT_SYNC_ENABLED = os.environ.get(
-    "LEGACY_DELIVERY_REPORT_SYNC_ENABLED", "false"
-).strip().lower() in ("1", "true", "yes", "on")
+# The legacy transport workbook is a read-only lookup source in UAT.
+# Keep Sheet3/Data Booking&Car available to the web, but never write back to
+# any tab in this spreadsheet—even if an old Render env var still exists.
+DELIVERY_REPORT_READ_ONLY = True
+LEGACY_DELIVERY_REPORT_SYNC_ENABLED = False
 # UAT only: isolated reconciliation target.  This is deliberately separate
 # from the live Delivery report while the direct-write path is being verified.
 UAT_REPORT_TEST_SPREADSHEET_ID = os.environ.get(
@@ -922,7 +924,9 @@ def write_uat_report_test_summaries(summaries: list):
 
 
 def write_delivery_report_summaries(summaries: list):
-    """Upsert multiple Wave+Branch into the source tab using batchUpdate in 1 single HTTP request."""
+    """Blocked in UAT: the legacy transport workbook is lookup-only."""
+    if DELIVERY_REPORT_READ_ONLY:
+        raise RuntimeError("legacy transport workbook is read-only in UAT")
     if not LEGACY_DELIVERY_REPORT_SYNC_ENABLED:
         raise RuntimeError("legacy Delivery report/staging sync is disabled")
     if not summaries:
@@ -2959,6 +2963,7 @@ async def read_root():
         "message": "Scanner API UAT is running",
         "environment": APP_ENV,
         "data_source": "google_sheets" if UAT_SHEETS_ONLY else "bigquery",
+        "legacy_transport_workbook": "read_only",
         "scan_feature_enabled": SCAN_FEATURE_ENABLED,
     }
 
@@ -2972,6 +2977,7 @@ async def health_check(response: Response):
         "status": "ok", "version": APP_VERSION, "timestamp": time.time(),
         "environment": APP_ENV,
         "data_source": "google_sheets" if UAT_SHEETS_ONLY else "bigquery",
+        "legacy_transport_workbook": "read_only",
         "scan_feature_enabled": SCAN_FEATURE_ENABLED,
     }
 
