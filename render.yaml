@@ -12,8 +12,8 @@ services:
     healthCheckPath: /api/health
     autoDeployTrigger: commit
     envVars:
-      - key: GOOGLE_APPLICATION_CREDENTIALS
-        value: /etc/secrets/pro-scanner-uat.json
+      - key: GOOGLE_SERVICE_ACCOUNT_JSON
+        sync: false
       - key: APP_ENV
         value: uat
       - key: UAT_SHEETS_ONLY
