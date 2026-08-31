@@ -87,6 +87,9 @@ member_history_row_cache = {"expires_at": 0.0, "existing_map": {}, "last_data_ro
 
 DELIVERY_REPORT_SPREADSHEET_ID = "14kBtY2tdMXi3I9rbNleokmyJ_WWGRmKXPPU2VaVstZQ"
 DELIVERY_REPORT_SHEET_NAME = "Delivery report"
+LEGACY_DELIVERY_REPORT_SYNC_ENABLED = os.environ.get(
+    "LEGACY_DELIVERY_REPORT_SYNC_ENABLED", "false"
+).strip().lower() in ("1", "true", "yes", "on")
 # UAT only: isolated reconciliation target.  This is deliberately separate
 # from the live Delivery report while the direct-write path is being verified.
 UAT_REPORT_TEST_SPREADSHEET_ID = os.environ.get(
@@ -102,12 +105,18 @@ DELIVERY_BRANCH_SHEET_NAME = "Sheet3"
 DELIVERY_BRANCH_SHEET_GID = "500149916"
 BRANCH_MASTER_SPREADSHEET_ID = "18-gD0iSI3ivMijKQi54Ds-7Gm2p-LFyovjEs1MelrKQ"
 BRANCH_MASTER_SHEET_NAME = "ข้อมูลสาขา"
+WAVE_MONITORING_SPREADSHEET_ID = "1TL-tj-BrvYM7i_wNHlA0x641_VOqfT9SLpmm2NZATOo"
+WAVE_MONITORING_SHEET_NAME = "Wave_Monitoring"
+WAVE_MONITORING_SHEET_GID = "0"
+WAVE_MONITORING_CACHE_TTL_SECONDS = 5 * 60
 delivery_report_lock = Lock()
 delivery_lookup_cache = {"expires_at": 0.0, "cars": {}, "branches": {}}
 branch_province_cache = {"expires_at": 0.0, "data": {}}
 branch_province_refresh_lock = Lock()
 branch_report_cache = {"expires_at": 0.0, "data": {}}
 branch_report_refresh_lock = Lock()
+wave_monitoring_pick_date_cache = {"expires_at": 0.0, "exact": {}, "waves": {}}
+wave_monitoring_pick_date_lock = Lock()
 delivery_report_row_cache = {"expires_at": 0.0, "existing_map": {}, "last_data_row": 1}
 uat_report_test_row_cache = {"expires_at": 0.0, "existing_map": {}, "last_data_row": 1}
 SHEET_ROW_CACHE_TTL_SECONDS = 10 * 60  # ✅ Standard: เพิ่ม cache row เป็น 10 นาที ลด API round-trips
@@ -568,6 +577,93 @@ def get_sheet_meta_for_booking(booking_no: str, force: bool = False) -> dict:
     raw_num = re.sub(r"^B0*1*", "", compact)
     return booking_map.get(clean_b) or booking_map.get(compact) or booking_map.get(raw_num) or booking_map.get(f"B001-{raw_num}") or {}
 
+
+def _wave_tokens(value) -> list:
+    """Support single, zero-padded and multi-wave cell formats."""
+    text = str(value or "").strip()
+    if not text:
+        return []
+    tokens = []
+    for match in re.findall(r"(?<!\d)\d[\d,]{4,12}(?!\d)", text):
+        digits = re.sub(r"\D", "", match)
+        if 5 <= len(digits) <= 10:
+            tokens.append(str(int(digits)))
+    return list(dict.fromkeys(tokens))
+
+
+def _parse_pick_date(value):
+    if isinstance(value, datetime.datetime):
+        return value.date()
+    if isinstance(value, datetime.date):
+        return value
+    text = str(value or "").strip()
+    if not text:
+        return None
+    text = text.split("T", 1)[0].strip()
+    for pattern in ("%Y-%m-%d", "%d/%m/%Y", "%Y/%m/%d"):
+        try:
+            return datetime.datetime.strptime(text, pattern).date()
+        except ValueError:
+            continue
+    return None
+
+
+def load_wave_monitoring_pick_dates(force: bool = False) -> tuple:
+    """Load Wave(A), Planned Pick Date(B), Booking(I) without touching Delivery report."""
+    now = time.time()
+    with wave_monitoring_pick_date_lock:
+        if not force and wave_monitoring_pick_date_cache["expires_at"] > now:
+            return (copy.deepcopy(wave_monitoring_pick_date_cache["exact"]),
+                    copy.deepcopy(wave_monitoring_pick_date_cache["waves"]))
+
+    exact = {}
+    wave_dates = {}
+    try:
+        query = urllib.parse.urlencode({
+            "gid": WAVE_MONITORING_SHEET_GID,
+            "tqx": "out:csv",
+            "tq": "select A,B,I where A is not null and B is not null",
+        })
+        url = f"https://docs.google.com/spreadsheets/d/{WAVE_MONITORING_SPREADSHEET_ID}/gviz/tq?{query}"
+        request = urllib.request.Request(url, headers={"User-Agent": "Pro-Scanner-UAT/1.0"})
+        with urllib.request.urlopen(request, timeout=15) as response:
+            rows = list(csv.reader(io.StringIO(response.read().decode("utf-8-sig"))))
+        for row in rows[1:]:
+            row = list(row) + [""] * max(0, 3 - len(row))
+            pick_date = _parse_pick_date(row[1])
+            booking = re.sub(r"\s+", "", str(row[2] or "").upper())
+            if not pick_date:
+                continue
+            for wave in _wave_tokens(row[0]):
+                if booking:
+                    exact[(booking, wave)] = pick_date
+                    exact[(booking.replace("-", ""), wave)] = pick_date
+                wave_dates.setdefault(wave, pick_date)
+        with wave_monitoring_pick_date_lock:
+            wave_monitoring_pick_date_cache.update({
+                "expires_at": time.time() + WAVE_MONITORING_CACHE_TTL_SECONDS,
+                "exact": exact, "waves": wave_dates,
+            })
+    except Exception as exc:
+        print(f"⚠️ Wave Monitoring pick-date read unavailable: {exc}")
+        with wave_monitoring_pick_date_lock:
+            if wave_monitoring_pick_date_cache["exact"] or wave_monitoring_pick_date_cache["waves"]:
+                wave_monitoring_pick_date_cache["expires_at"] = time.time() + 30
+                return (copy.deepcopy(wave_monitoring_pick_date_cache["exact"]),
+                        copy.deepcopy(wave_monitoring_pick_date_cache["waves"]))
+    return exact, wave_dates
+
+
+def get_wave_monitoring_pick_date(wave_no: str, booking_no: str = ""):
+    waves = _wave_tokens(wave_no)
+    if not waves:
+        return None
+    wave = waves[0]
+    booking = re.sub(r"\s+", "", str(booking_no or "").upper())
+    exact, wave_dates = load_wave_monitoring_pick_dates()
+    return (exact.get((booking, wave)) or exact.get((booking.replace("-", ""), wave))
+            or wave_dates.get(wave))
+
 # ==================== DOCUMENT OVERRIDES SYNC SYSTEM ====================
 document_overrides_overlay = {}
 document_overrides_lock = Lock()
@@ -645,12 +741,14 @@ def record_document_overrides(summaries: list, emp_id: str, reason: str = ""):
     append_uat_event_rows("Document Overrides", rows_to_insert)
     print(f"✅ Saved {len(rows_to_insert)} document overrides to UAT Sheet")
 
-def get_delivery_wave_meta(wave: str) -> dict:
+def get_delivery_wave_meta(wave: str, booking: str = "") -> dict:
     if UAT_SHEETS_ONLY:
         meta = get_sheet_meta_for_wave(wave)
+        resolved_booking = str(booking or meta.get("booking") or "").strip().upper()
         return {
-            "pick_date": None,
-            "booking": str(meta.get("booking") or "").strip().upper(),
+            **meta,
+            "pick_date": get_wave_monitoring_pick_date(wave, resolved_booking),
+            "booking": resolved_booking,
         }
     query = """
         SELECT MAX(Planned_Pick_Date) AS planned_pick_date,
@@ -733,9 +831,11 @@ def write_uat_report_test_summaries(summaries: list):
         for summary in summaries:
             wave = str(int(str(summary["wave"]).strip()))
             branch = str(summary["branch"] or "").strip().upper()
-            if wave not in meta_cache:
-                meta_cache[wave] = get_sheet_meta_for_wave(wave)
-            meta = meta_cache[wave]
+            summary_booking = str(summary.get("booking") or "").strip().upper()
+            meta_key = (wave, summary_booking)
+            if meta_key not in meta_cache:
+                meta_cache[meta_key] = get_delivery_wave_meta(wave, summary_booking)
+            meta = meta_cache[meta_key]
             booking = str(summary.get("booking") or meta.get("booking") or "").strip().upper()
             key = (booking, wave, branch)
             target_row = existing_map.get(key)
@@ -746,7 +846,12 @@ def write_uat_report_test_summaries(summaries: list):
                 current_append_row += 1
                 existing_map[key] = target_row
             branch_meta = branch_map.get(branch, {})
-            pick_date = now_bkk.date()
+            pick_date = meta.get("pick_date")
+            # Never silently replace a missing planned pick date with today's
+            # date: that creates an incorrect operational report.
+            if not pick_date:
+                print(f"UAT report skipped: planned pick date not found | {booking}/{wave}/{branch}")
+                continue
             order_date, delivery_date = delivery_business_dates(pick_date)
             row = [[
                 target_row - 1,
@@ -811,6 +916,8 @@ def write_uat_report_test_summaries(summaries: list):
 
 def write_delivery_report_summaries(summaries: list):
     """Upsert multiple Wave+Branch into the source tab using batchUpdate in 1 single HTTP request."""
+    if not LEGACY_DELIVERY_REPORT_SYNC_ENABLED:
+        raise RuntimeError("legacy Delivery report/staging sync is disabled")
     if not summaries:
         return
     session = get_sheets_session()
@@ -2895,18 +3002,19 @@ def sync_document_summary_reports(summaries: list):
                 failed.append(f"{s.get('wave')}/{s.get('branch')}: {single_exc}")
         if failed:
             failures.append("Member Data: " + "; ".join(failed))
-    try:
-        write_delivery_report_summaries(summaries)
-    except Exception as exc:
-        print(f"🚨 Delivery report batch write error: {exc}")
-        failed = []
-        for s in summaries:
-            try:
-                write_delivery_report_summary(s)
-            except Exception as single_exc:
-                failed.append(f"{s.get('wave')}/{s.get('branch')}: {single_exc}")
-        if failed:
-            failures.append("Delivery report: " + "; ".join(failed))
+    if LEGACY_DELIVERY_REPORT_SYNC_ENABLED:
+        try:
+            write_delivery_report_summaries(summaries)
+        except Exception as exc:
+            print(f"🚨 Delivery report batch write error: {exc}")
+            failed = []
+            for s in summaries:
+                try:
+                    write_delivery_report_summary(s)
+                except Exception as single_exc:
+                    failed.append(f"{s.get('wave')}/{s.get('branch')}: {single_exc}")
+            if failed:
+                failures.append("Delivery report: " + "; ".join(failed))
     if failures:
         raise RuntimeError(" | ".join(failures))
 
@@ -3028,25 +3136,15 @@ def get_document_overrides_endpoint(wave_no: str):
 
 @app.get("/api/transport-meta")
 def get_transport_meta(booking: str):
-    """ข้อมูลรถและขนส่งสำหรับหัวเอกสารใบขาดเกินจาก Data Booking&Car."""
+    """ข้อมูลรถและขนส่งจาก Booking & Wave source (ไม่อ่าน Delivery report เดิม)."""
     clean_booking = str(booking or "").strip().upper()
     if not clean_booking:
         return {"booking": "", "carrier": "", "driver": "", "plate": ""}
-    if UAT_SHEETS_ONLY:
-        meta = get_sheet_meta_for_booking(clean_booking)
-        return {
-            "booking": clean_booking,
-            "carrier": str(meta.get("carrier") or ""),
-            "driver": str(meta.get("sender") or ""),
-            "plate": str(meta.get("plate") or ""),
-        }
-    session = get_sheets_session()
-    cars, _ = load_delivery_lookup_maps(session)
-    meta = cars.get(clean_booking) or {}
+    meta = get_sheet_meta_for_booking(clean_booking)
     return {
         "booking": clean_booking,
         "carrier": str(meta.get("carrier") or ""),
-        "driver": str(meta.get("driver") or ""),
+        "driver": str(meta.get("sender") or ""),
         "plate": str(meta.get("plate") or ""),
     }
 
