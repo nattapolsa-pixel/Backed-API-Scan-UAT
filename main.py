@@ -92,6 +92,7 @@ DELIVERY_SOURCE_SHEET_ID = 0
 DELIVERY_REPORT_SHEET_ID = 1686001204
 DELIVERY_CAR_SHEET_NAME = "Data Booking&Car"
 DELIVERY_BRANCH_SHEET_NAME = "Sheet3"
+DELIVERY_BRANCH_SHEET_GID = "500149916"
 delivery_report_lock = Lock()
 delivery_lookup_cache = {"expires_at": 0.0, "cars": {}, "branches": {}}
 branch_province_cache = {"expires_at": 0.0, "data": {}}
@@ -394,18 +395,37 @@ def load_branch_province_map(session, force: bool = False) -> dict:
             return copy.deepcopy(branch_province_cache["data"])
 
         rows = []
-        chunk_size = 2000
-        max_rows = 20000
-        for start_row in range(1, max_rows + 1, chunk_size):
-            end_row = min(start_row + chunk_size - 1, max_rows)
-            chunk = _sheet_values(
-                session,
-                DELIVERY_REPORT_SPREADSHEET_ID,
-                f"'{DELIVERY_BRANCH_SHEET_NAME}'!A{start_row}:D{end_row}",
+        try:
+            gviz_response = session.get(
+                f"https://docs.google.com/spreadsheets/d/{DELIVERY_REPORT_SPREADSHEET_ID}/gviz/tq",
+                params={
+                    "tqx": "out:csv",
+                    "gid": DELIVERY_BRANCH_SHEET_GID,
+                    "sheet": DELIVERY_BRANCH_SHEET_NAME,
+                    "tq": "select A,D",
+                },
+                timeout=(3, 25),
             )
-            rows.extend(chunk)
-            if len(chunk) < chunk_size:
-                break
+            gviz_response.raise_for_status()
+            content_type = str(gviz_response.headers.get("Content-Type") or "").lower()
+            if "text/html" in content_type:
+                raise RuntimeError("GViz returned an HTML login page")
+            csv_rows = list(csv.reader(io.StringIO(gviz_response.text.lstrip("\ufeff"))))
+            rows = [[row[0] if row else "", "", "", row[1] if len(row) > 1 else ""] for row in csv_rows]
+        except Exception as gviz_error:
+            print(f"Branch province GViz read unavailable: {gviz_error}")
+            chunk_size = 2000
+            max_rows = 20000
+            for start_row in range(1, max_rows + 1, chunk_size):
+                end_row = min(start_row + chunk_size - 1, max_rows)
+                chunk = _sheet_values(
+                    session,
+                    DELIVERY_REPORT_SPREADSHEET_ID,
+                    f"'{DELIVERY_BRANCH_SHEET_NAME}'!A{start_row}:D{end_row}",
+                )
+                rows.extend(chunk)
+                if len(chunk) < chunk_size:
+                    break
         province_map = {}
         for row in rows[1:]:
             row = list(row) + [""] * max(0, 4 - len(row))
