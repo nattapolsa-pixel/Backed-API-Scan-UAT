@@ -2626,6 +2626,28 @@ async def health_check(response: Response):
         "scan_feature_enabled": SCAN_FEATURE_ENABLED,
     }
 
+
+@app.get("/api/branch-provinces")
+def get_branch_provinces(force: bool = False):
+    """Serve the branch master using authenticated Google Sheets access."""
+    if force:
+        with delivery_report_lock:
+            delivery_lookup_cache["expires_at"] = 0.0
+
+    session = get_sheets_session()
+    _, branches = load_delivery_lookup_maps(session)
+    province_map = {
+        str(code).strip().upper(): str(meta.get("province") or "").strip()
+        for code, meta in branches.items()
+        if str(code).strip() and str(meta.get("province") or "").strip()
+    }
+    return {
+        "success": True,
+        "source": DELIVERY_BRANCH_SHEET_NAME,
+        "count": len(province_map),
+        "branches": province_map,
+    }
+
 def sync_document_summary_reports(summaries: list):
     if UAT_SHEETS_ONLY:
         # UAT ห้ามแก้ Member Data / Delivery report ซึ่งเป็นข้อมูลใช้งานจริง
