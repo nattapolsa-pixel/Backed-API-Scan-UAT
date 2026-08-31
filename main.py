@@ -2743,37 +2743,41 @@ def get_booking_data_internal(booking_no: str, force_refresh: bool = False) -> d
                     lpn_list.append(item)
                 continue
 
-            base_summary = summarize_branch_for_member_data(
-                {"wave_no": wave_key, "booking_no": native_booking, "lpn_list": branch_items}, branch
-            )
-            fields = ("m", "red", "blue", "green", "black", "pallet")
-            split_columns = {"m": "M_Count", "red": "Red_Count", "blue": "Blue_Count",
-                             "green": "Green_Count", "black": "Black_Count", "pallet": "Pallet_Count"}
-            outgoing = {field: sum(int(split.get(split_columns[field]) or 0) for split in branch_splits)
-                        for field in fields}
-            target_split = next((split for split in branch_splits
-                                 if str(split.get("Target_Booking") or "").strip().upper() == booking_clean), None)
+            if branch_splits:
+                base_summary = summarize_branch_for_member_data(
+                    {"wave_no": wave_key, "booking_no": native_booking, "lpn_list": branch_items}, branch
+                )
+                fields = ("m", "red", "blue", "green", "black", "pallet")
+                split_columns = {"m": "M_Count", "red": "Red_Count", "blue": "Blue_Count",
+                                 "green": "Green_Count", "black": "Black_Count", "pallet": "Pallet_Count"}
+                outgoing = {field: sum(int(split.get(split_columns[field]) or 0) for split in branch_splits)
+                            for field in fields}
+                target_split = next((split for split in branch_splits
+                                     if str(split.get("Target_Booking") or "").strip().upper() == booking_clean), None)
 
-            if booking_clean == native_booking:
-                visible_totals = {field: max(0, int(base_summary.get(field) or 0) - outgoing[field]) for field in fields}
+                if booking_clean == native_booking:
+                    visible_totals = {field: max(0, int(base_summary.get(field) or 0) - outgoing[field]) for field in fields}
+                    for item in branch_items:
+                        item = copy.deepcopy(item)
+                        item["booking_split_summary"] = visible_totals
+                        item["booking_split_outgoing"] = True
+                        lpn_list.append(item)
+                elif target_split:
+                    visible_totals = {field: max(0, int(target_split.get(split_columns[field]) or 0)) for field in fields}
+                    first = copy.deepcopy(branch_items[0])
+                    first.update({
+                        "lpn": f"แบ่งยอดจาก {native_booking}", "zone": "TRANSFER", "status": "Scanned",
+                        "qty": sum(visible_totals[field] for field in ("m", "red", "blue", "green", "black")),
+                        "total_qty": sum(visible_totals[field] for field in ("m", "red", "blue", "green", "black")),
+                        "scan_type": "BOOKING_SPLIT", "color": "None", "historical_summary": True,
+                        "booking_split_summary": visible_totals,
+                        "booking_split_source": native_booking,
+                        "booking_split_target": booking_clean,
+                    })
+                    lpn_list.append(first)
+            else:
                 for item in branch_items:
-                    item = copy.deepcopy(item)
-                    item["booking_split_summary"] = visible_totals
-                    item["booking_split_outgoing"] = True
                     lpn_list.append(item)
-            elif target_split:
-                visible_totals = {field: max(0, int(target_split.get(split_columns[field]) or 0)) for field in fields}
-                first = copy.deepcopy(branch_items[0])
-                first.update({
-                    "lpn": f"แบ่งยอดจาก {native_booking}", "zone": "TRANSFER", "status": "Scanned",
-                    "qty": sum(visible_totals[field] for field in ("m", "red", "blue", "green", "black")),
-                    "total_qty": sum(visible_totals[field] for field in ("m", "red", "blue", "green", "black")),
-                    "scan_type": "BOOKING_SPLIT", "color": "None", "historical_summary": True,
-                    "booking_split_summary": visible_totals,
-                    "booking_split_source": native_booking,
-                    "booking_split_target": booking_clean,
-                })
-                lpn_list.append(first)
         waves_included.add(wave_data_overlaid["wave_no"])
         
     zones_calc = {}
