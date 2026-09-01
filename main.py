@@ -54,7 +54,7 @@ if not os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
 # UAT must not initialize a BigQuery client at all.  Google credentials are
 # loaded lazily by get_sheets_session() only when a Sheet operation is needed.
 APP_ENV = os.environ.get("APP_ENV", "uat").strip().lower()
-APP_VERSION = os.environ.get("APP_VERSION", "1.2.5-uat").strip()
+APP_VERSION = os.environ.get("APP_VERSION", "1.2.6-uat").strip()
 UAT_SHEETS_ONLY = os.environ.get("UAT_SHEETS_ONLY", "true").strip().lower() in ("1", "true", "yes", "on")
 SCAN_FEATURE_ENABLED = os.environ.get("SCAN_FEATURE_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
 
@@ -3563,7 +3563,11 @@ def move_booking_branch(data: BookingBranchMoveData):
         booking_waves_cache.pop(previous, None)
         booking_waves_cache.pop(target, None)
     queue_branch_totals_reconciliation([(wave_clean, branch)], delay_seconds=0.5)
-    return {"status": "success", "message": "ย้ายสาขาเรียบร้อย", "previous_booking": previous, "target_booking": target, "preview": preview}
+    # ส่งมุมมองปลายทางที่อ่านหลังบันทึกกลับใน response เดียว ป้องกันหน้าเว็บ
+    # ยิง GET ถัดไปเร็วเกินไปแล้วเห็นข้อมูลก่อนย้าย.
+    target_view = get_booking_data_internal(target, force_refresh=True)
+    return {"status": "success", "message": "ย้ายสาขาเรียบร้อย", "previous_booking": previous,
+            "target_booking": target, "preview": preview, "target_view": target_view}
 
 @app.post("/api/split-booking-branch")
 def split_booking_branch(data: BookingBranchSplitData):
@@ -3607,8 +3611,10 @@ def split_booking_branch(data: BookingBranchSplitData):
         booking_waves_cache.pop(source, None)
         booking_waves_cache.pop(target, None)
     split_report_summaries = []
+    booking_views = {}
     for booking in (source, target):
         booking_view = get_booking_data_internal(booking, force_refresh=True)
+        booking_views[booking] = booking_view
         # A booking can contain the same branch in several waves. Build the
         # report from the exact Wave+Branch only, otherwise another wave's
         # split summary can overwrite this row or make one side look missing.
@@ -3629,7 +3635,8 @@ def split_booking_branch(data: BookingBranchSplitData):
             split_report_summaries.append(summary)
     queue_report_summary_snapshots(split_report_summaries, delay_seconds=0.0)
     return {"status": "success", "message": "แบ่งยอดเข้าสอง Booking เรียบร้อย",
-            "source_booking": source, "target_booking": target, "allocated": requested}
+            "source_booking": source, "target_booking": target, "allocated": requested,
+            "target_view": booking_views.get(target)}
 
 @app.post("/api/start-pallet")
 def start_pallet(data: PalletStartData):
