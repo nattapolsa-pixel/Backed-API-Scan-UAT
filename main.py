@@ -636,23 +636,31 @@ def load_wave_monitoring_pick_dates(force: bool = False) -> tuple:
     wave_dates = {}
     expected_branches = {}
     try:
-        query = urllib.parse.urlencode({
-            "gid": WAVE_MONITORING_SHEET_GID,
-            "tqx": "out:csv",
-            "tq": "select A,B,I,K where A is not null and B is not null",
-        })
-        url = f"https://docs.google.com/spreadsheets/d/{WAVE_MONITORING_SPREADSHEET_ID}/gviz/tq?{query}"
+        # The GViz query endpoint can inherit the sheet's active basic filter,
+        # which previously hid older pick dates (for example 31/08/2026).
+        # CSV export always returns the full tab regardless of the visible filter.
+        url = (
+            f"https://docs.google.com/spreadsheets/d/{WAVE_MONITORING_SPREADSHEET_ID}"
+            f"/export?format=csv&gid={WAVE_MONITORING_SHEET_GID}"
+        )
         request = urllib.request.Request(url, headers={"User-Agent": "Pro-Scanner-UAT/1.0"})
         with urllib.request.urlopen(request, timeout=15) as response:
             rows = list(csv.reader(io.StringIO(response.read().decode("utf-8-sig"))))
+        headers = rows[0] if rows else []
+        header_index = {str(name).strip(): index for index, name in enumerate(headers)}
+        wave_index = header_index.get("Wave_Number", 0)
+        pick_date_index = header_index.get("Planned_Pick_Date", 1)
+        booking_index = header_index.get("Vehicle_Booking_No", 8)
+        branch_index = header_index.get("Branch_Code", 10)
         for row in rows[1:]:
-            row = list(row) + [""] * max(0, 4 - len(row))
-            pick_date = _parse_pick_date(row[1])
-            booking = re.sub(r"\s+", "", str(row[2] or "").upper())
-            branch = str(row[3] or "").strip().upper()
+            required_width = max(wave_index, pick_date_index, booking_index, branch_index) + 1
+            row = list(row) + [""] * max(0, required_width - len(row))
+            pick_date = _parse_pick_date(row[pick_date_index])
+            booking = re.sub(r"\s+", "", str(row[booking_index] or "").upper())
+            branch = str(row[branch_index] or "").strip().upper()
             if not pick_date:
                 continue
-            for wave in _wave_tokens(row[0]):
+            for wave in _wave_tokens(row[wave_index]):
                 if booking:
                     exact[(booking, wave)] = pick_date
                     exact[(booking.replace("-", ""), wave)] = pick_date
@@ -2726,6 +2734,11 @@ def get_booking_data_internal(booking_no: str, force_refresh: bool = False) -> d
         if re.sub(r"\D", "", str(wave or ""))
     ))
     license_plate = mapping["license_plate"]
+    native_waves = {
+        str(int(re.sub(r"\D", "", str(wave))))
+        for wave in (mapping.get("waves") or [])
+        if re.sub(r"\D", "", str(wave or ""))
+    }
     
     lpn_list = []
     waves_included = set()
@@ -2748,9 +2761,11 @@ def get_booking_data_internal(booking_no: str, force_refresh: bool = False) -> d
     for wave_data_overlaid in wave_results:
         wave_key = str(int(str(wave_data_overlaid["wave_no"]).strip()))
         native_booking = str(wave_data_overlaid.get("booking_no") or "").strip().upper()
+        is_native_wave = (wave_key in native_waves) or (bool(native_booking) and native_booking == booking_clean)
         items_by_branch = {}
         for item in wave_data_overlaid.get("lpn_list", []):
             items_by_branch.setdefault(str(item.get("branch") or "").strip().upper(), []).append(item)
+        wave_has_items = False
         for branch, branch_items in items_by_branch.items():
             assignment = assignments.get((wave_key, branch))
             assigned_booking = str((assignment or {}).get("Assigned_Booking") or "").strip().upper()
@@ -2773,6 +2788,7 @@ def get_booking_data_internal(booking_no: str, force_refresh: bool = False) -> d
                         )
                     }
                     lpn_list.append(item)
+                    wave_has_items = True
                 continue
 
             if branch_splits:
@@ -2787,13 +2803,14 @@ def get_booking_data_internal(booking_no: str, force_refresh: bool = False) -> d
                 target_split = next((split for split in branch_splits
                                      if str(split.get("Target_Booking") or "").strip().upper() == booking_clean), None)
 
-                if booking_clean == native_booking:
+                if is_native_wave:
                     visible_totals = {field: max(0, int(base_summary.get(field) or 0) - outgoing[field]) for field in fields}
                     for item in branch_items:
                         item = copy.deepcopy(item)
                         item["booking_split_summary"] = visible_totals
                         item["booking_split_outgoing"] = True
                         lpn_list.append(item)
+                        wave_has_items = True
                 elif target_split:
                     visible_totals = {field: max(0, int(target_split.get(split_columns[field]) or 0)) for field in fields}
                     first = copy.deepcopy(branch_items[0])
@@ -2807,10 +2824,16 @@ def get_booking_data_internal(booking_no: str, force_refresh: bool = False) -> d
                         "booking_split_target": booking_clean,
                     })
                     lpn_list.append(first)
+                    wave_has_items = True
             else:
-                for item in branch_items:
-                    lpn_list.append(item)
-        waves_included.add(wave_data_overlaid["wave_no"])
+                # สาขาที่ไม่มีการย้ายหรือแบ่งยอด จะต้องอยู่ใน Booking นี้เฉพาะเมื่อ Wave นี้เป็น Wave ดั้งเดิมของ Booking เท่านั้น
+                # ป้องกันไม่ให้ Wave อื่นที่ถูกดึงเข้ามาเพราะย้ายแค่บางสาขา เอาสาขาอื่นทั้งหมดใน Wave นั้นติดมาด้วย
+                if is_native_wave:
+                    for item in branch_items:
+                        lpn_list.append(item)
+                        wave_has_items = True
+        if wave_has_items:
+            waves_included.add(wave_data_overlaid["wave_no"])
         
     zones_calc = {}
     for item in lpn_list:
