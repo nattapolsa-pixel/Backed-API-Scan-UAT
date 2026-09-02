@@ -903,6 +903,31 @@ def write_uat_report_test_summaries(summaries: list):
         if not batch_data:
             return
         base = f"https://sheets.googleapis.com/v4/spreadsheets/{UAT_REPORT_TEST_SPREADSHEET_ID}"
+        # Google Sheets starts new tabs with 1,000 rows. A historical backfill
+        # can exceed that limit, so extend the grid before writing A1 ranges
+        # beyond the current row count. Existing rows/formulas are untouched.
+        required_last_row = max(last_data_row, current_append_row - 1)
+        metadata_response = session.get(
+            base,
+            params={"fields": "sheets(properties(sheetId,title,gridProperties(rowCount)))"},
+            timeout=SHEETS_HTTP_TIMEOUT,
+        )
+        metadata_response.raise_for_status()
+        target_properties = next((
+            sheet.get("properties", {})
+            for sheet in metadata_response.json().get("sheets", [])
+            if int(sheet.get("properties", {}).get("sheetId", -1)) == UAT_REPORT_TEST_SHEET_ID
+        ), {})
+        current_row_count = int(target_properties.get("gridProperties", {}).get("rowCount", 0) or 0)
+        if required_last_row > current_row_count:
+            expand_response = session.post(f"{base}:batchUpdate", json={"requests": [{
+                "appendDimension": {
+                    "sheetId": UAT_REPORT_TEST_SHEET_ID,
+                    "dimension": "ROWS",
+                    "length": required_last_row - current_row_count,
+                }
+            }]}, timeout=SHEETS_HTTP_TIMEOUT)
+            expand_response.raise_for_status()
         response = session.post(
             f"{base}/values:batchUpdate",
             json={"valueInputOption": "USER_ENTERED", "data": batch_data}, timeout=SHEETS_HTTP_TIMEOUT
