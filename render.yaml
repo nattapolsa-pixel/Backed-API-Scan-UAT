@@ -2,13 +2,14 @@ services:
   - type: web
     name: backed-api-scan-uat
     runtime: python
-    plan: standard
+    # Free only: prevents a future Blueprint sync from upgrading compute by accident.
+    plan: free
     region: singapore
     branch: main
-    buildCommand: pip install -r requirements.txt
+    buildCommand: pip install --no-cache-dir -r requirements.txt
     # Cache และ single-flight locks อยู่ใน memory ของ process; ใช้ 1 worker เพื่อให้ทุก request
     # แชร์ cache เดียวกัน ส่วน FastAPI ยังรองรับ blocking Sheet I/O พร้อมกันผ่าน threadpool
-    startCommand: gunicorn main:app -w 1 -k uvicorn.workers.UvicornWorker --worker-connections 2000 --backlog 2048 --bind 0.0.0.0:$PORT --timeout 90 --keep-alive 10 --graceful-timeout 30
+    startCommand: gunicorn main:app -w 1 -k uvicorn.workers.UvicornWorker --worker-connections 200 --backlog 256 --bind 0.0.0.0:$PORT --timeout 120 --keep-alive 10 --graceful-timeout 20
     healthCheckPath: /api/health
     autoDeployTrigger: commit
     envVars:
@@ -20,5 +21,7 @@ services:
         value: "true"
       - key: SCAN_FEATURE_ENABLED
         value: "false"
+      - key: APP_VERSION
+        value: 1.2.7-uat-free
       - key: UAT_DATABASE_SPREADSHEET_ID
         value: 1RJcsrbWnGO7gMiq9bhBR4bA9Twh1NjqP6816dXOW9DI

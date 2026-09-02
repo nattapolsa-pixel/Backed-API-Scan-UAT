@@ -2,7 +2,12 @@ from fastapi import FastAPI, HTTPException, BackgroundTasks, Response
 from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel
 from typing import List, Optional       # ✅ แก้ไข #1: เพิ่ม Optional
-from google.cloud import bigquery
+try:
+    # Free UAT runs from Google Sheets only. Keep BigQuery optional so the
+    # 512 MB instance does not need to load the large client dependency.
+    from google.cloud import bigquery
+except ImportError:
+    bigquery = None
 import google.auth
 from google.oauth2 import service_account
 from google.auth.transport.requests import AuthorizedSession
@@ -27,7 +32,8 @@ from fastapi.middleware.cors import CORSMiddleware
 app = FastAPI()
 
 # ✅ GZip Compression: ลด payload size สำหรับ response ขนาดใหญ่ (Wave data)
-app.add_middleware(GZipMiddleware, minimum_size=512)  # ✅ Standard: compress aggressively from 512 bytes
+# ระดับ 4 ลด CPU บน Free 0.1 CPU แต่ยังลด payload Wave/Booking ได้มาก
+app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=4)
 
 # ✅ จำกัด CORS: อนุญาตเฉพาะหน้าเว็บบน GitHub Pages (*.github.io) + localhost สำหรับทดสอบ
 #    ถ้าใช้โดเมนอื่น (custom domain) ให้เพิ่ม origin นั้นใน ALLOWED_ORIGINS ด้วย
@@ -54,13 +60,13 @@ if not os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
 # UAT must not initialize a BigQuery client at all.  Google credentials are
 # loaded lazily by get_sheets_session() only when a Sheet operation is needed.
 APP_ENV = os.environ.get("APP_ENV", "uat").strip().lower()
-APP_VERSION = os.environ.get("APP_VERSION", "1.2.6-uat").strip()
+APP_VERSION = os.environ.get("APP_VERSION", "1.2.7-uat-free").strip()
 UAT_SHEETS_ONLY = os.environ.get("UAT_SHEETS_ONLY", "true").strip().lower() in ("1", "true", "yes", "on")
 SCAN_FEATURE_ENABLED = os.environ.get("SCAN_FEATURE_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
 
-client = None if UAT_SHEETS_ONLY else bigquery.Client(
-    project=os.environ.get("GOOGLE_CLOUD_PROJECT", "pro-analytics-db")
-)
+if not UAT_SHEETS_ONLY and bigquery is None:
+    raise RuntimeError("google-cloud-bigquery is required when UAT_SHEETS_ONLY=false")
+client = None if UAT_SHEETS_ONLY else bigquery.Client(project=os.environ.get("GOOGLE_CLOUD_PROJECT", "pro-analytics-db"))
 
 # ✅ BigQuery Job Timeout: Standard Plan 1 CPU + 2 GB RAM → 60 วินาที
 BQ_JOB_TIMEOUT_SECONDS = 60
@@ -123,8 +129,8 @@ wave_monitoring_pick_date_cache = {"expires_at": 0.0, "exact": {}, "waves": {}, 
 wave_monitoring_pick_date_lock = Lock()
 delivery_report_row_cache = {"expires_at": 0.0, "existing_map": {}, "last_data_row": 1}
 uat_report_test_row_cache = {"expires_at": 0.0, "existing_map": {}, "last_data_row": 1}
-SHEET_ROW_CACHE_TTL_SECONDS = 10 * 60  # ✅ Standard: เพิ่ม cache row เป็น 10 นาที ลด API round-trips
-SHEETS_HTTP_TIMEOUT = (3, 45)           # ✅ Standard: connect 3s (เร็วกว่า), read 45s (รองรับ large sheet)
+SHEET_ROW_CACHE_TTL_SECONDS = 15 * 60  # Free: ลดการอ่าน Sheet ซ้ำและรักษา RAM ให้อยู่ในขอบเขต
+SHEETS_HTTP_TIMEOUT = (3, 45)
 _sheets_session_local = threading.local()
 
 # ฐานข้อมูลเหตุการณ์ของ UAT (แทนตาราง BigQuery ที่เคยรับข้อมูลเขียนจากหน้าเว็บ)
@@ -155,7 +161,7 @@ UAT_EVENT_SHEETS = {
 uat_event_sheet_lock = Lock()
 uat_event_sheets_ready = False
 uat_event_cache = {}
-UAT_EVENT_CACHE_TTL_SECONDS = 30  # ✅ Standard: UAT event cache 30s เพื่อลด Sheets API calls
+UAT_EVENT_CACHE_TTL_SECONDS = 45  # Free: ลด Sheets API calls; ทุกการเขียนยังล้าง cache ทันที
 uat_event_read_lock = Lock()
 
 def get_sheets_session():
@@ -2701,7 +2707,8 @@ def get_booking_data_internal(booking_no: str, force_refresh: bool = False) -> d
     wave_results = []
     
     # จำกัด fan-out ไม่ให้ Booking ที่มีหลาย Wave ยิง BigQuery พร้อมกันจนคิว API อั้นทั้งระบบ
-    with ThreadPoolExecutor(max_workers=max(1, min(6, len(waves)))) as executor:
+    # Free มี 0.1 CPU/512 MB: จำกัด fan-out เพื่อลด peak RAM/context switching
+    with ThreadPoolExecutor(max_workers=max(1, min(3, len(waves)))) as executor:
         futures = {executor.submit(get_wave_data_internal, wave, wave_force_refresh): wave for wave in waves}
         for future in futures:
             wave = futures[future]
@@ -4381,7 +4388,7 @@ def query_pending_waves_from_bigquery():
 
 
 def _startup_warm_cache():
-    """⚡ Standard Plan: ดึงรายการ Wave ล่วงหน้าตอน startup พร้อม preload Wave cache"""
+    """Free plan: warm Google Sheets caches in one background flow after cold start."""
     try:
         data = query_pending_waves_from_bigquery()
         with pending_waves_cache_lock:
@@ -4389,8 +4396,8 @@ def _startup_warm_cache():
             pending_waves_cache["expires_at"] = time.time() + PENDING_WAVES_CACHE_TTL_SECONDS
         print("✅ Startup cache warm-up complete (pending waves)")
 
-        # ⚡ Standard Plan: 2GB RAM → preload Wave แรกๆ ให้พร้อมเลย
-        waves_to_preload = (data.get("waves") or [])[:3]
+        # อุ่นเฉพาะ Wave ล่าสุดหนึ่งรายการเพื่อลด peak RAM/CPU ตอนเครื่องเพิ่งตื่น
+        waves_to_preload = (data.get("waves") or [])[:1]
         if waves_to_preload:
             import threading
             def _preload_waves():
@@ -4456,7 +4463,7 @@ def recover_recent_report_syncs():
 
 @app.on_event("startup")
 async def startup_event():
-    """⚡ Standard Plan: Pre-warm cache + preload Wave cache ตอน server เริ่มทำงาน"""
+    """Free plan: return health quickly, then warm Sheet caches in background."""
     ensure_report_sync_worker_started()
     threading.Thread(target=_startup_warm_cache, daemon=True).start()
     threading.Thread(target=recover_recent_report_syncs, daemon=True, name="report-sync-recovery").start()
