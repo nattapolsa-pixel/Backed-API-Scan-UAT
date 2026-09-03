@@ -60,7 +60,7 @@ if not os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
 # UAT must not initialize a BigQuery client at all.  Google credentials are
 # loaded lazily by get_sheets_session() only when a Sheet operation is needed.
 APP_ENV = os.environ.get("APP_ENV", "uat").strip().lower()
-APP_VERSION = os.environ.get("APP_VERSION", "1.3.0-uat-free").strip()
+APP_VERSION = os.environ.get("APP_VERSION", "1.3.1-uat-free").strip()
 UAT_SHEETS_ONLY = os.environ.get("UAT_SHEETS_ONLY", "true").strip().lower() in ("1", "true", "yes", "on")
 SCAN_FEATURE_ENABLED = os.environ.get("SCAN_FEATURE_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
 PROCESS_STARTED_AT = time.time()
@@ -168,6 +168,8 @@ uat_event_sheets_ready = False
 uat_event_cache = {}
 UAT_EVENT_CACHE_TTL_SECONDS = 45  # Free: ลด Sheets API calls; ทุกการเขียนยังล้าง cache ทันที
 uat_event_read_lock = Lock()
+dashboard_operations_cache = {"expires_at": 0.0, "rows": []}
+dashboard_operations_lock = Lock()
 
 def get_sheets_session():
     session = getattr(_sheets_session_local, "session", None)
@@ -972,6 +974,7 @@ def write_uat_report_test_summaries(summaries: list):
         }, timeout=SHEETS_HTTP_TIMEOUT)
         sequence_response.raise_for_status()
         uat_report_test_row_cache.update({"existing_map": {}, "last_data_row": 1, "expires_at": 0.0})
+        dashboard_operations_cache.update({"expires_at": 0.0, "rows": []})
         print(f"⚡ UAT test Delivery report updated | {len(batch_data)} branches")
 
 
@@ -3193,6 +3196,54 @@ def _parse_event_datetime(value):
         return None
 
 
+def _parse_report_date(value):
+    raw = str(value or "").strip().split(" ")[0]
+    for pattern in ("%Y-%m-%d", "%d/%m/%Y", "%d/%m/%y"):
+        try:
+            parsed = datetime.datetime.strptime(raw, pattern).date()
+            if parsed.year > 2400:
+                parsed = parsed.replace(year=parsed.year - 543)
+            return parsed
+        except ValueError:
+            continue
+    return None
+
+
+def load_dashboard_operations_rows() -> list:
+    """Read the isolated UAT Delivery report at most once every five minutes."""
+    now = time.time()
+    if dashboard_operations_cache["expires_at"] > now:
+        return copy.deepcopy(dashboard_operations_cache["rows"])
+    with dashboard_operations_lock:
+        now = time.time()
+        if dashboard_operations_cache["expires_at"] > now:
+            return copy.deepcopy(dashboard_operations_cache["rows"])
+        values = _sheet_values(
+            get_sheets_session(), UAT_REPORT_TEST_SPREADSHEET_ID,
+            f"'{UAT_REPORT_TEST_SHEET_NAME}'!C:T"
+        )
+        rows = []
+        for raw in values[1:]:
+            row = list(raw) + [""] * max(0, 18 - len(raw))
+            pick_date = _parse_report_date(row[0])
+            if not pick_date:
+                continue
+            numbers = []
+            for value in row[12:18]:
+                try:
+                    numbers.append(max(0, int(float(str(value or 0).replace(",", "")))))
+                except (TypeError, ValueError):
+                    numbers.append(0)
+            rows.append({
+                "date": pick_date.isoformat(), "booking": str(row[5] or "0").strip() or "0",
+                "wave": str(row[7] or "").strip(), "branch": str(row[8] or "").strip(),
+                "m": numbers[0], "red": numbers[1], "blue": numbers[2],
+                "green": numbers[3], "black": numbers[4], "total": numbers[5],
+            })
+        dashboard_operations_cache.update({"expires_at": time.time() + 300, "rows": rows})
+        return copy.deepcopy(rows)
+
+
 @app.post("/api/usage-event")
 def record_usage_event(data: UsageEventData, background_tasks: BackgroundTasks):
     """Queue one lightweight UAT usage event; never block the user's document flow."""
@@ -3310,6 +3361,69 @@ def get_usage_dashboard(response: Response, days: int = 7):
         users.append(user)
     users.sort(key=lambda item: (-item["prints"], -item["documents_opened"], -item["actions"], item["emp_id"]))
 
+    operations_error = None
+    try:
+        operation_rows = load_dashboard_operations_rows()
+    except Exception as exc:
+        operations_error = str(exc)[:160]
+        operation_rows = []
+        print(f"Dashboard operations unavailable: {operations_error}")
+
+    operation_daily_map = {}
+    operation_bookings = set()
+    operation_waves = set()
+    operation_branches = set()
+    operation_totals = {key: 0 for key in ("m", "red", "blue", "green", "black", "total")}
+    for row in operation_rows:
+        pick_date = _parse_report_date(row.get("date"))
+        if not pick_date or pick_date < cutoff.astimezone(bangkok_tz).date():
+            continue
+        key = pick_date.isoformat()
+        if key not in daily_map:
+            continue
+        item = operation_daily_map.setdefault(key, {
+            "date": key, "m": 0, "red": 0, "blue": 0, "green": 0,
+            "black": 0, "total": 0, "bookings": set(), "waves": set(), "branches": set()
+        })
+        for field in operation_totals:
+            value = max(0, int(row.get(field) or 0))
+            item[field] += value
+            operation_totals[field] += value
+        if row.get("booking"):
+            item["bookings"].add(row["booking"])
+            operation_bookings.add(row["booking"])
+        if row.get("wave"):
+            item["waves"].add(row["wave"])
+            operation_waves.add(row["wave"])
+        if row.get("branch"):
+            item["branches"].add(row["branch"])
+            operation_branches.add(row["branch"])
+
+    operation_daily = []
+    for key in date_keys:
+        item = operation_daily_map.get(key, {
+            "date": key, "m": 0, "red": 0, "blue": 0, "green": 0,
+            "black": 0, "total": 0, "bookings": set(), "waves": set(), "branches": set()
+        })
+        item["booking_count"] = len(item.pop("bookings"))
+        item["wave_count"] = len(item.pop("waves"))
+        item["branch_count"] = len(item.pop("branches"))
+        operation_daily.append(item)
+    peak_day = max(operation_daily, key=lambda item: item["total"], default=None)
+    tote_total = sum(operation_totals[key] for key in ("red", "blue", "green", "black"))
+    operation_summary = {
+        **operation_totals,
+        "tote_total": tote_total,
+        "booking_count": len(operation_bookings),
+        "wave_count": len(operation_waves),
+        "branch_count": len(operation_branches),
+        "avg_boxes_per_booking": round(operation_totals["total"] / len(operation_bookings), 1) if operation_bookings else 0,
+        "m_share_pct": round(operation_totals["m"] / operation_totals["total"] * 100, 1) if operation_totals["total"] else 0,
+        "tote_share_pct": round(tote_total / operation_totals["total"] * 100, 1) if operation_totals["total"] else 0,
+        "peak_date": peak_day["date"] if peak_day and peak_day["total"] else None,
+        "peak_total": peak_day["total"] if peak_day else 0,
+    }
+
     daily = []
     for key in date_keys:
         item = daily_map[key]
@@ -3336,6 +3450,7 @@ def get_usage_dashboard(response: Response, days: int = 7):
         },
         "event_counts": type_counts,
         "daily": daily,
+        "operations": {"summary": operation_summary, "daily": operation_daily},
         "users": users[:50],
         "recent_events": events[:30],
         "system": {
@@ -3345,6 +3460,7 @@ def get_usage_dashboard(response: Response, days: int = 7):
             "scan_feature_enabled": SCAN_FEATURE_ENABLED,
             "uptime_seconds": round(time.time() - PROCESS_STARTED_AT),
             "dashboard_query_ms": round((time.perf_counter() - started) * 1000),
+            "operations_error": operations_error,
         },
     }
     response.headers["Cache-Control"] = "private, max-age=30"
