@@ -22,6 +22,6 @@ services:
       - key: SCAN_FEATURE_ENABLED
         value: "false"
       - key: APP_VERSION
-        value: 1.2.7-uat-free
+        value: 1.3.0-uat-free
       - key: UAT_DATABASE_SPREADSHEET_ID
         value: 1RJcsrbWnGO7gMiq9bhBR4bA9Twh1NjqP6816dXOW9DI

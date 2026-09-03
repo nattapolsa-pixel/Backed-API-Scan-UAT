@@ -60,9 +60,10 @@ if not os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
 # UAT must not initialize a BigQuery client at all.  Google credentials are
 # loaded lazily by get_sheets_session() only when a Sheet operation is needed.
 APP_ENV = os.environ.get("APP_ENV", "uat").strip().lower()
-APP_VERSION = os.environ.get("APP_VERSION", "1.2.7-uat-free").strip()
+APP_VERSION = os.environ.get("APP_VERSION", "1.3.0-uat-free").strip()
 UAT_SHEETS_ONLY = os.environ.get("UAT_SHEETS_ONLY", "true").strip().lower() in ("1", "true", "yes", "on")
 SCAN_FEATURE_ENABLED = os.environ.get("SCAN_FEATURE_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
+PROCESS_STARTED_AT = time.time()
 
 if not UAT_SHEETS_ONLY and bigquery is None:
     raise RuntimeError("google-cloud-bigquery is required when UAT_SHEETS_ONLY=false")
@@ -156,6 +157,10 @@ UAT_EVENT_SHEETS = {
         "Event_ID", "Wave_Number", "Booking_No", "Branch_Code", "Branch_Name", "Status",
         "M_Count", "Red_Count", "Blue_Count", "Green_Count", "Black_Count", "Total_Count",
         "Pallet_Count", "Emp_ID", "Completed_At", "Created_At"
+    ],
+    "Usage Events": [
+        "Event_ID", "Event_Type", "Emp_ID", "Emp_Name", "Wave_Number", "Booking_No",
+        "Branch_Code", "Status", "Duration_Ms", "Detail", "Client_Time", "Created_At"
     ],
 }
 uat_event_sheet_lock = Lock()
@@ -2979,6 +2984,19 @@ class ResetDocumentOverridesData(BaseModel):
     booking: Optional[str] = None
     emp_id: Optional[str] = None
 
+class UsageEventData(BaseModel):
+    event_id: Optional[str] = None
+    event_type: str
+    emp_id: Optional[str] = None
+    emp_name: Optional[str] = None
+    wave: Optional[str] = None
+    booking: Optional[str] = None
+    branch: Optional[str] = None
+    status: Optional[str] = "SUCCESS"
+    duration_ms: Optional[int] = 0
+    detail: Optional[str] = None
+    client_time: Optional[str] = None
+
 class CloseJobData(BaseModel):
     wave: str
     branch: str
@@ -3154,6 +3172,183 @@ def get_branch_provinces(force: bool = False):
         "count": len(province_map),
         "branches": province_map,
     }
+
+
+USAGE_EVENT_TYPES = {
+    "LOGIN", "LOGOUT", "SEARCH", "OPEN_DOCUMENT", "PRINT_DOCUMENT",
+    "SAVE_DOCUMENT", "VIEW_DASHBOARD"
+}
+
+
+def _parse_event_datetime(value):
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = datetime.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=datetime.timezone(datetime.timedelta(hours=7)))
+        return parsed.astimezone(datetime.timezone.utc)
+    except (TypeError, ValueError):
+        return None
+
+
+@app.post("/api/usage-event")
+def record_usage_event(data: UsageEventData, background_tasks: BackgroundTasks):
+    """Queue one lightweight UAT usage event; never block the user's document flow."""
+    event_type = re.sub(r"[^A-Z_]", "", str(data.event_type or "").strip().upper())
+    if event_type not in USAGE_EVENT_TYPES:
+        raise HTTPException(status_code=400, detail="unsupported event_type")
+    status = re.sub(r"[^A-Z_]", "", str(data.status or "SUCCESS").strip().upper())[:20] or "SUCCESS"
+    row = {
+        "Event_ID": str(data.event_id or uuid.uuid4())[:80],
+        "Event_Type": event_type,
+        "Emp_ID": str(data.emp_id or "").strip()[:40],
+        "Emp_Name": str(data.emp_name or "").strip()[:120],
+        "Wave_Number": str(data.wave or "").strip()[:120],
+        "Booking_No": str(data.booking or "").strip().upper()[:120],
+        "Branch_Code": str(data.branch or "").strip().upper()[:40],
+        "Status": status,
+        "Duration_Ms": max(0, min(int(data.duration_ms or 0), 600000)),
+        "Detail": str(data.detail or "").strip()[:240],
+        "Client_Time": str(data.client_time or "").strip()[:60],
+        "Created_At": _uat_now_iso(),
+    }
+    background_tasks.add_task(append_uat_event_rows, "Usage Events", [row])
+    return {"status": "queued", "event_id": row["Event_ID"]}
+
+
+@app.get("/api/dashboard")
+def get_usage_dashboard(response: Response, days: int = 7):
+    """Aggregate UAT usage without exposing raw Sheet access to the browser."""
+    days = max(1, min(int(days or 7), 30))
+    started = time.perf_counter()
+    now_utc = datetime.datetime.now(datetime.timezone.utc)
+    cutoff = now_utc - datetime.timedelta(days=days)
+    bangkok_tz = datetime.timezone(datetime.timedelta(hours=7))
+    records = read_uat_event_records("Usage Events")
+    events = []
+    for row in records:
+        created = _parse_event_datetime(row.get("Created_At"))
+        if not created or created < cutoff:
+            continue
+        try:
+            duration = max(0, int(float(row.get("Duration_Ms") or 0)))
+        except (TypeError, ValueError):
+            duration = 0
+        events.append({
+            "event_type": str(row.get("Event_Type") or "").strip().upper(),
+            "emp_id": str(row.get("Emp_ID") or "").strip(),
+            "emp_name": str(row.get("Emp_Name") or "").strip(),
+            "wave": str(row.get("Wave_Number") or "").strip(),
+            "booking": str(row.get("Booking_No") or "").strip(),
+            "branch": str(row.get("Branch_Code") or "").strip(),
+            "status": str(row.get("Status") or "SUCCESS").strip().upper(),
+            "duration_ms": duration,
+            "detail": str(row.get("Detail") or "").strip(),
+            "created_at": created.isoformat(),
+        })
+
+    type_counts = {event_type: 0 for event_type in sorted(USAGE_EVENT_TYPES)}
+    user_map = {}
+    date_keys = []
+    daily_map = {}
+    today_bkk = now_utc.astimezone(bangkok_tz).date()
+    for offset in range(days - 1, -1, -1):
+        key = (today_bkk - datetime.timedelta(days=offset)).isoformat()
+        date_keys.append(key)
+        daily_map[key] = {"date": key, "actions": 0, "searches": 0, "prints": 0, "errors": 0, "users": set()}
+
+    successful = 0
+    search_durations = []
+    for event in events:
+        event_type = event["event_type"]
+        type_counts[event_type] = type_counts.get(event_type, 0) + 1
+        is_error = event["status"] in {"ERROR", "FAILED", "NOT_FOUND", "TIMEOUT"}
+        if not is_error:
+            successful += 1
+        if event_type == "SEARCH" and event["duration_ms"] > 0:
+            search_durations.append(event["duration_ms"])
+
+        parsed_created = _parse_event_datetime(event["created_at"])
+        day_key = parsed_created.astimezone(bangkok_tz).date().isoformat() if parsed_created else ""
+        if day_key in daily_map:
+            daily = daily_map[day_key]
+            daily["actions"] += 1
+            daily["searches"] += 1 if event_type == "SEARCH" else 0
+            daily["prints"] += 1 if event_type == "PRINT_DOCUMENT" else 0
+            daily["errors"] += 1 if is_error else 0
+            if event["emp_id"]:
+                daily["users"].add(event["emp_id"])
+
+        emp_id = event["emp_id"] or "ไม่ระบุ"
+        user = user_map.setdefault(emp_id, {
+            "emp_id": emp_id, "emp_name": event["emp_name"] or "", "actions": 0,
+            "searches": 0, "documents_opened": 0, "prints": 0, "saves": 0,
+            "errors": 0, "search_duration_total": 0, "search_duration_count": 0,
+            "last_active": event["created_at"],
+        })
+        if event["emp_name"]:
+            user["emp_name"] = event["emp_name"]
+        user["actions"] += 1
+        user["searches"] += 1 if event_type == "SEARCH" else 0
+        user["documents_opened"] += 1 if event_type == "OPEN_DOCUMENT" else 0
+        user["prints"] += 1 if event_type == "PRINT_DOCUMENT" else 0
+        user["saves"] += 1 if event_type == "SAVE_DOCUMENT" else 0
+        user["errors"] += 1 if is_error else 0
+        if event_type == "SEARCH" and event["duration_ms"] > 0:
+            user["search_duration_total"] += event["duration_ms"]
+            user["search_duration_count"] += 1
+        if event["created_at"] > user["last_active"]:
+            user["last_active"] = event["created_at"]
+
+    users = []
+    for user in user_map.values():
+        count = user.pop("search_duration_count")
+        total = user.pop("search_duration_total")
+        user["avg_search_ms"] = round(total / count) if count else 0
+        users.append(user)
+    users.sort(key=lambda item: (-item["prints"], -item["documents_opened"], -item["actions"], item["emp_id"]))
+
+    daily = []
+    for key in date_keys:
+        item = daily_map[key]
+        item["active_users"] = len(item.pop("users"))
+        daily.append(item)
+    events.sort(key=lambda item: item["created_at"], reverse=True)
+    searches = type_counts.get("SEARCH", 0)
+    avg_search_ms = round(sum(search_durations) / len(search_durations)) if search_durations else 0
+    success_rate = round((successful / len(events)) * 100, 1) if events else 0
+    payload = {
+        "success": True,
+        "generated_at": now_utc.isoformat(),
+        "period_days": days,
+        "summary": {
+            "active_users": len([user for user in users if user["emp_id"] != "ไม่ระบุ"]),
+            "actions": len(events),
+            "searches": searches,
+            "documents_opened": type_counts.get("OPEN_DOCUMENT", 0),
+            "prints": type_counts.get("PRINT_DOCUMENT", 0),
+            "saves": type_counts.get("SAVE_DOCUMENT", 0),
+            "errors": len(events) - successful,
+            "success_rate": success_rate,
+            "avg_search_ms": avg_search_ms,
+        },
+        "event_counts": type_counts,
+        "daily": daily,
+        "users": users[:50],
+        "recent_events": events[:30],
+        "system": {
+            "api_version": APP_VERSION,
+            "environment": APP_ENV,
+            "data_source": "google_sheets" if UAT_SHEETS_ONLY else "bigquery",
+            "scan_feature_enabled": SCAN_FEATURE_ENABLED,
+            "uptime_seconds": round(time.time() - PROCESS_STARTED_AT),
+            "dashboard_query_ms": round((time.perf_counter() - started) * 1000),
+        },
+    }
+    response.headers["Cache-Control"] = "private, max-age=30"
+    return payload
 
 def sync_document_summary_reports(summaries: list):
     if UAT_SHEETS_ONLY:
