@@ -60,7 +60,7 @@ if not os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
 # UAT must not initialize a BigQuery client at all.  Google credentials are
 # loaded lazily by get_sheets_session() only when a Sheet operation is needed.
 APP_ENV = os.environ.get("APP_ENV", "uat").strip().lower()
-APP_VERSION = os.environ.get("APP_VERSION", "1.3.2-uat-free").strip()
+APP_VERSION = os.environ.get("APP_VERSION", "1.3.3-uat-free").strip()
 UAT_SHEETS_ONLY = os.environ.get("UAT_SHEETS_ONLY", "true").strip().lower() in ("1", "true", "yes", "on")
 SCAN_FEATURE_ENABLED = os.environ.get("SCAN_FEATURE_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
 PROCESS_STARTED_AT = time.time()
@@ -3278,21 +3278,36 @@ def record_usage_event(data: UsageEventData, background_tasks: BackgroundTasks):
 
 
 @app.get("/api/dashboard")
-def get_usage_dashboard(response: Response, days: int = 7, q: str = "", employee: str = ""):
+def get_usage_dashboard(response: Response, days: int = 7, q: str = "", employee: str = "",
+                        date_from: str = "", date_to: str = ""):
     """Aggregate UAT usage without exposing raw Sheet access to the browser."""
     days = max(1, min(int(days or 7), 30))
     query = re.sub(r"\s+", " ", str(q or "").strip()).upper()[:120]
     employee_filter = str(employee or "").strip().upper()[:40]
     started = time.perf_counter()
     now_utc = datetime.datetime.now(datetime.timezone.utc)
-    cutoff = now_utc - datetime.timedelta(days=days)
     bangkok_tz = datetime.timezone(datetime.timedelta(hours=7))
+    today_bkk = now_utc.astimezone(bangkok_tz).date()
+    requested_from = _parse_report_date(date_from) if date_from else None
+    requested_to = _parse_report_date(date_to) if date_to else None
+    if date_from and not requested_from:
+        raise HTTPException(status_code=400, detail="date_from must be YYYY-MM-DD")
+    if date_to and not requested_to:
+        raise HTTPException(status_code=400, detail="date_to must be YYYY-MM-DD")
+    range_to = requested_to or today_bkk
+    range_from = requested_from or (range_to - datetime.timedelta(days=days - 1))
+    if range_from > range_to:
+        raise HTTPException(status_code=400, detail="date_from must not be after date_to")
+    if (range_to - range_from).days >= 366:
+        raise HTTPException(status_code=400, detail="date range must not exceed 366 days")
+    period_days = (range_to - range_from).days + 1
     records = read_uat_event_records("Usage Events")
     events = []
     employee_options_map = {}
     for row in records:
         created = _parse_event_datetime(row.get("Created_At"))
-        if not created or created < cutoff:
+        created_day = created.astimezone(bangkok_tz).date() if created else None
+        if not created_day or created_day < range_from or created_day > range_to:
             continue
         try:
             duration = max(0, int(float(row.get("Duration_Ms") or 0)))
@@ -3329,9 +3344,8 @@ def get_usage_dashboard(response: Response, days: int = 7, q: str = "", employee
     user_map = {}
     date_keys = []
     daily_map = {}
-    today_bkk = now_utc.astimezone(bangkok_tz).date()
-    for offset in range(days - 1, -1, -1):
-        key = (today_bkk - datetime.timedelta(days=offset)).isoformat()
+    for offset in range(period_days):
+        key = (range_from + datetime.timedelta(days=offset)).isoformat()
         date_keys.append(key)
         daily_map[key] = {"date": key, "actions": 0, "searches": 0, "prints": 0, "errors": 0, "users": set()}
 
@@ -3403,7 +3417,7 @@ def get_usage_dashboard(response: Response, days: int = 7, q: str = "", employee
         if not _dashboard_reference_matches(row, query):
             continue
         pick_date = _parse_report_date(row.get("date"))
-        if not pick_date or pick_date < cutoff.astimezone(bangkok_tz).date():
+        if not pick_date or pick_date < range_from or pick_date > range_to:
             continue
         key = pick_date.isoformat()
         if key not in daily_map:
@@ -3463,7 +3477,7 @@ def get_usage_dashboard(response: Response, days: int = 7, q: str = "", employee
     payload = {
         "success": True,
         "generated_at": now_utc.isoformat(),
-        "period_days": days,
+        "period_days": period_days,
         "summary": {
             "active_users": len([user for user in users if user["emp_id"] != "ไม่ระบุ"]),
             "actions": len(events),
@@ -3481,6 +3495,9 @@ def get_usage_dashboard(response: Response, days: int = 7, q: str = "", employee
         "filters": {
             "q": query,
             "employee": employee_filter,
+            "date_from": range_from.isoformat(),
+            "date_to": range_to.isoformat(),
+            "custom_date_range": bool(date_from or date_to),
             "employee_applies_to": "usage_only",
             "reference_search_applies_to": "usage_and_delivery",
         },
