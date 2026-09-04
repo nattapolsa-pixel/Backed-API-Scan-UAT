@@ -60,7 +60,7 @@ if not os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
 # UAT must not initialize a BigQuery client at all.  Google credentials are
 # loaded lazily by get_sheets_session() only when a Sheet operation is needed.
 APP_ENV = os.environ.get("APP_ENV", "uat").strip().lower()
-APP_VERSION = os.environ.get("APP_VERSION", "1.3.1-uat-free").strip()
+APP_VERSION = os.environ.get("APP_VERSION", "1.3.2-uat-free").strip()
 UAT_SHEETS_ONLY = os.environ.get("UAT_SHEETS_ONLY", "true").strip().lower() in ("1", "true", "yes", "on")
 SCAN_FEATURE_ENABLED = os.environ.get("SCAN_FEATURE_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
 PROCESS_STARTED_AT = time.time()
@@ -3244,6 +3244,14 @@ def load_dashboard_operations_rows() -> list:
         return copy.deepcopy(rows)
 
 
+def _dashboard_reference_matches(row: dict, query: str) -> bool:
+    """Match a Booking, Wave, or branch code without issuing another Sheets read."""
+    if not query:
+        return True
+    return any(query in str(row.get(field) or "").upper()
+               for field in ("booking", "wave", "branch"))
+
+
 @app.post("/api/usage-event")
 def record_usage_event(data: UsageEventData, background_tasks: BackgroundTasks):
     """Queue one lightweight UAT usage event; never block the user's document flow."""
@@ -3270,15 +3278,18 @@ def record_usage_event(data: UsageEventData, background_tasks: BackgroundTasks):
 
 
 @app.get("/api/dashboard")
-def get_usage_dashboard(response: Response, days: int = 7):
+def get_usage_dashboard(response: Response, days: int = 7, q: str = "", employee: str = ""):
     """Aggregate UAT usage without exposing raw Sheet access to the browser."""
     days = max(1, min(int(days or 7), 30))
+    query = re.sub(r"\s+", " ", str(q or "").strip()).upper()[:120]
+    employee_filter = str(employee or "").strip().upper()[:40]
     started = time.perf_counter()
     now_utc = datetime.datetime.now(datetime.timezone.utc)
     cutoff = now_utc - datetime.timedelta(days=days)
     bangkok_tz = datetime.timezone(datetime.timedelta(hours=7))
     records = read_uat_event_records("Usage Events")
     events = []
+    employee_options_map = {}
     for row in records:
         created = _parse_event_datetime(row.get("Created_At"))
         if not created or created < cutoff:
@@ -3287,7 +3298,7 @@ def get_usage_dashboard(response: Response, days: int = 7):
             duration = max(0, int(float(row.get("Duration_Ms") or 0)))
         except (TypeError, ValueError):
             duration = 0
-        events.append({
+        event = {
             "event_type": str(row.get("Event_Type") or "").strip().upper(),
             "emp_id": str(row.get("Emp_ID") or "").strip(),
             "emp_name": str(row.get("Emp_Name") or "").strip(),
@@ -3298,7 +3309,21 @@ def get_usage_dashboard(response: Response, days: int = 7):
             "duration_ms": duration,
             "detail": str(row.get("Detail") or "").strip(),
             "created_at": created.isoformat(),
-        })
+        }
+        events.append(event)
+        employee_key = event["emp_id"].upper()
+        if employee_key:
+            option = employee_options_map.setdefault(employee_key, {
+                "emp_id": event["emp_id"], "emp_name": event["emp_name"],
+            })
+            if event["emp_name"]:
+                option["emp_name"] = event["emp_name"]
+
+    employee_options = sorted(employee_options_map.values(),
+                              key=lambda item: ((item["emp_name"] or item["emp_id"]).casefold(), item["emp_id"].casefold()))
+    events = [event for event in events
+              if _dashboard_reference_matches(event, query)
+              and (not employee_filter or event["emp_id"].upper() == employee_filter)]
 
     type_counts = {event_type: 0 for event_type in sorted(USAGE_EVENT_TYPES)}
     user_map = {}
@@ -3375,6 +3400,8 @@ def get_usage_dashboard(response: Response, days: int = 7):
     operation_branches = set()
     operation_totals = {key: 0 for key in ("m", "red", "blue", "green", "black", "total")}
     for row in operation_rows:
+        if not _dashboard_reference_matches(row, query):
+            continue
         pick_date = _parse_report_date(row.get("date"))
         if not pick_date or pick_date < cutoff.astimezone(bangkok_tz).date():
             continue
@@ -3451,6 +3478,13 @@ def get_usage_dashboard(response: Response, days: int = 7):
         "event_counts": type_counts,
         "daily": daily,
         "operations": {"summary": operation_summary, "daily": operation_daily},
+        "filters": {
+            "q": query,
+            "employee": employee_filter,
+            "employee_applies_to": "usage_only",
+            "reference_search_applies_to": "usage_and_delivery",
+        },
+        "employee_options": employee_options,
         "users": users[:50],
         "recent_events": events[:30],
         "system": {
