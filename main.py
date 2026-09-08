@@ -60,7 +60,7 @@ if not os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
 # UAT must not initialize a BigQuery client at all.  Google credentials are
 # loaded lazily by get_sheets_session() only when a Sheet operation is needed.
 APP_ENV = os.environ.get("APP_ENV", "uat").strip().lower()
-APP_VERSION = os.environ.get("APP_VERSION", "1.3.4-uat-free").strip()
+APP_VERSION = os.environ.get("APP_VERSION", "1.3.5-uat-free").strip()
 UAT_SHEETS_ONLY = os.environ.get("UAT_SHEETS_ONLY", "true").strip().lower() in ("1", "true", "yes", "on")
 SCAN_FEATURE_ENABLED = os.environ.get("SCAN_FEATURE_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
 PROCESS_STARTED_AT = time.time()
@@ -2785,6 +2785,15 @@ def get_booking_data_internal(booking_no: str, force_refresh: bool = False) -> d
                 wave_data = future.result()
                 wave_data_overlaid = merge_member_history(apply_local_overlay(wave, wave_data), wave)
                 wave_results.append(wave_data_overlaid)
+            except HTTPException as e:
+                # A stale/failed branch-move record can reference a foreign Wave
+                # that is not part of this Booking's real mapping. It must not
+                # make confirmation of the newly selected Wave fail with the
+                # unrelated old Wave number.
+                if UAT_SHEETS_ONLY and wave not in native_waves and e.status_code == 404:
+                    print(f"⚠️ Ignoring unavailable transferred Wave {wave} while loading Booking {booking_clean}")
+                    continue
+                raise
             except Exception as e:
                 print(f"🚨 Error fetching wave {wave} in booking {booking_no}: {e}")
                 raise
