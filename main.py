@@ -60,7 +60,7 @@ if not os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
 # UAT must not initialize a BigQuery client at all.  Google credentials are
 # loaded lazily by get_sheets_session() only when a Sheet operation is needed.
 APP_ENV = os.environ.get("APP_ENV", "uat").strip().lower()
-APP_VERSION = os.environ.get("APP_VERSION", "1.3.3-uat-free").strip()
+APP_VERSION = os.environ.get("APP_VERSION", "1.3.4-uat-free").strip()
 UAT_SHEETS_ONLY = os.environ.get("UAT_SHEETS_ONLY", "true").strip().lower() in ("1", "true", "yes", "on")
 SCAN_FEATURE_ENABLED = os.environ.get("SCAN_FEATURE_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
 PROCESS_STARTED_AT = time.time()
@@ -705,33 +705,51 @@ document_overrides_overlay = {}
 document_overrides_lock = Lock()
 MANUAL_OVERRIDE_EMP_PREFIX = "MANUAL_OVERRIDE|"
 
-def get_document_overrides_for_wave(wave_no: str) -> dict:
+def _document_override_scope_key(wave_no: str, booking_no: str = "") -> tuple:
+    clean_wave = re.sub(r"\D", "", str(wave_no or ""))
+    wave_key = str(int(clean_wave)) if clean_wave else ""
+    booking_key = re.sub(r"\s+", "", str(booking_no or "").upper())
+    return wave_key, booking_key
+
+
+def get_document_overrides_for_wave(wave_no: str, booking_no: str = "") -> dict:
     clean_wave = re.sub(r"\D", "", str(wave_no or ""))
     if not clean_wave:
         return {}
-    wave_key = str(int(clean_wave))
+    wave_key, booking_key = _document_override_scope_key(clean_wave, booking_no)
+    cache_key = (wave_key, booking_key)
     with document_overrides_lock:
-        if wave_key in document_overrides_overlay:
+        if cache_key in document_overrides_overlay:
             # Intentional zero overrides must survive refresh and restart.
             return {
                 branch: copy.deepcopy(value)
-                for branch, value in document_overrides_overlay[wave_key].items()
+                for branch, value in document_overrides_overlay[cache_key].items()
             }
 
-    overrides = {}
+    exact_overrides = {}
+    legacy_overrides = {}
     try:
         rows = [row for row in read_uat_event_records("Document Overrides")
                 if re.sub(r"\D", "", str(row.get("Wave_Number") or "")) == clean_wave]
-        seen_branches = set()
         for row in reversed(rows):
             action = str(row.get("Action") or "").strip().upper()
             if action == "RESET_ALL" or str(row.get("Branch_Code") or "").strip().upper() == "RESET_ALL":
                 break
+            row_booking = re.sub(r"\s+", "", str(row.get("Booking_No") or "").upper())
+            # Booking splits share the same Wave+Branch. Never let an edit made
+            # for the target booking overwrite the source booking (or vice versa).
+            if booking_key:
+                if row_booking not in (booking_key, ""):
+                    continue
+                target = exact_overrides if row_booking == booking_key else legacy_overrides
+            else:
+                if row_booking:
+                    continue
+                target = legacy_overrides
             branch = str(row.get("Branch_Code") or "").strip().upper()
-            if not branch or branch in seen_branches:
+            if not branch or branch in target:
                 continue
-            seen_branches.add(branch)
-            overrides[branch] = {
+            target[branch] = {
                 "m": _history_int(row.get("M_Count")),
                 "red": _history_int(row.get("Red_Count")),
                 "blue": _history_int(row.get("Blue_Count")),
@@ -745,8 +763,10 @@ def get_document_overrides_for_wave(wave_no: str) -> dict:
                 "branch_name": str(row.get("Branch_Name") or branch).strip(),
                 "booking": str(row.get("Booking_No") or "").strip().upper(),
             }
+        overrides = dict(legacy_overrides)
+        overrides.update(exact_overrides)
         with document_overrides_lock:
-            document_overrides_overlay[wave_key] = copy.deepcopy(overrides)
+            document_overrides_overlay[cache_key] = copy.deepcopy(overrides)
     except Exception as e:
         print(f"⚠️ Error reading document overrides from UAT Sheet: {e}")
     return overrides
@@ -1211,7 +1231,7 @@ def apply_document_override_to_summary(summary: dict) -> dict:
     branch = str(result.get("branch") or "").strip().upper()
     if not wave or not branch:
         return result
-    override = (get_document_overrides_for_wave(wave) or {}).get(branch) or {}
+    override = (get_document_overrides_for_wave(wave, result.get("booking")) or {}).get(branch) or {}
     if not override:
         return result
     for field in ("m", "red", "blue", "green", "black", "pallet"):
@@ -1585,7 +1605,9 @@ def build_uat_wave_data(wave_no: str) -> dict:
     except ValueError:
         raise HTTPException(status_code=400, detail="รหัส Wave ต้องเป็นตัวเลขเท่านั้น")
     items = build_member_history_items(wave)
-    overrides = get_document_overrides_for_wave(wave)
+    meta = get_sheet_meta_for_wave(wave)
+    booking = str(meta.get("booking") or "").strip().upper()
+    overrides = get_document_overrides_for_wave(wave, booking)
     existing_branches = {str(item.get("branch") or "").strip().upper() for item in items}
     # A manual correction is durable UAT source data too.  Do not make the
     # document disappear (or snap back) merely because Member Data is delayed
@@ -1617,7 +1639,6 @@ def build_uat_wave_data(wave_no: str) -> dict:
             })
     if not items:
         raise HTTPException(status_code=404, detail=f"ไม่พบ Wave [{wave}] ใน Member Data")
-    meta = get_sheet_meta_for_wave(wave)
     return {
         "wave_no": f"{int(wave):010d}",
         "booking_no": str(meta.get("booking") or "").strip().upper(),
@@ -2546,7 +2567,9 @@ def get_wave_data_internal(wave_no: str, force_refresh: bool = False) -> dict:
                     }
                 data = copy.deepcopy(data)
 
-    data["document_overrides"] = get_document_overrides_for_wave(wave_clean)
+    data["document_overrides"] = get_document_overrides_for_wave(
+        wave_clean, data.get("booking_no")
+    )
     return data
 
 active_wave_refreshes = set()
@@ -2856,7 +2879,7 @@ def get_booking_data_internal(booking_no: str, force_refresh: bool = False) -> d
     for wave_no_inc in waves_included:
         clean_w = re.sub(r"\D", "", str(wave_no_inc))
         if clean_w:
-            combined_overrides.update(get_document_overrides_for_wave(clean_w))
+            combined_overrides.update(get_document_overrides_for_wave(clean_w, booking_clean))
 
     return {
         "booking_no": booking_no,
@@ -3071,6 +3094,46 @@ def get_booking_branch_splits(force_refresh: bool = False) -> dict:
         except Exception as exc:
             print(f"BOOKING SPLIT READ ERROR: {exc}")
             return copy.deepcopy(booking_splits_cache["data"])
+
+
+def persist_target_booking_split_edits(summaries: list, emp_id: str, reason: str = "") -> list:
+    """Make manual edits to a split target authoritative for both booking views."""
+    splits = get_booking_branch_splits(force_refresh=True)
+    rows = []
+    affected_sources = []
+    now_iso = _uat_now_iso()
+    for item in summaries or []:
+        if not item.get("booking_split"):
+            continue
+        key = (str(item.get("wave") or ""), str(item.get("branch") or "").strip().upper(),
+               str(item.get("booking") or "").strip().upper())
+        current = splits.get(key)
+        if not current or not bool(current.get("Is_Active", True)):
+            # The native/source side also carries booking_split_summary. Only
+            # a target allocation row may be edited directly here.
+            continue
+        source = str(current.get("Source_Booking") or "").strip().upper()
+        rows.append({
+            "Event_ID": str(uuid.uuid4()), "Wave_Number": key[0], "Branch_Code": key[1],
+            "Source_Booking": source, "Target_Booking": key[2],
+            "M_Count": item["m"], "Red_Count": item["red"], "Blue_Count": item["blue"],
+            "Green_Count": item["green"], "Black_Count": item["black"],
+            "Pallet_Count": item["pallet"], "Is_Active": True,
+            "Reason": str(reason or "MANUAL_TOTAL_SAVE").strip(),
+            "Note": "Updated from UAT shipping document", "Emp_ID": str(emp_id or "").strip(),
+            "Created_At": now_iso,
+        })
+        affected_sources.append((source, key[0], key[1]))
+    if rows:
+        append_uat_event_rows("Booking Branch Splits", rows)
+        with booking_splits_cache_lock:
+            booking_splits_cache["expires_at"] = 0.0
+        with booking_waves_cache_lock:
+            for source, _, _ in affected_sources:
+                booking_waves_cache.pop(source, None)
+            for item in rows:
+                booking_waves_cache.pop(item["Target_Booking"], None)
+    return affected_sources
 
 # ==================== ROUTES & APIs ====================
 
@@ -3611,16 +3674,23 @@ def save_document_summary(data: DocumentSummaryBatchData, background_tasks: Back
             **values
         })
 
+    affected_split_sources = []
     if data.persist_overrides:
         # The frontend sends dirty branches only. Persist zero so old totals cannot return later.
         persistent_items = normalized
         for item in persistent_items:
             item["allow_zero_update"] = True
+        # If this is the target side of a split, update the allocation record
+        # itself. Otherwise refresh/print would rebuild the old split amount.
+        affected_split_sources = persist_target_booking_split_edits(
+            persistent_items, emp_id, data.reason or "MANUAL_TOTAL_SAVE"
+        )
         # Apply the edit to the live web overlay first. A temporary Google auth
         # outage must never make the UI snap back to the calculated old total.
         with document_overrides_lock:
             for item in persistent_items:
-                wave_ov = document_overrides_overlay.setdefault(item["wave"], {})
+                scope_key = _document_override_scope_key(item["wave"], item.get("booking"))
+                wave_ov = document_overrides_overlay.setdefault(scope_key, {})
                 wave_ov[item["branch"]] = {
                     **{field: item[field] for field in ("m", "red", "blue", "green", "black", "total", "pallet")},
                     "is_hidden": bool(item.get("is_hidden")),
@@ -3641,6 +3711,31 @@ def save_document_summary(data: DocumentSummaryBatchData, background_tasks: Back
     # production ยังคงส่งเฉพาะสาขาที่ปิดจบแล้วตามกติกาเดิม.
     report_summaries = (normalized if UAT_SHEETS_ONLY
                         else [item for item in normalized if item.get("is_closed")])
+    # A target split edit also changes the source booking's remaining amount.
+    # Refresh that exact Wave+Branch so Delivery report stays balanced.
+    for source_booking, split_wave, split_branch in dict.fromkeys(affected_split_sources):
+        if not source_booking:
+            continue
+        source_view = get_booking_data_internal(source_booking, force_refresh=True)
+        source_items = [
+            item for item in source_view.get("lpn_list", [])
+            if str(item.get("branch") or "").strip().upper() == split_branch
+            and re.sub(r"\D", "", str(item.get("wave_no") or ""))
+            and str(int(re.sub(r"\D", "", str(item.get("wave_no") or "")))) == split_wave
+        ]
+        if not source_items:
+            continue
+        source_summary = summarize_branch_for_member_data(
+            {"wave_no": split_wave, "booking_no": source_booking, "lpn_list": source_items},
+            split_branch,
+        )
+        source_summary.update({
+            "booking": source_booking, "booking_split": True,
+            "is_closed": any(item.get("branch_closed_at") for item in source_items),
+            "allow_zero_update": True,
+        })
+        if UAT_SHEETS_ONLY or source_summary["is_closed"]:
+            report_summaries.append(source_summary)
     if data.persist_overrides:
         # A manual save is transactional from the user's perspective: do not
         # say success until every totals Sheet has accepted the new values.
@@ -3706,17 +3801,19 @@ def reset_document_overrides(data: ResetDocumentOverridesData, background_tasks:
         tombstone_sheet_overrides(waves_to_clear, data.emp_id)
         with document_overrides_lock:
             for w in waves_to_clear:
-                document_overrides_overlay[w] = {}
+                for cache_key in [key for key in document_overrides_overlay if key[0] == w]:
+                    document_overrides_overlay.pop(cache_key, None)
         queue_wave_totals_reconciliation(waves_to_clear, delay_seconds=0.5)
 
     return {"status": "success", "cleared_waves": waves_to_clear}
 
 @app.get("/api/document-overrides")
-def get_document_overrides_endpoint(wave_no: str):
+def get_document_overrides_endpoint(wave_no: str, booking: str = ""):
     clean_w = re.sub(r"\D", "", str(wave_no or ""))
     if not clean_w:
         return {"overrides": {}}
-    return {"wave_no": clean_w, "overrides": get_document_overrides_for_wave(clean_w)}
+    return {"wave_no": clean_w, "booking": str(booking or "").strip().upper(),
+            "overrides": get_document_overrides_for_wave(clean_w, booking)}
 
 @app.get("/api/transport-meta")
 def get_transport_meta(booking: str):
@@ -3851,7 +3948,7 @@ def ensure_booking_source_complete(booking_no: str, booking_data: dict):
         }
         # Saved manual corrections are complete, durable branch records even
         # while the large Member Data import is delayed.
-        actual.update(get_document_overrides_for_wave(wave).keys())
+        actual.update(get_document_overrides_for_wave(wave, booking).keys())
         absent = sorted(expected - actual)
         if absent:
             missing.append({"wave": wave, "missing": absent, "expected": len(expected), "actual": len(actual)})
