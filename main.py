@@ -62,9 +62,13 @@ if not os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
 APP_ENV = os.environ.get("APP_ENV", "uat").strip().lower()
 APP_VERSION = os.environ.get("APP_VERSION", "1.3.7-free").strip()
 UAT_SHEETS_ONLY = os.environ.get("UAT_SHEETS_ONLY", "true").strip().lower() in ("1", "true", "yes", "on")
-# This repository is the isolated Sheets deployment.  Keep Scan available by
-# default here; Production uses its separate repository and configuration.
-SCAN_FEATURE_ENABLED = os.environ.get("SCAN_FEATURE_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
+# This repository is the isolated Sheets deployment.  Its scan path is never
+# allowed to use BigQuery, so legacy Render values cannot accidentally re-hold
+# the demo scanner. Production is a separate repository/environment.
+SCAN_FEATURE_ENABLED = (
+    (UAT_SHEETS_ONLY and APP_ENV == "uat")
+    or os.environ.get("SCAN_FEATURE_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
+)
 PROCESS_STARTED_AT = time.time()
 
 if not UAT_SHEETS_ONLY and bigquery is None:
