@@ -162,6 +162,13 @@ UAT_EVENT_SHEETS = {
         "Event_ID", "Event_Type", "Emp_ID", "Emp_Name", "Wave_Number", "Booking_No",
         "Branch_Code", "Status", "Duration_Ms", "Detail", "Client_Time", "Created_At"
     ],
+    # Scan events in this deployment are deliberately isolated from the live
+    # BigQuery transaction table.  This makes the demo scanner usable without
+    # ever writing into Production.
+    "Scan Transactions": [
+        "Transaction_ID", "Wave_Number", "LPN", "Scan_Type", "Color", "Qty",
+        "Branch_Code", "Branch_Name", "Emp_ID", "Pallet_No", "Created_At"
+    ],
 }
 uat_event_sheet_lock = Lock()
 uat_event_sheets_ready = False
@@ -271,6 +278,32 @@ def read_uat_event_records(sheet_name: str, force: bool = False) -> list:
             records.append(dict(zip(headers, values[:len(headers)])))
         uat_event_cache[sheet_name] = {"records": records, "expires_at": now + UAT_EVENT_CACHE_TTL_SECONDS}
         return copy.deepcopy(records)
+
+
+def uat_scan_mode() -> bool:
+    """Enable scanning only against the isolated UAT event workbook."""
+    return bool(SCAN_FEATURE_ENABLED and UAT_SHEETS_ONLY)
+
+
+def save_uat_scan_event(wave_no: str, lpn: str, branch_code: str, branch_name: str,
+                        qty: int, scan_type: str, color: str, emp_id: str,
+                        pallet_no: int, transaction_id: str = "") -> bool:
+    """Durably save a scan without contacting BigQuery/Production."""
+    txn = transaction_id or str(uuid.uuid4())
+    # The durable check also protects a retry after a Render restart.
+    if any(str(row.get("Transaction_ID") or "").strip() == txn
+           for row in read_uat_event_records("Scan Transactions")):
+        return False
+    append_uat_event_rows("Scan Transactions", [{
+        "Transaction_ID": txn, "Wave_Number": str(wave_no), "LPN": str(lpn).strip().upper(),
+        "Scan_Type": str(scan_type), "Color": str(color), "Qty": int(qty or 0),
+        "Branch_Code": str(branch_code).strip().upper(), "Branch_Name": str(branch_name).strip(),
+        "Emp_ID": str(emp_id).strip(), "Pallet_No": int(pallet_no or 0), "Created_At": _uat_now_iso(),
+    }])
+    mark_transaction_processed(txn)
+    record_local_scan(str(wave_no), str(lpn), str(branch_code), int(qty or 0),
+                      str(scan_type), str(color), int(pallet_no or 0))
+    return True
 
 
 INVALID_BRANCH_STRINGS = {
@@ -1649,7 +1682,7 @@ def build_uat_wave_data(wave_no: str) -> dict:
         "zone_summary": [],
         "document_overrides": overrides,
         "source": "Google Sheets UAT",
-        "scan_feature_enabled": False,
+        "scan_feature_enabled": SCAN_FEATURE_ENABLED,
     }
 
 DIRECT_QTY_PREFIXES = ("PP", "SP")
@@ -4183,6 +4216,21 @@ def start_pallet(data: PalletStartData):
     if color not in ("Green", "Blue", "Red"):
         raise HTTPException(status_code=400, detail="สีพาเลทไม่ถูกต้อง")
 
+    if uat_scan_mode():
+        cache_key = (tuple(wave_ids), branch)
+        with pallet_allocation_lock:
+            prior = [row for row in read_uat_event_records("Scan Transactions")
+                     if str(row.get("Branch_Code") or "").strip().upper() == branch
+                     and str(row.get("Wave_Number") or "").strip() in {str(w) for w in wave_ids}]
+            next_no = max([int(row.get("Pallet_No") or 0) for row in prior] + [int(pallet_counter_cache.get(cache_key, 0) or 0)]) + 1
+            pallet_counter_cache[cache_key] = next_no
+        for wave_id in wave_ids:
+            save_uat_scan_event(str(wave_id), f"PALLET_{branch}_{next_no}", branch, branch_name,
+                                0, "PALLET_START", color, emp_id, next_no,
+                                f"uat-pallet:{wave_id}:{branch}:{next_no}")
+        record_shared_pallet_state(wave_ids, branch, next_no, color=color, submitted=False)
+        return {"status": "success", "pallet_no": next_no, "color": color, "allocated_by": emp_id}
+
     cache_key = (tuple(wave_ids), branch)
     with pallet_allocation_lock:
         cached_max = int(pallet_counter_cache.get(cache_key, 0) or 0)
@@ -4254,6 +4302,14 @@ def submit_pallet(data: PalletSubmitData):
     emp_id = (data.emp_id or "").strip()
     if not wave_ids or not branch or pallet_no <= 0:
         raise HTTPException(status_code=400, detail="ข้อมูล Wave สาขา หรือเลขพาเลทไม่ครบ")
+
+    if uat_scan_mode():
+        for wave_id in wave_ids:
+            save_uat_scan_event(str(wave_id), f"PALLET_SUBMIT_{branch}_{pallet_no}", branch, branch_name,
+                                0, "PALLET_SUBMIT", color or "None", emp_id, pallet_no,
+                                f"uat-pallet-submit:{wave_id}:{branch}:{pallet_no}")
+        record_shared_pallet_state(wave_ids, branch, pallet_no, color=color, submitted=True)
+        return {"status": "success", "pallet_no": pallet_no, "submitted_by": emp_id, "report_sync": "not_needed"}
 
     marker_time = datetime.datetime.now(datetime.timezone.utc).isoformat()
     markers = [{
@@ -4461,6 +4517,19 @@ def process_scan(data: ScanData, background_tasks: BackgroundTasks):
     except (ValueError, TypeError):
         pallet_no_val = 0
 
+    if uat_scan_mode():
+        # Member Data is the read-only source in this deployment.  Validate the
+        # Wave/branch there, then write the scan only to the isolated workbook.
+        source = build_uat_wave_data(wave_clean)
+        known_branches = {str(item.get("branch") or "").strip().upper()
+                          for item in source.get("lpn_list") or []}
+        if branch_val.upper() not in known_branches:
+            raise HTTPException(status_code=400, detail=f"ไม่พบสาขา [{branch_val}] ใน Wave {wave_clean}")
+        saved = save_uat_scan_event(wave_clean, lpn_val, branch_val, branch_name_val,
+                                    data.qty, type_val, color_val, emp_val, pallet_no_val, transaction_id)
+        return {"status": "success", "message": "Saved" if saved else "Already saved",
+                "duplicate": not saved, "report_sync": "not_needed"}
+
     # Check cache first
     valid_pairs = get_valid_lpns_for_wave(wave_clean)
 
@@ -4559,6 +4628,32 @@ def process_scan_batch(data: ScanBatchData, background_tasks: BackgroundTasks):
         scan_hold_error()
     if not data.scans:
         return {"status": "success", "message": "No scans to process", "processed_count": 0}
+
+    if uat_scan_mode():
+        processed, failed, ids = 0, [], []
+        branch_cache = {}
+        for item in data.scans:
+            try:
+                wave_clean = str(int(item.wave_no))
+                if wave_clean not in branch_cache:
+                    branch_cache[wave_clean] = {str(row.get("branch") or "").strip().upper()
+                                                for row in build_uat_wave_data(wave_clean).get("lpn_list") or []}
+                branch = (item.branch_code or "").strip().upper()
+                if branch not in branch_cache[wave_clean]:
+                    raise ValueError(f"ไม่พบสาขา [{branch}] ใน Wave {wave_clean}")
+                txn = (item.transaction_id or "").strip()
+                saved = save_uat_scan_event(wave_clean, item.lpn, branch, item.branch_name,
+                                            item.qty, item.type, item.color, item.emp_id,
+                                            int(item.pallet_no or 0), txn)
+                if saved:
+                    processed += 1
+                if txn:
+                    ids.append(txn)
+            except Exception as exc:
+                failed.append({"lpn": item.lpn, "transaction_id": item.transaction_id, "reason": str(exc)})
+        return {"status": "success" if not failed else ("partial_success" if processed else "failed"),
+                "processed_count": processed, "failed_count": len(failed),
+                "processed_transaction_ids": ids, "errors": failed, "report_sync": "not_needed"}
 
     import datetime
     table_ref = client.dataset("logistics_db").table("app_scan_transactions")
