@@ -60,8 +60,9 @@ if not os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
 # UAT must not initialize a BigQuery client at all.  Google credentials are
 # loaded lazily by get_sheets_session() only when a Sheet operation is needed.
 APP_ENV = os.environ.get("APP_ENV", "uat").strip().lower()
-APP_VERSION = os.environ.get("APP_VERSION", "1.3.7-free").strip()
+APP_VERSION = os.environ.get("APP_VERSION", "1.3.8-free").strip()
 UAT_SHEETS_ONLY = os.environ.get("UAT_SHEETS_ONLY", "true").strip().lower() in ("1", "true", "yes", "on")
+SCAN_DEMO_ONLY = os.environ.get("SCAN_DEMO_ONLY", "true").strip().lower() in ("1", "true", "yes", "on")
 # This repository is the isolated Sheets deployment.  Its scan path is never
 # allowed to use BigQuery, so legacy Render values cannot accidentally re-hold
 # the demo scanner. Production is a separate repository/environment.
@@ -296,6 +297,13 @@ def save_uat_scan_event(wave_no: str, lpn: str, branch_code: str, branch_name: s
                         pallet_no: int, transaction_id: str = "") -> bool:
     """Durably save a scan without contacting BigQuery/Production."""
     txn = transaction_id or str(uuid.uuid4())
+    # Presentation mode intentionally changes only the in-memory screen state.
+    # It does not create Sheets tabs, append rows, or touch any document source.
+    if SCAN_DEMO_ONLY:
+        mark_transaction_processed(txn)
+        record_local_scan(str(wave_no), str(lpn), str(branch_code), int(qty or 0),
+                          str(scan_type), str(color), int(pallet_no or 0))
+        return True
     # The durable check also protects a retry after a Render restart.
     if any(str(row.get("Transaction_ID") or "").strip() == txn
            for row in read_uat_event_records("Scan Transactions")):
@@ -3194,6 +3202,7 @@ async def read_root():
         "data_source": "google_sheets" if UAT_SHEETS_ONLY else "bigquery",
         "legacy_transport_workbook": "read_only",
         "scan_feature_enabled": SCAN_FEATURE_ENABLED,
+        "scan_demo_only": SCAN_DEMO_ONLY,
     }
 
 # ✅ Health Check Endpoint: ตอบสนองเร็ว <5ms สำหรับ keep-alive heartbeat
@@ -4225,9 +4234,9 @@ def start_pallet(data: PalletStartData):
     if uat_scan_mode():
         cache_key = (tuple(wave_ids), branch)
         with pallet_allocation_lock:
-            prior = [row for row in read_uat_event_records("Scan Transactions")
-                     if str(row.get("Branch_Code") or "").strip().upper() == branch
-                     and str(row.get("Wave_Number") or "").strip() in {str(w) for w in wave_ids}]
+            prior = [] if SCAN_DEMO_ONLY else [row for row in read_uat_event_records("Scan Transactions")
+                                               if str(row.get("Branch_Code") or "").strip().upper() == branch
+                                               and str(row.get("Wave_Number") or "").strip() in {str(w) for w in wave_ids}]
             next_no = max([int(row.get("Pallet_No") or 0) for row in prior] + [int(pallet_counter_cache.get(cache_key, 0) or 0)]) + 1
             pallet_counter_cache[cache_key] = next_no
         for wave_id in wave_ids:
