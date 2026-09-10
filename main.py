@@ -610,8 +610,13 @@ def load_booking_wave_sheet_meta(force: bool = False) -> tuple:
                                 booking_map[raw_num] = entry
                                 booking_map[f"B001-{raw_num}"] = entry
                         for wave_id in waves:
-                            wave_map[wave_id] = entry
-                            wave_map[f"{int(wave_id):010d}"] = entry
+                            # One Wave may legitimately belong to more than one
+                            # Booking.  Keep every booking instead of overwriting
+                            # the previous row (which made the last row win).
+                            for wave_key in (wave_id, f"{int(wave_id):010d}"):
+                                entries = wave_map.setdefault(wave_key, [])
+                                if not any(item.get("booking") == clean_b for item in entries):
+                                    entries.append(entry)
 
             with booking_wave_sheet_lock:
                 booking_wave_sheet_cache["bookings"] = booking_map
@@ -626,12 +631,18 @@ def load_booking_wave_sheet_meta(force: bool = False) -> tuple:
 
         return booking_map, wave_map
 
-def get_sheet_meta_for_wave(wave_no: str, force: bool = False) -> dict:
+def get_sheet_metas_for_wave(wave_no: str, force: bool = False) -> list:
     clean_wave = re.sub(r"\D", "", str(wave_no or ""))
     if not clean_wave:
-        return {}
+        return []
     _, wave_map = load_booking_wave_sheet_meta(force=force)
-    return wave_map.get(str(int(clean_wave))) or {}
+    value = wave_map.get(str(int(clean_wave))) or []
+    # Backward-compatible with an already-warmed pre-fix cache.
+    return list(value) if isinstance(value, list) else ([value] if value else [])
+
+
+def get_sheet_meta_for_wave(wave_no: str, force: bool = False) -> dict:
+    return (get_sheet_metas_for_wave(wave_no, force=force) or [{}])[0]
 
 def get_sheet_meta_for_booking(booking_no: str, force: bool = False) -> dict:
     clean_b = re.sub(r"\s+", "", str(booking_no or "").upper())
@@ -3971,7 +3982,14 @@ def check_wave(wave_no: str, force: bool = False):
             }
         # Apply the in-memory scan overlays dynamically
         overlaid_data = apply_local_overlay(wave_no, raw_data)
-        return merge_member_history(overlaid_data, wave_no)
+        result = merge_member_history(overlaid_data, wave_no)
+        if UAT_SHEETS_ONLY:
+            result["booking_options"] = [
+                str(item.get("booking") or "").strip().upper()
+                for item in get_sheet_metas_for_wave(wave_no, force=force)
+                if str(item.get("booking") or "").strip()
+            ]
+        return result
     except HTTPException:
         raise
     except Exception as e:
