@@ -82,7 +82,9 @@ MEMBER_HISTORY_ERROR_BACKOFF_SECONDS = 60
 MEMBER_HISTORY_SNAPSHOT_PATH = os.path.join(tempfile.gettempdir(), "pro_scanner_member_history.json.gz")
 MEMBER_HISTORY_SNAPSHOT_MAX_AGE_SECONDS = 6 * 60 * 60
 MEMBER_HISTORY_SNAPSHOT_TTL_SECONDS = 30
-MEMBER_HISTORY_ITEMS_CACHE_MAX = 64
+# Member Data มี ~44,000 แถว และ instance มี RAM แค่ 512 MB (เคย OOM มาแล้วหลายรอบ)
+# cache นี้ถูกล้างทุกครั้งที่ history รีเฟรช (ทุก ~10 นาที) จึงไม่ต้องเก็บเยอะ
+MEMBER_HISTORY_ITEMS_CACHE_MAX = 16
 member_history_cache = {"expires_at": 0.0, "loaded_at": 0.0, "data": {}, "by_wave": {}, "generation": 0}
 member_history_items_cache = {}
 member_history_refreshing = False
@@ -1915,8 +1917,15 @@ def get_wave_data_internal(wave_no: str, force_refresh: bool = False) -> dict:
 
 
 def fetch_booking_waves(booking_no: str) -> dict:
-    """Resolve a Booking to its Waves and transport details from the Booking & Wave sheet."""
-    sheet_meta = get_sheet_meta_for_booking(booking_no, force=True)
+    """Resolve a Booking to its Waves and transport details from the Booking & Wave sheet.
+
+    The cached sheet answers first. A forced re-read costs a full gviz download,
+    so it is worth paying only when the Booking is genuinely missing — typically a
+    row added minutes ago that the 10-minute cache has not picked up yet.
+    """
+    sheet_meta = get_sheet_meta_for_booking(booking_no)
+    if not sheet_meta or not sheet_meta.get("waves"):
+        sheet_meta = get_sheet_meta_for_booking(booking_no, force=True)
     if not sheet_meta or not sheet_meta.get("waves"):
         raise HTTPException(status_code=404, detail=f"ไม่พบ Booking [{booking_no}] ใน Sheet Booking & Wave")
     return {
