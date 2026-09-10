@@ -2,21 +2,16 @@ from fastapi import FastAPI, HTTPException, BackgroundTasks, Response
 from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel
 from typing import List, Optional       # ✅ แก้ไข #1: เพิ่ม Optional
-try:
-    # Free UAT runs from Google Sheets only. Keep BigQuery optional so the
-    # 512 MB instance does not need to load the large client dependency.
-    from google.cloud import bigquery
-except ImportError:
-    bigquery = None
 import google.auth
 from google.oauth2 import service_account
 from google.auth.transport.requests import AuthorizedSession
 import csv
+import gzip
 import json
 import base64
 import io
-import math
 import os
+import tempfile
 import re
 import time
 import copy
@@ -26,14 +21,13 @@ import urllib.parse
 import urllib.request
 import threading
 from threading import Lock
-from concurrent.futures import ThreadPoolExecutor
 from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI()
 
 # ✅ GZip Compression: ลด payload size สำหรับ response ขนาดใหญ่ (Wave data)
 # ระดับ 4 ลด CPU บน Free 0.1 CPU แต่ยังลด payload Wave/Booking ได้มาก
-app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=4)
+app.add_middleware(GZipMiddleware, minimum_size=512, compresslevel=4)
 
 # ✅ จำกัด CORS: อนุญาตเฉพาะหน้าเว็บบน GitHub Pages (*.github.io) + localhost สำหรับทดสอบ
 #    ถ้าใช้โดเมนอื่น (custom domain) ให้เพิ่ม origin นั้นใน ALLOWED_ORIGINS ด้วย
@@ -52,58 +46,50 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Local development convenience only. On Render, credentials arrive through
+# GOOGLE_SERVICE_ACCOUNT_JSON. The file keeps its historical name; it is used
+# purely as a Google Sheets service account now.
 if not os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
-    local_key_path = os.path.join(os.path.dirname(__file__), "bq-key.json")
-    if os.path.exists(local_key_path):
-        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = local_key_path
+    for candidate in ("service-account.json", "bq-key.json"):
+        local_key_path = os.path.join(os.path.dirname(__file__), candidate)
+        if os.path.exists(local_key_path):
+            os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = local_key_path
+            break
 
-# UAT must not initialize a BigQuery client at all.  Google credentials are
-# loaded lazily by get_sheets_session() only when a Sheet operation is needed.
+# Google Sheets is the only data source. Credentials are loaded lazily by
+# get_sheets_session(), so a cold start never waits on an auth round-trip.
 APP_ENV = os.environ.get("APP_ENV", "uat").strip().lower()
-APP_VERSION = os.environ.get("APP_VERSION", "1.3.9-free").strip()
-UAT_SHEETS_ONLY = os.environ.get("UAT_SHEETS_ONLY", "true").strip().lower() in ("1", "true", "yes", "on")
+APP_VERSION = os.environ.get("APP_VERSION", "1.4.0-free").strip()
 SCAN_DEMO_ONLY = os.environ.get("SCAN_DEMO_ONLY", "true").strip().lower() in ("1", "true", "yes", "on")
 # Scan is held by default.  The Render flag can be enabled briefly for an
 # isolated presentation, without changing any document workflow.
 SCAN_FEATURE_ENABLED = os.environ.get("SCAN_FEATURE_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
 PROCESS_STARTED_AT = time.time()
 
-if not UAT_SHEETS_ONLY and bigquery is None:
-    raise RuntimeError("google-cloud-bigquery is required when UAT_SHEETS_ONLY=false")
-client = None if UAT_SHEETS_ONLY else bigquery.Client(project=os.environ.get("GOOGLE_CLOUD_PROJECT", "pro-analytics-db"))
-
-# ✅ BigQuery Job Timeout: Standard Plan 1 CPU + 2 GB RAM → 60 วินาที
-BQ_JOB_TIMEOUT_SECONDS = 60
-
-# 🔒 QC Feature Toggle: ตั้ง False เพื่อ Hold ระบบ QC ไว้ก่อน
-#    เปลี่ยนเป็น True เมื่อต้องการเปิดใช้งานระบบ QC
-QC_FEATURE_ENABLED = False
 
 # UAT Google Sheets migration. Production code lives in a separate worktree/branch.
-
-NUMERIC_BRANCH_MASTER_SPREADSHEET_ID = "1zI5YAq0JvlM-WsaCfDVYVZgiCn5pWx_HVJjQMiTFwoI"
-NUMERIC_BRANCH_MASTER_SHEET_NAME = "Master"
-NUMERIC_BRANCH_MASTER_GID = "606346592"
-NUMERIC_BRANCH_MASTER_CACHE_TTL_SECONDS = 30 * 60
-numeric_branch_master_cache = {"expires_at": 0.0, "data": {}}
-numeric_branch_master_lock = Lock()
 
 # ไฟล์ Control Outbound ที่ใช้งานจริง (Member Data เป็นแท็บแรก)
 MEMBER_HISTORY_SPREADSHEET_ID = "1MO3lu1GssPZZvaruwQ5trUB045dzh4HUHdH35mbyOtc"
 MEMBER_HISTORY_GID = "1628470483"
 MEMBER_HISTORY_CACHE_TTL_SECONDS = 10 * 60
-member_history_cache = {"expires_at": 0.0, "data": {}}
+# The sheet is ~39k rows: the download is the slowest thing this service does,
+# so an expired cache is served stale while one background thread refreshes it.
+MEMBER_HISTORY_HTTP_TIMEOUT = 45
+MEMBER_HISTORY_ERROR_BACKOFF_SECONDS = 60
+# A gzipped snapshot on the container's own disk survives a worker restart, so a
+# restarted worker answers from disk instead of re-downloading 39k rows.
+MEMBER_HISTORY_SNAPSHOT_PATH = os.path.join(tempfile.gettempdir(), "pro_scanner_member_history.json.gz")
+MEMBER_HISTORY_SNAPSHOT_MAX_AGE_SECONDS = 6 * 60 * 60
+MEMBER_HISTORY_SNAPSHOT_TTL_SECONDS = 30
+MEMBER_HISTORY_ITEMS_CACHE_MAX = 64
+member_history_cache = {"expires_at": 0.0, "loaded_at": 0.0, "data": {}, "by_wave": {}, "generation": 0}
+member_history_items_cache = {}
+member_history_refreshing = False
 member_history_lock = Lock()
 member_history_refresh_lock = Lock()
 member_history_row_cache = {"expires_at": 0.0, "existing_map": {}, "last_data_row": 1}
 
-DELIVERY_REPORT_SPREADSHEET_ID = "14kBtY2tdMXi3I9rbNleokmyJ_WWGRmKXPPU2VaVstZQ"
-DELIVERY_REPORT_SHEET_NAME = "Delivery report"
-# The legacy transport workbook is a read-only lookup source in UAT.
-# Keep Sheet3/Data Booking&Car available to the web, but never write back to
-# any tab in this spreadsheet—even if an old Render env var still exists.
-DELIVERY_REPORT_READ_ONLY = True
-LEGACY_DELIVERY_REPORT_SYNC_ENABLED = False
 # UAT only: isolated reconciliation target.  This is deliberately separate
 # from the live Delivery report while the direct-write path is being verified.
 UAT_REPORT_TEST_SPREADSHEET_ID = os.environ.get(
@@ -111,33 +97,46 @@ UAT_REPORT_TEST_SPREADSHEET_ID = os.environ.get(
 )
 UAT_REPORT_TEST_SHEET_NAME = "Delivery report"
 UAT_REPORT_TEST_SHEET_ID = 0
-DELIVERY_SOURCE_SHEET_NAME = "วางข้อมูล"
-DELIVERY_SOURCE_SHEET_ID = 0
-DELIVERY_REPORT_SHEET_ID = 1686001204
-DELIVERY_CAR_SHEET_NAME = "Data Booking&Car"
-DELIVERY_BRANCH_SHEET_NAME = "Sheet3"
-DELIVERY_BRANCH_SHEET_GID = "500149916"
 BRANCH_MASTER_SPREADSHEET_ID = "18-gD0iSI3ivMijKQi54Ds-7Gm2p-LFyovjEs1MelrKQ"
 BRANCH_MASTER_SHEET_NAME = "ข้อมูลสาขา"
 WAVE_MONITORING_SPREADSHEET_ID = "1TL-tj-BrvYM7i_wNHlA0x641_VOqfT9SLpmm2NZATOo"
-WAVE_MONITORING_SHEET_NAME = "Wave_Monitoring"
 WAVE_MONITORING_SHEET_GID = "0"
 WAVE_MONITORING_CACHE_TTL_SECONDS = 5 * 60
 delivery_report_lock = Lock()
-delivery_lookup_cache = {"expires_at": 0.0, "cars": {}, "branches": {}}
 branch_province_cache = {"expires_at": 0.0, "data": {}}
 branch_province_refresh_lock = Lock()
 branch_report_cache = {"expires_at": 0.0, "data": {}}
 branch_report_refresh_lock = Lock()
 wave_monitoring_pick_date_cache = {"expires_at": 0.0, "exact": {}, "waves": {}, "branches": {}}
 wave_monitoring_pick_date_lock = Lock()
-delivery_report_row_cache = {"expires_at": 0.0, "existing_map": {}, "last_data_row": 1}
 uat_report_test_row_cache = {"expires_at": 0.0, "existing_map": {}, "last_data_row": 1}
 SHEET_ROW_CACHE_TTL_SECONDS = 15 * 60  # Free: ลดการอ่าน Sheet ซ้ำและรักษา RAM ให้อยู่ในขอบเขต
 SHEETS_HTTP_TIMEOUT = (3, 45)
+GVIZ_HTTP_TIMEOUT_SECONDS = 20
 _sheets_session_local = threading.local()
 
-# ฐานข้อมูลเหตุการณ์ของ UAT (แทนตาราง BigQuery ที่เคยรับข้อมูลเขียนจากหน้าเว็บ)
+
+def fetch_gviz_text(url: str, timeout: int = GVIZ_HTTP_TIMEOUT_SECONDS) -> str:
+    """Read a Google Sheet through the gviz endpoint, asking for gzip.
+
+    urllib does not request compression by default, so every one of these reads
+    used to pull the full uncompressed CSV/JSON. Sheet exports are highly
+    compressible, and decompression costs far less than the extra transfer time
+    on a Free instance with a slow uplink.
+    """
+    request = urllib.request.Request(url, headers={
+        "User-Agent": "Pro-Scanner-UAT/1.0",
+        "Accept-Encoding": "gzip",
+    })
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        payload = response.read()
+        if "gzip" in (response.headers.get("Content-Encoding") or "").lower():
+            payload = gzip.decompress(payload)
+    return payload.decode("utf-8-sig")
+
+# ฐานข้อมูลเหตุการณ์ของ UAT: ทุกอย่างที่หน้าเว็บเขียนกลับ เก็บเป็น event log 6 แท็บ
+# แถวถูก append เท่านั้น และการอ่านใช้แถวล่าสุดต่อ key (ดู read_uat_event_records)
+# ⚠️ เพิ่มคอลัมน์ได้เฉพาะต่อท้าย: การอ่านจับคู่ค่าตามลำดับ header ด้านล่างนี้
 UAT_DATABASE_SPREADSHEET_ID = os.environ.get(
     "UAT_DATABASE_SPREADSHEET_ID", "1RJcsrbWnGO7gMiq9bhBR4bA9Twh1NjqP6816dXOW9DI"
 )
@@ -166,8 +165,8 @@ UAT_EVENT_SHEETS = {
         "Branch_Code", "Status", "Duration_Ms", "Detail", "Client_Time", "Created_At"
     ],
     # Scan events in this deployment are deliberately isolated from the live
-    # BigQuery transaction table.  This makes the demo scanner usable without
-    # ever writing into Production.
+    # live Production data. This makes the demo scanner usable without ever
+    # writing anywhere outside this workbook.
     "Scan Transactions": [
         "Transaction_ID", "Wave_Number", "LPN", "Scan_Type", "Color", "Qty",
         "Branch_Code", "Branch_Name", "Emp_ID", "Pallet_No", "Created_At"
@@ -191,10 +190,6 @@ def get_sheets_session():
         credentials = service_account.Credentials.from_service_account_info(
             json.loads(credentials_json), scopes=scopes
         )
-    elif client is not None:
-        credentials = client._credentials
-        if hasattr(credentials, "with_scopes"):
-            credentials = credentials.with_scopes(scopes)
     else:
         credentials, _ = google.auth.default(scopes=scopes)
     session = AuthorizedSession(credentials)
@@ -260,18 +255,28 @@ def append_uat_event_rows(sheet_name: str, rows: list):
         uat_event_cache.pop(sheet_name, None)
 
 
+def _copy_flat_records(records: list) -> list:
+    """Copy a list of flat string dicts.
+
+    These rows only ever hold strings, so a shallow dict() per row is equivalent
+    to deepcopy and roughly an order of magnitude cheaper — and this runs on
+    every Wave and Booking read.
+    """
+    return [dict(row) for row in records]
+
+
 def read_uat_event_records(sheet_name: str, force: bool = False) -> list:
     now = time.time()
     cached = uat_event_cache.get(sheet_name)
     if cached and not force and cached["expires_at"] > now:
-        return copy.deepcopy(cached["records"])
+        return _copy_flat_records(cached["records"])
     # Single-flight: คำขอ Wave/Booking ที่เข้าพร้อมกันใช้ผลโหลด Sheet ชุดเดียวกัน
     # แทนการยิง Google Sheets ซ้ำคนละ thread ตอน cache หมดอายุ
     with uat_event_read_lock:
         now = time.time()
         cached = uat_event_cache.get(sheet_name)
         if cached and not force and cached["expires_at"] > now:
-            return copy.deepcopy(cached["records"])
+            return _copy_flat_records(cached["records"])
         ensure_uat_event_sheets()
         headers = UAT_EVENT_SHEETS[sheet_name]
         rows = _sheet_values(get_sheets_session(), UAT_DATABASE_SPREADSHEET_ID, f"'{sheet_name}'!A:{chr(64 + len(headers))}")
@@ -280,18 +285,15 @@ def read_uat_event_records(sheet_name: str, force: bool = False) -> list:
             values = list(row) + [""] * max(0, len(headers) - len(row))
             records.append(dict(zip(headers, values[:len(headers)])))
         uat_event_cache[sheet_name] = {"records": records, "expires_at": now + UAT_EVENT_CACHE_TTL_SECONDS}
-        return copy.deepcopy(records)
+        return _copy_flat_records(records)
 
 
-def uat_scan_mode() -> bool:
-    """Enable scanning only against the isolated UAT event workbook."""
-    return bool(SCAN_FEATURE_ENABLED and UAT_SHEETS_ONLY)
 
 
 def save_uat_scan_event(wave_no: str, lpn: str, branch_code: str, branch_name: str,
                         qty: int, scan_type: str, color: str, emp_id: str,
                         pallet_no: int, transaction_id: str = "") -> bool:
-    """Durably save a scan without contacting BigQuery/Production."""
+    """Durably save a scan into the isolated UAT workbook only."""
     txn = transaction_id or str(uuid.uuid4())
     # Presentation mode intentionally changes only the in-memory screen state.
     # It does not create Sheets tabs, append rows, or touch any document source.
@@ -353,6 +355,49 @@ def member_data_bu(owner) -> str:
         "MAX MART": "MAX MART",
     }.get(code, code or "Unknown")
 
+def _apply_member_history_writes(written: list, date_str: str, time_str: str):
+    """Fold rows we just wrote into the in-memory history so reads stay correct.
+
+    The alternative — expiring the cache — would serve the pre-write numbers on
+    the next read and pay for a full 39k-row reload to learn what we already know.
+    """
+    if not written:
+        return
+    with member_history_lock:
+        history = member_history_cache.get("data")
+        if not history:
+            return
+        by_wave = member_history_cache.get("by_wave") or {}
+        for summary in written:
+            wave = str(int(summary["wave"]))
+            branch = str(summary["branch"]).strip().upper()
+            row = {
+                "date": date_str, "time": time_str, "wave": wave, "branch": branch,
+                "branch_name": summary.get("branch_name") or branch,
+                "bu": summary.get("bu") or "Unknown",
+                "label_count": _history_int(summary.get("label_count")),
+                "m": _history_int(summary.get("m")), "red": _history_int(summary.get("red")),
+                "blue": _history_int(summary.get("blue")), "green": _history_int(summary.get("green")),
+                "black": _history_int(summary.get("black")),
+                "total": _history_int(summary.get("total")), "pallet": _history_int(summary.get("pallet")),
+            }
+            previous = history.get((wave, branch))
+            history[(wave, branch)] = row
+            wave_rows = by_wave.setdefault(wave, [])
+            if previous is not None:
+                for index, existing in enumerate(wave_rows):
+                    if existing is previous or existing.get("branch") == branch:
+                        wave_rows[index] = row
+                        break
+                else:
+                    wave_rows.append(row)
+            else:
+                wave_rows.append(row)
+        # Bump the generation so the per-Wave item cache rebuilds with the new totals.
+        member_history_cache["generation"] = int(member_history_cache.get("generation") or 0) + 1
+        member_history_items_cache.clear()
+
+
 def write_member_history_summaries(summaries: list):
     """Upsert document totals using batchUpdate in 1 single HTTP request."""
     if not summaries:
@@ -388,6 +433,7 @@ def write_member_history_summaries(summaries: list):
     time_str = now_bkk.strftime("%H:%M")
 
     batch_data = []
+    written_rows = []
     current_append_row = last_data_row + 1
 
     for summary in summaries:
@@ -416,6 +462,7 @@ def write_member_history_summaries(summaries: list):
             "range": f"Member Data!A{target_row}:P{target_row}",
             "values": row_values
         })
+        written_rows.append(summary)
 
     if not batch_data:
         return
@@ -431,13 +478,13 @@ def write_member_history_summaries(summaries: list):
     member_history_row_cache["last_data_row"] = max(last_data_row, current_append_row - 1)
     member_history_row_cache["expires_at"] = time.time() + SHEET_ROW_CACHE_TTL_SECONDS
 
-    with member_history_lock:
-        member_history_cache["expires_at"] = 0
+    # Apply what we just wrote straight into the in-memory rows instead of
+    # expiring the cache. Expiring it would make the next read serve the stale
+    # pre-write numbers (stale-while-revalidate) and cost a 39k-row reload for
+    # data we already know.
+    _apply_member_history_writes(written_rows, date_str, time_str)
     print(f"⚡ Member Data BATCH updated | {len(batch_data)} branches in 1 request")
 
-def write_member_history_summary(summary: dict):
-    """Upsert one completed Wave+Branch row in Member Data."""
-    write_member_history_summaries([summary])
 
 def _sheet_values(session, spreadsheet_id: str, a1_range: str) -> list:
     encoded = urllib.parse.quote(a1_range, safe="")
@@ -445,29 +492,6 @@ def _sheet_values(session, spreadsheet_id: str, a1_range: str) -> list:
     response = session.get(url, timeout=SHEETS_HTTP_TIMEOUT)
     response.raise_for_status()
     return response.json().get("values") or []
-
-def load_delivery_lookup_maps(session) -> tuple:
-    now = time.time()
-    with delivery_report_lock:
-        if delivery_lookup_cache["expires_at"] > now:
-            return delivery_lookup_cache["cars"], delivery_lookup_cache["branches"]
-        car_rows = _sheet_values(session, DELIVERY_REPORT_SPREADSHEET_ID, f"'{DELIVERY_CAR_SHEET_NAME}'!A:H")
-        branch_rows = _sheet_values(session, DELIVERY_REPORT_SPREADSHEET_ID, f"'{DELIVERY_BRANCH_SHEET_NAME}'!A:F")
-        cars = {}
-        for row in car_rows[1:]:
-            row = list(row) + [""] * max(0, 8 - len(row))
-            booking = str(row[2] or "").strip().upper()
-            if booking:
-                cars[booking] = {"carrier": str(row[5] or "").strip(), "driver": str(row[6] or "").strip(),
-                                 "plate": str(row[7] or "").strip()}
-        branches = {}
-        for row in branch_rows[1:]:
-            row = list(row) + [""] * max(0, 6 - len(row))
-            code = str(row[0] or "").strip().upper()
-            if code:
-                branches[code] = {"province": str(row[3] or "").strip(), "region": str(row[5] or "").strip()}
-        delivery_lookup_cache.update({"expires_at": now + 600, "cars": cars, "branches": branches})
-        return cars, branches
 
 
 def load_branch_province_map(session, force: bool = False) -> dict:
@@ -490,10 +514,7 @@ def load_branch_province_map(session, force: bool = False) -> dict:
                 f"https://docs.google.com/spreadsheets/d/{BRANCH_MASTER_SPREADSHEET_ID}"
                 f"/gviz/tq?{query}"
             )
-            request = urllib.request.Request(url, headers={"User-Agent": "Pro-Scanner-UAT/1.0"})
-            with urllib.request.urlopen(request, timeout=15) as response:
-                csv_text = response.read().decode("utf-8-sig")
-            csv_rows = list(csv.reader(io.StringIO(csv_text)))
+            csv_rows = list(csv.reader(io.StringIO(fetch_gviz_text(url))))
             rows = [[row[0] if row else "", "", "", row[1] if len(row) > 1 else ""] for row in csv_rows]
         except Exception as source_error:
             print(f"Branch province source read unavailable: {source_error}")
@@ -531,9 +552,7 @@ def load_branch_report_map(force: bool = False) -> dict:
                 "tq": "select A,D,E",
             })
             url = f"https://docs.google.com/spreadsheets/d/{BRANCH_MASTER_SPREADSHEET_ID}/gviz/tq?{query}"
-            request = urllib.request.Request(url, headers={"User-Agent": "Pro-Scanner-UAT/1.0"})
-            with urllib.request.urlopen(request, timeout=15) as response:
-                rows = list(csv.reader(io.StringIO(response.read().decode("utf-8-sig"))))
+            rows = list(csv.reader(io.StringIO(fetch_gviz_text(url))))
         except Exception as source_error:
             print(f"Branch report source read unavailable: {source_error}")
             branch_report_cache["expires_at"] = now + 60
@@ -572,51 +591,49 @@ def load_booking_wave_sheet_meta(force: bool = False) -> tuple:
         try:
             tq = "SELECT K, L, P, Q, R WHERE K IS NOT NULL OR L IS NOT NULL"
             url = f"https://docs.google.com/spreadsheets/d/{BOOKING_WAVE_SHEET_ID}/gviz/tq?gid={BOOKING_WAVE_SHEET_GID}&tqx=out:json&tq={urllib.parse.quote(tq)}"
-            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                text = resp.read().decode("utf-8")
-                m = re.search(r"google\.visualization\.Query\.setResponse\((.*)\);", text, re.DOTALL)
-                if m:
-                    data = json.loads(m.group(1))
-                    rows = data.get("table", {}).get("rows", [])
-                    for r in rows:
-                        c = r.get("c") or []
+            text = fetch_gviz_text(url)
+            m = re.search(r"google\.visualization\.Query\.setResponse\((.*)\);", text, re.DOTALL)
+            if m:
+                data = json.loads(m.group(1))
+                rows = data.get("table", {}).get("rows", [])
+                for r in rows:
+                    c = r.get("c") or []
 
-                        def get_val(idx):
-                            if idx < len(c) and c[idx]:
-                                return str(c[idx].get("f") or c[idx].get("v") or "").strip()
-                            return ""
+                    def get_val(idx):
+                        if idx < len(c) and c[idx]:
+                            return str(c[idx].get("f") or c[idx].get("v") or "").strip()
+                        return ""
 
-                        b = get_val(0)
-                        w = get_val(1)
-                        carrier = get_val(2)
-                        sender = get_val(3)
-                        plate = get_val(4)
-                        waves = [str(int(x)) for x in re.findall(r"\b\d{5,}\b", w)]
-                        clean_b = re.sub(r"\s+", "", b.upper())
-                        compact_b = clean_b.replace("-", "")
-                        raw_num = re.sub(r"^B0*1*", "", compact_b)
-                        entry = {
-                            "booking": clean_b,
-                            "waves": waves,
-                            "carrier": carrier,
-                            "sender": sender,
-                            "plate": plate,
-                        }
-                        if clean_b:
-                            booking_map[clean_b] = entry
-                            booking_map[compact_b] = entry
-                            if raw_num:
-                                booking_map[raw_num] = entry
-                                booking_map[f"B001-{raw_num}"] = entry
-                        for wave_id in waves:
-                            # One Wave may legitimately belong to more than one
-                            # Booking.  Keep every booking instead of overwriting
-                            # the previous row (which made the last row win).
-                            for wave_key in (wave_id, f"{int(wave_id):010d}"):
-                                entries = wave_map.setdefault(wave_key, [])
-                                if not any(item.get("booking") == clean_b for item in entries):
-                                    entries.append(entry)
+                    b = get_val(0)
+                    w = get_val(1)
+                    carrier = get_val(2)
+                    sender = get_val(3)
+                    plate = get_val(4)
+                    waves = [str(int(x)) for x in re.findall(r"\b\d{5,}\b", w)]
+                    clean_b = re.sub(r"\s+", "", b.upper())
+                    compact_b = clean_b.replace("-", "")
+                    raw_num = re.sub(r"^B0*1*", "", compact_b)
+                    entry = {
+                        "booking": clean_b,
+                        "waves": waves,
+                        "carrier": carrier,
+                        "sender": sender,
+                        "plate": plate,
+                    }
+                    if clean_b:
+                        booking_map[clean_b] = entry
+                        booking_map[compact_b] = entry
+                        if raw_num:
+                            booking_map[raw_num] = entry
+                            booking_map[f"B001-{raw_num}"] = entry
+                    for wave_id in waves:
+                        # One Wave may legitimately belong to more than one
+                        # Booking.  Keep every booking instead of overwriting
+                        # the previous row (which made the last row win).
+                        for wave_key in (wave_id, f"{int(wave_id):010d}"):
+                            entries = wave_map.setdefault(wave_key, [])
+                            if not any(item.get("booking") == clean_b for item in entries):
+                                entries.append(entry)
 
             with booking_wave_sheet_lock:
                 booking_wave_sheet_cache["bookings"] = booking_map
@@ -704,9 +721,7 @@ def load_wave_monitoring_pick_dates(force: bool = False) -> tuple:
             f"https://docs.google.com/spreadsheets/d/{WAVE_MONITORING_SPREADSHEET_ID}"
             f"/export?format=csv&gid={WAVE_MONITORING_SHEET_GID}"
         )
-        request = urllib.request.Request(url, headers={"User-Agent": "Pro-Scanner-UAT/1.0"})
-        with urllib.request.urlopen(request, timeout=15) as response:
-            rows = list(csv.reader(io.StringIO(response.read().decode("utf-8-sig"))))
+        rows = list(csv.reader(io.StringIO(fetch_gviz_text(url))))
         headers = rows[0] if rows else []
         header_index = {str(name).strip(): index for index, name in enumerate(headers)}
         wave_index = header_index.get("Wave_Number", 0)
@@ -757,7 +772,6 @@ def get_wave_monitoring_pick_date(wave_no: str, booking_no: str = ""):
 # ==================== DOCUMENT OVERRIDES SYNC SYSTEM ====================
 document_overrides_overlay = {}
 document_overrides_lock = Lock()
-MANUAL_OVERRIDE_EMP_PREFIX = "MANUAL_OVERRIDE|"
 
 def _document_override_scope_key(wave_no: str, booking_no: str = "") -> tuple:
     clean_wave = re.sub(r"\D", "", str(wave_no or ""))
@@ -854,24 +868,13 @@ def record_document_overrides(summaries: list, emp_id: str, reason: str = ""):
     print(f"✅ Saved {len(rows_to_insert)} document overrides to UAT Sheet")
 
 def get_delivery_wave_meta(wave: str, booking: str = "") -> dict:
-    if UAT_SHEETS_ONLY:
-        meta = get_sheet_meta_for_wave(wave)
-        resolved_booking = str(booking or meta.get("booking") or "").strip().upper()
-        return {
-            **meta,
-            "pick_date": get_wave_monitoring_pick_date(wave, resolved_booking),
-            "booking": resolved_booking,
-        }
-    query = """
-        SELECT MAX(Planned_Pick_Date) AS planned_pick_date,
-               COALESCE(MAX(NULLIF(TRIM(Vehicle_Booking_No), '')), '') AS booking_no
-        FROM `pro-analytics-db.logistics_db.wave_summary_fast`
-        WHERE SAFE_CAST(REGEXP_REPLACE(TRIM(CAST(Wave_Number AS STRING)), r'[^0-9]', '') AS INT64) = @wave
-    """
-    config = bigquery.QueryJobConfig(query_parameters=[bigquery.ScalarQueryParameter("wave", "INT64", int(wave))])
-    row = next(iter(client.query(query, job_config=config).result(timeout=BQ_JOB_TIMEOUT_SECONDS)), None)
-    return {"pick_date": row["planned_pick_date"] if row else None,
-            "booking": str(row["booking_no"] or "").strip().upper() if row else ""}
+    meta = get_sheet_meta_for_wave(wave)
+    resolved_booking = str(booking or meta.get("booking") or "").strip().upper()
+    return {
+        **meta,
+        "pick_date": get_wave_monitoring_pick_date(wave, resolved_booking),
+        "booking": resolved_booking,
+    }
 
 def delivery_business_dates(pick_date):
     if isinstance(pick_date, datetime.datetime):
@@ -887,8 +890,6 @@ def delivery_business_dates(pick_date):
         delivery_date += datetime.timedelta(days=1)
     return order_date, delivery_date
 
-def _date_serial(value):
-    return (value - datetime.date(1899, 12, 30)).days if isinstance(value, datetime.date) else ""
 
 
 def write_uat_report_test_summaries(summaries: list):
@@ -1052,126 +1053,6 @@ def write_uat_report_test_summaries(summaries: list):
         print(f"⚡ UAT test Delivery report updated | {len(batch_data)} branches")
 
 
-def write_delivery_report_summaries(summaries: list):
-    """Blocked in UAT: the legacy transport workbook is lookup-only."""
-    if DELIVERY_REPORT_READ_ONLY:
-        raise RuntimeError("legacy transport workbook is read-only in UAT")
-    if not LEGACY_DELIVERY_REPORT_SYNC_ENABLED:
-        raise RuntimeError("legacy Delivery report/staging sync is disabled")
-    if not summaries:
-        return
-    session = get_sheets_session()
-    cars, branches = load_delivery_lookup_maps(session)
-    now_bkk = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=7)))
-    
-    with delivery_report_lock:
-        now = time.time()
-        if delivery_report_row_cache["existing_map"] and delivery_report_row_cache["expires_at"] > now:
-            existing_map = dict(delivery_report_row_cache["existing_map"])
-            last_data_row = int(delivery_report_row_cache["last_data_row"] or 1)
-        else:
-            existing = _sheet_values(session, DELIVERY_REPORT_SPREADSHEET_ID, f"'{DELIVERY_SOURCE_SHEET_NAME}'!A:V")
-            existing_map = {}
-            last_data_row = 1
-            for index in range(len(existing), 1, -1):
-                row = list(existing[index - 1]) + [""] * max(0, 22 - len(existing[index - 1]))
-                row_wave = row[2] if len(row) > 2 else ""
-                row_branch = row[3] if len(row) > 3 else ""
-                row_booking = str(row[18] or "").strip().upper()
-                if _is_valid_wave_branch(row_wave, row_branch):
-                    if index > last_data_row:
-                        last_data_row = index
-                    wave_digits = re.sub(r"\D", "", str(row_wave or ""))
-                    branch_clean = str(row_branch or "").strip().upper()
-                    wave_branch = (str(int(wave_digits)), branch_clean)
-                    exact_key = (row_booking, *wave_branch)
-                    existing_map.setdefault(exact_key, index)
-                    existing_map.setdefault(("", *wave_branch), index)
-
-        batch_data = []
-        formula_requests = []
-        current_append_row = last_data_row + 1
-        meta_cache = {}
-
-        for summary in summaries:
-            wave = str(int(str(summary["wave"]).strip()))
-            branch = str(summary["branch"] or "").strip().upper()
-            if wave not in meta_cache:
-                meta_cache[wave] = get_delivery_wave_meta(wave)
-            meta = meta_cache[wave]
-
-            pick_date = meta.get("pick_date") or now_bkk.date()
-            order_date, delivery_date = delivery_business_dates(pick_date)
-            booking = str(summary.get("booking") or meta.get("booking") or "").strip().upper()
-            car = cars.get(booking, {})
-            key = (booking, wave, branch)
-            legacy_key = ("", wave, branch)
-
-            if key in existing_map:
-                target_row = existing_map[key]
-            elif not summary.get("booking_split") and legacy_key in existing_map:
-                target_row = existing_map[legacy_key]
-            else:
-                # Zero corrections update existing rows only; they never create new zero reports.
-                if int(summary.get("total") or 0) <= 0:
-                    print(f"Delivery zero update skipped (no existing row) | {booking}/{wave}/{branch}")
-                    continue
-                target_row = current_append_row
-                existing_map[key] = target_row
-                current_append_row += 1
-
-            core_values = [[
-                _date_serial(now_bkk.date()), now_bkk.strftime("%H:%M:%S"), wave, branch,
-                clean_branch_display_name(summary.get("branch_name")), member_data_bu(summary.get("bu")), "", "",
-                _history_int(summary.get("m")), _history_int(summary.get("red")), _history_int(summary.get("blue")),
-                _history_int(summary.get("green")), _history_int(summary.get("black")), _history_int(summary.get("total")),
-                _history_int(summary.get("pallet")), "Outbound", ""
-            ]]
-            car_values = [[
-                booking, car.get("carrier", ""), car.get("driver", ""), car.get("plate", "")
-            ]]
-            date_values = [[
-                _date_serial(order_date), _date_serial(pick_date), _date_serial(delivery_date)
-            ]]
-
-            batch_data.append({"range": f"'{DELIVERY_SOURCE_SHEET_NAME}'!A{target_row}:Q{target_row}", "values": core_values})
-            batch_data.append({"range": f"'{DELIVERY_SOURCE_SHEET_NAME}'!S{target_row}:V{target_row}", "values": car_values})
-            batch_data.append({"range": f"'{DELIVERY_SOURCE_SHEET_NAME}'!X{target_row}:Z{target_row}", "values": date_values})
-
-            if target_row > 2:
-                formula_requests.append({"copyPaste": {
-                    "source": {"sheetId": DELIVERY_REPORT_SHEET_ID, "startRowIndex": target_row - 2,
-                               "endRowIndex": target_row - 1, "startColumnIndex": 0, "endColumnIndex": 20},
-                    "destination": {"sheetId": DELIVERY_REPORT_SHEET_ID, "startRowIndex": target_row - 1,
-                                    "endRowIndex": target_row, "startColumnIndex": 0, "endColumnIndex": 20},
-                    "pasteType": "PASTE_FORMULA", "pasteOrientation": "NORMAL"
-                }})
-
-        if not batch_data:
-            return
-
-        # Send 1 single values:batchUpdate request
-        base = f"https://sheets.googleapis.com/v4/spreadsheets/{DELIVERY_REPORT_SPREADSHEET_ID}"
-        response = session.post(f"{base}/values:batchUpdate", json={"valueInputOption": "RAW", "data": batch_data}, timeout=SHEETS_HTTP_TIMEOUT)
-        response.raise_for_status()
-
-        delivery_report_row_cache["existing_map"] = dict(existing_map)
-        delivery_report_row_cache["last_data_row"] = max(last_data_row, current_append_row - 1)
-        delivery_report_row_cache["expires_at"] = time.time() + SHEET_ROW_CACHE_TTL_SECONDS
-
-        if formula_requests:
-            try:
-                copied = session.post(f"{base}:batchUpdate", json={"requests": formula_requests}, timeout=SHEETS_HTTP_TIMEOUT)
-                copied.raise_for_status()
-            except Exception as fe:
-                print(f"⚠️ Formula copy warning: {fe}")
-
-        print(f"⚡ Delivery source/report BATCH updated | {len(summaries)} branches in 1 request")
-
-def write_delivery_report_summary(summary: dict):
-    """Upsert one Wave+Branch into the source tab; Delivery report remains formula-driven."""
-    write_delivery_report_summaries([summary])
-
 def summarize_branch_for_member_data(wave_data: dict, branch: str) -> dict:
     items = [item for item in wave_data.get("lpn_list", []) if str(item.get("branch") or "").strip().upper() == branch]
     # ตัดเฉพาะ transaction ที่ซ้ำกันทุกมิติจาก network retry แต่ LPN เดิมคนละพาเลทยังนับแยกตามปกติ
@@ -1329,65 +1210,6 @@ def normalize_report_summary(raw: dict, wave: str = "", branch: str = "") -> dic
     return summary
 
 
-def report_summary_has_boxes(summary: dict) -> bool:
-    return int(normalize_report_summary(summary).get("total") or 0) > 0
-
-
-def get_durable_close_summaries(wave: str, branches) -> dict:
-    """Read the exact positive totals saved atomically with CLOSE_JOB."""
-    clean_branches = sorted({str(branch or "").strip().upper() for branch in branches or [] if branch})
-    if not clean_branches:
-        return {}
-    try:
-        query = """
-            WITH LatestClose AS (
-              SELECT
-                TRIM(UPPER(CAST(Branch_Code AS STRING))) AS branch,
-                CAST(Color AS STRING) AS payload,
-                SAFE_CAST(Timestamp AS TIMESTAMP) AS closed_at
-              FROM `pro-analytics-db.logistics_db.app_scan_transactions`
-              WHERE SAFE_CAST(REGEXP_REPLACE(TRIM(CAST(Wave_Number AS STRING)), r'[^0-9]', '') AS INT64) = @wave
-                AND UPPER(TRIM(CAST(Scan_Type AS STRING))) = 'CLOSE_SUMMARY'
-                AND TRIM(UPPER(CAST(Branch_Code AS STRING))) IN UNNEST(@branches)
-              QUALIFY ROW_NUMBER() OVER (
-                PARTITION BY TRIM(UPPER(CAST(Branch_Code AS STRING)))
-                ORDER BY SAFE_CAST(Timestamp AS TIMESTAMP) DESC, CAST(LPN AS STRING) DESC
-              ) = 1
-            )
-            SELECT c.*,
-              EXISTS (
-                SELECT 1
-                FROM `pro-analytics-db.logistics_db.app_scan_transactions` t
-                WHERE SAFE_CAST(REGEXP_REPLACE(TRIM(CAST(t.Wave_Number AS STRING)), r'[^0-9]', '') AS INT64) = @wave
-                  AND TRIM(UPPER(CAST(t.Branch_Code AS STRING))) = c.branch
-                  AND SAFE_CAST(t.Timestamp AS TIMESTAMP) > c.closed_at
-                  AND (
-                    UPPER(TRIM(CAST(t.Scan_Type AS STRING))) IN ('RESET_BOX', 'CANCEL_COMBINE')
-                    OR STARTS_WITH(UPPER(TRIM(CAST(t.Scan_Type AS STRING))), 'CORRECTION|')
-                  )
-              ) AS has_post_close_correction
-            FROM LatestClose c
-        """
-        job_config = bigquery.QueryJobConfig(query_parameters=[
-            bigquery.ScalarQueryParameter("wave", "INT64", int(str(wave))),
-            bigquery.ArrayQueryParameter("branches", "STRING", clean_branches),
-        ])
-        durable = {}
-        for row in client.query(query, job_config=job_config).result(timeout=BQ_JOB_TIMEOUT_SECONDS):
-            branch = str(row["branch"] or "").strip().upper()
-            try:
-                payload = json.loads(str(row["payload"] or "{}"))
-            except (TypeError, ValueError, json.JSONDecodeError):
-                continue
-            summary = normalize_report_summary(payload, str(wave), branch)
-            if summary.get("total", 0) > 0:
-                summary["_closed_at"] = row["closed_at"].isoformat() if row["closed_at"] else ""
-                summary["_has_post_close_correction"] = bool(row["has_post_close_correction"])
-                durable[branch] = summary
-        return durable
-    except Exception as exc:
-        print(f"⚠️ CLOSE SUMMARY READ skipped | Wave: {wave} | {exc}")
-        return {}
 
 
 def _report_sync_key(wave: str, branch: str, mode: str) -> tuple:
@@ -1422,7 +1244,7 @@ def queue_report_summary_snapshots(summaries: list, delay_seconds: float = REPOR
 
 
 def queue_branch_totals_reconciliation(wave_branch_pairs, delay_seconds: float = REPORT_SYNC_RECONCILE_DELAY_SECONDS):
-    """Queue a server-side recalculation from BigQuery after streaming rows become queryable."""
+    """Queue a server-side recalculation from the Sheets sources."""
     now = time.time()
     with report_sync_pending_lock:
         for wave, branch in wave_branch_pairs or []:
@@ -1464,7 +1286,7 @@ def _build_reconciled_summaries(entries: list) -> list:
     for entry in entries:
         entries_by_wave.setdefault(entry["wave"], []).append(entry)
     for wave, wave_entries in entries_by_wave.items():
-        # One fresh BigQuery query per Wave, even when many branches changed together.
+        # One fresh Sheet read per Wave, even when many branches changed together.
         fresh = get_wave_data_internal(wave, force_refresh=True)
         fresh = apply_local_overlay(wave, fresh)
         available_branches = sorted({str(item.get("branch") or "").strip().upper()
@@ -1475,22 +1297,14 @@ def _build_reconciled_summaries(entries: list) -> list:
                 requested.update(available_branches)
             else:
                 requested.add(entry["branch"])
-        durable_summaries = get_durable_close_summaries(wave, requested)
         for branch in sorted(requested):
             branch_items = [item for item in fresh.get("lpn_list", [])
                             if str(item.get("branch") or "").strip().upper() == branch]
             # Google Sheets เป็นรายงานงานที่ปิดจบแล้วเท่านั้น ห้ามสร้างแถว 0/ยอดระหว่างทำงาน
             if not any(item.get("branch_closed_at") for item in branch_items):
                 continue
-            calculated = normalize_report_summary(summarize_branch_for_member_data(fresh, branch), wave, branch)
-            durable = durable_summaries.get(branch)
-            # CLOSE_SUMMARY คือยอดที่เห็นจริงตอนกดปิดและเก็บถาวรพร้อม CLOSE_JOB
-            # ใช้เป็น fallback/กันข้อมูล BigQuery ที่เข้าช้าหรือหายบางส่วน แล้วให้ manual override ชนะท้ายสุด
-            if (durable and not durable.get("_has_post_close_correction")
-                    and int(durable.get("total") or 0) > int(calculated.get("total") or 0)):
-                summary = {**calculated, **durable, "wave": wave, "branch": branch, "is_closed": True}
-            else:
-                summary = calculated
+            # ยอดคำนวณจาก Sheet คือแหล่งจริง แล้วให้ยอดที่ผู้ใช้แก้เองชนะท้ายสุด
+            summary = normalize_report_summary(summarize_branch_for_member_data(fresh, branch), wave, branch)
             summary = normalize_report_summary(apply_document_override_to_summary(summary), wave, branch)
             if summary.get("total", 0) > 0 or summary.get("allow_zero_update"):
                 summaries.append(summary)
@@ -1530,7 +1344,7 @@ def report_sync_worker_loop():
             snapshots = [copy.deepcopy(entry["summary"]) for entry in due_entries
                          if entry["mode"] == "snapshot" and entry.get("summary")]
             reconciles = [entry for entry in due_entries if entry["mode"] != "snapshot"]
-            # Snapshot gives users a fast update. Reconciliation follows from durable BigQuery state.
+            # Snapshot gives users a fast update; reconciliation re-reads the Sheet after.
             if snapshots:
                 sync_document_summary_reports(snapshots)
             if reconciles:
@@ -1555,13 +1369,88 @@ def _history_int(value) -> int:
     except (TypeError, ValueError):
         return 0
 
-def load_member_history() -> dict:
-    """Member Data is a completed branch summary, keyed by numeric Wave + branch."""
-    now = time.time()
+_NON_DIGIT_RE = re.compile(r"\D")
+
+
+def _parse_member_history_csv(csv_text: str) -> dict:
+    """Turn the Member Data CSV export into {(wave, branch): summary}."""
+    history = {}
+    rows = csv.reader(io.StringIO(csv_text))
+    next(rows, None)
+    for row in rows:
+        if len(row) < 16:
+            row = list(row) + [""] * (16 - len(row))
+        wave_digits = _NON_DIGIT_RE.sub("", row[2])
+        branch = str(row[3] or "").strip().upper()
+        if not wave_digits or not branch:
+            continue
+        wave = str(int(wave_digits))
+        history[(wave, branch)] = {
+            "date": str(row[0] or "").strip(), "time": str(row[1] or "").strip(),
+            "wave": wave, "branch": branch, "branch_name": clean_branch_display_name(row[4]),
+            "bu": str(row[5] or "").strip() or "Unknown", "label_count": _history_int(row[6]),
+            "m": _history_int(row[8]), "red": _history_int(row[9]), "blue": _history_int(row[10]),
+            "green": _history_int(row[11]), "black": _history_int(row[12]),
+            "total": _history_int(row[13]), "pallet": _history_int(row[14])
+        }
+    return history
+
+
+def _store_member_history(history: dict, ttl_seconds: float):
+    """Publish a loaded history plus the per-Wave index every read needs.
+
+    Without the index, every Wave lookup scanned all ~39k rows; a Booking with
+    Waves did that five times per request.
+    """
+    by_wave = {}
+    for row in history.values():
+        by_wave.setdefault(row["wave"], []).append(row)
     with member_history_lock:
-        cached = member_history_cache.get("data") or {}
-        if cached and member_history_cache.get("expires_at", 0) > now:
-            return cached
+        member_history_cache["data"] = history
+        member_history_cache["by_wave"] = by_wave
+        member_history_cache["expires_at"] = time.time() + ttl_seconds
+        member_history_cache["loaded_at"] = time.time()
+        member_history_cache["generation"] = int(member_history_cache.get("generation") or 0) + 1
+        member_history_items_cache.clear()
+
+
+def _save_member_history_snapshot(history: dict):
+    """Keep a compressed copy on local disk so a worker restart skips the download."""
+    try:
+        with gzip.open(MEMBER_HISTORY_SNAPSHOT_PATH, "wt", encoding="utf-8", compresslevel=1) as handle:
+            json.dump(list(history.values()), handle, ensure_ascii=False, separators=(",", ":"))
+    except Exception as exc:
+        print(f"⚠️ Member Data snapshot not saved: {exc}")
+
+
+def _load_member_history_snapshot() -> dict:
+    """Read the local snapshot if it is recent enough to serve while refreshing."""
+    try:
+        age = time.time() - os.path.getmtime(MEMBER_HISTORY_SNAPSHOT_PATH)
+        if age > MEMBER_HISTORY_SNAPSHOT_MAX_AGE_SECONDS:
+            return {}
+        with gzip.open(MEMBER_HISTORY_SNAPSHOT_PATH, "rt", encoding="utf-8") as handle:
+            rows = json.load(handle)
+        history = {(row["wave"], row["branch"]): row for row in rows
+                   if row.get("wave") and row.get("branch")}
+        if history:
+            print(f"⚡ Member Data restored from local snapshot: {len(history)} rows ({int(age)}s old)")
+        return history
+    except FileNotFoundError:
+        return {}
+    except Exception as exc:
+        print(f"⚠️ Member Data snapshot unreadable: {exc}")
+        return {}
+
+
+def _refresh_member_history() -> dict:
+    """Download and publish Member Data. Only one thread does this at a time.
+
+    The refresh lock also collapses concurrent bursts: whoever arrives second
+    finds the cache already fresh and returns that read instead of downloading
+    the sheet again.
+    """
+    global member_history_refreshing
     with member_history_refresh_lock:
         now = time.time()
         with member_history_lock:
@@ -1572,41 +1461,87 @@ def load_member_history() -> dict:
             f"https://docs.google.com/spreadsheets/d/{MEMBER_HISTORY_SPREADSHEET_ID}"
             f"/gviz/tq?tqx=out:csv&gid={MEMBER_HISTORY_GID}"
         )
-        history = {}
         try:
-            request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(request, timeout=45) as response:
-                rows = csv.reader(io.StringIO(response.read().decode("utf-8-sig")))
-                next(rows, None)
-                for row in rows:
-                    row = list(row) + [""] * max(0, 16 - len(row))
-                    wave_digits = re.sub(r"\D", "", row[2])
-                    branch = str(row[3] or "").strip().upper()
-                    if not wave_digits or not branch:
-                        continue
-                    wave = str(int(wave_digits))
-                    history[(wave, branch)] = {
-                        "date": str(row[0] or "").strip(), "time": str(row[1] or "").strip(),
-                        "wave": wave, "branch": branch, "branch_name": clean_branch_display_name(row[4]),
-                        "bu": str(row[5] or "").strip() or "Unknown", "label_count": _history_int(row[6]),
-                        "m": _history_int(row[8]), "red": _history_int(row[9]), "blue": _history_int(row[10]),
-                        "green": _history_int(row[11]), "black": _history_int(row[12]),
-                        "total": _history_int(row[13]), "pallet": _history_int(row[14])
-                    }
-            with member_history_lock:
-                member_history_cache["data"] = history
-                member_history_cache["expires_at"] = now + MEMBER_HISTORY_CACHE_TTL_SECONDS
-            print(f"✅ Member Data history loaded: {len(history)} branch summaries")
+            started = time.time()
+            history = _parse_member_history_csv(fetch_gviz_text(url, timeout=MEMBER_HISTORY_HTTP_TIMEOUT))
+            if not history:
+                raise ValueError("Member Data returned no usable rows")
+            _store_member_history(history, MEMBER_HISTORY_CACHE_TTL_SECONDS)
+            _save_member_history_snapshot(history)
+            print(f"✅ Member Data loaded: {len(history)} branch summaries in {time.time() - started:.1f}s")
             return history
         except Exception as exc:
-            print(f"⚠️ Member Data history load failed (non-critical): {exc}")
+            print(f"⚠️ Member Data load failed, keeping previous rows: {exc}")
             with member_history_lock:
-                member_history_cache["expires_at"] = now + 60
+                # Retry soon, but do not hammer Google while it is unhappy.
+                member_history_cache["expires_at"] = time.time() + MEMBER_HISTORY_ERROR_BACKOFF_SECONDS
+                return member_history_cache.get("data") or {}
+        finally:
+            with member_history_lock:
+                member_history_refreshing = False
+
+
+def load_member_history(force: bool = False) -> dict:
+    """Member Data as {(wave, branch): summary}, served without ever blocking on Google.
+
+    Stale-while-revalidate: an expired cache is returned immediately and refreshed
+    in the background. Only a genuinely empty cache waits for the download, and it
+    tries the local snapshot first. This is what stops a 10-minute cache expiry from
+    turning one unlucky user's search into a 45-second wait.
+
+    force=True is the refresh button and the "data is still arriving" retry: it
+    always blocks on a real read, because the caller specifically wants new rows.
+    """
+    global member_history_refreshing
+    if force:
+        with member_history_lock:
+            member_history_cache["expires_at"] = 0.0
+        return _refresh_member_history()
+    now = time.time()
+    with member_history_lock:
+        cached = member_history_cache.get("data") or {}
+        fresh = member_history_cache.get("expires_at", 0) > now
+        if cached and fresh:
             return cached
+        should_refresh = bool(cached) and not member_history_refreshing
+        if should_refresh:
+            member_history_refreshing = True
+
+    if cached:
+        if should_refresh:
+            threading.Thread(target=_refresh_member_history, daemon=True,
+                             name="member-history-refresh").start()
+        return cached
+
+    # Cold cache: a snapshot from this container lets the first request answer now.
+    snapshot = _load_member_history_snapshot()
+    if snapshot:
+        _store_member_history(snapshot, MEMBER_HISTORY_SNAPSHOT_TTL_SECONDS)
+        with member_history_lock:
+            if not member_history_refreshing:
+                member_history_refreshing = True
+                threading.Thread(target=_refresh_member_history, daemon=True,
+                                 name="member-history-refresh").start()
+        return snapshot
+    return _refresh_member_history()
+
+
+def member_history_rows_for_wave(wave: str) -> list:
+    """All Member Data rows for one Wave, via the index instead of a full scan."""
+    load_member_history()
+    with member_history_lock:
+        return list((member_history_cache.get("by_wave") or {}).get(str(wave)) or [])
+
 
 def build_member_history_items(wave_no: str) -> list:
     wave = str(int(str(wave_no).strip()))
-    rows = [row for (row_wave, _), row in load_member_history().items() if row_wave == wave]
+    with member_history_lock:
+        generation = int(member_history_cache.get("generation") or 0)
+    cache_key = (wave, generation)
+    cached_items = member_history_items_cache.get(cache_key)
+    if cached_items is not None:
+        return cached_items
+    rows = member_history_rows_for_wave(wave)
     items = []
     for row in rows:
         values = [("M", "None", "Carton", row["m"]), ("RED", "Red", "TOTE", row["red"]),
@@ -1631,6 +1566,12 @@ def build_member_history_items(wave_no: str) -> list:
                 "wave_no": f"{int(wave):010d}", "historical_summary": True,
                 "historical_label_count": row["label_count"], "historical_date": row["date"]
             })
+    # Callers treat these items as read-only, and one Wave is rebuilt several
+    # times per request (document build, overlay merge, Booking fan-out).
+    # Keyed by history generation so a refresh invalidates it automatically.
+    if len(member_history_items_cache) > MEMBER_HISTORY_ITEMS_CACHE_MAX:
+        member_history_items_cache.clear()
+    member_history_items_cache[cache_key] = items
     return items
 
 def merge_member_history(raw_data: dict, wave_no: str) -> dict:
@@ -1707,196 +1648,43 @@ def build_uat_wave_data(wave_no: str) -> dict:
     }
 
 DIRECT_QTY_PREFIXES = ("PP", "SP")
-PACK_CASE_MAP_PATH = os.path.join(os.path.dirname(__file__), "pack_case_map.json")
-pack_case_map_cache = None
-pack_case_map_lock = Lock()
 
 def is_direct_qty_lpn_value(lpn: str) -> bool:
     return str(lpn or "").strip().upper().startswith(DIRECT_QTY_PREFIXES)
 
-def load_pack_case_map() -> dict:
-    """สร้างแมป 'จำนวนชิ้นต่อลัง (CASECNT)' จาก BigQuery (แคชไว้จนกว่าจะรีสตาร์ท)
-    - key แบบ 'OWNER|SKU'  -> casecnt  (ผ่าน master_picktype_native: Owner+SKU -> PACKKEY -> CASECNT)
-    - key แบบ 'PRODUCT_CODE' -> casecnt  (ทางตรง: Product_Code = PACKKEY)
-    calculate_direct_total_qty จะลองหา OWNER|CODE ก่อน ไม่เจอค่อยใช้ CODE ตรงๆ
-    """
-    global pack_case_map_cache
-    if pack_case_map_cache is not None:
-        return pack_case_map_cache
+# Compiled once: these three run on every one of ~39k Member Data rows, so
+# re-compiling them per row was a measurable slice of parse time on 0.1 CPU.
+_BRANCH_PREFIX_RE = re.compile(
+    r"^\s*(?:ห้างหุ้นส่วนสามัญนิติบุคคล|ห้างหุ้นส่วนจำกัด|หจก\.?|บริษัทจำกัด|บริษัท|บจก\.?)\s*",
+    re.IGNORECASE,
+)
+_BRANCH_SUFFIX_RE = re.compile(
+    r"\s*(?:จำกัด\s*\(มหาชน\)|จำกัด|\(มหาชน\)|มหาชน|บจก\.?|หจก\.?)\s*$",
+    re.IGNORECASE,
+)
+_WHITESPACE_RE = re.compile(r"\s+")
+_BRANCH_NAME_BLANKS = {"unknown", "null", "none", "-", "ไม่ระบุ", ""}
+_branch_name_cache = {}
 
-    with pack_case_map_lock:
-        if pack_case_map_cache is not None:
-            return pack_case_map_cache
-        case_map = {}
-        try:
-            # 1) master_product_native: PACKKEY (string_field_1) -> CASECNT (string_field_7)
-            product_case = {}
-            prod_sql = """
-                SELECT UPPER(TRIM(CAST(string_field_1 AS STRING))) AS packkey,
-                       SAFE_CAST(string_field_7 AS FLOAT64) AS casecnt
-                FROM `pro-analytics-db.logistics_db.master_product_native`
-                WHERE string_field_1 NOT IN ('PACKKEY', 'Pack')
-            """
-            for r in client.query(prod_sql).result(timeout=BQ_JOB_TIMEOUT_SECONDS):
-                pk = str(get_row_value(r, "packkey", "") or "").strip().upper()
-                cc = to_float(get_row_value(r, "casecnt", 0))
-                if pk and cc > 0:
-                    product_case[pk] = cc
-                    case_map[pk] = cc  # ทางตรง: Product_Code = PACKKEY
-
-            # 2) master_picktype_native: (Owner=field_1, SKU=field_2) -> PACKKEY (field_4)
-            pick_sql = """
-                SELECT UPPER(TRIM(CAST(string_field_1 AS STRING))) AS owner,
-                       UPPER(TRIM(CAST(string_field_2 AS STRING))) AS sku,
-                       UPPER(TRIM(CAST(string_field_4 AS STRING))) AS packkey
-                FROM `pro-analytics-db.logistics_db.master_picktype_native`
-                WHERE string_field_1 NOT IN ('STORERKEY', 'Owner')
-            """
-            for r in client.query(pick_sql).result(timeout=BQ_JOB_TIMEOUT_SECONDS):
-                owner = str(get_row_value(r, "owner", "") or "").strip().upper()
-                sku = str(get_row_value(r, "sku", "") or "").strip().upper()
-                pk = str(get_row_value(r, "packkey", "") or "").strip().upper()
-                cc = product_case.get(pk)
-                if owner and sku and cc:
-                    case_map[f"{owner}|{sku}"] = cc
-
-            pack_case_map_cache = case_map
-            print(f"✅ Loaded case-size map from BigQuery: {len(case_map)} keys")
-        except Exception as e:
-            print(f"⚠️ Case-size map load failed, falling back to Total_Qty: {e}")
-            pack_case_map_cache = {}
-        return pack_case_map_cache
-
-def get_row_value(row, key: str, default=None):
-    try:
-        return row[key]
-    except Exception:
-        return default
 
 def clean_branch_display_name(value) -> str:
     """Return a short operational branch name instead of a legal-entity name."""
     name = str(value or "").strip()
-    if not name or name.lower() in {"unknown", "null", "none"} or name in {"-", "ไม่ระบุ"}:
+    # The same few hundred branch names repeat across tens of thousands of rows,
+    # so memoizing turns three regex passes per row into one dict lookup.
+    cached = _branch_name_cache.get(name)
+    if cached is not None:
+        return cached
+    if name.lower() in _BRANCH_NAME_BLANKS:
+        _branch_name_cache[name] = "Unknown"
         return "Unknown"
 
-    name = re.sub(
-        r"^\s*(?:ห้างหุ้นส่วนสามัญนิติบุคคล|ห้างหุ้นส่วนจำกัด|หจก\.?|บริษัทจำกัด|บริษัท|บจก\.?)\s*",
-        "",
-        name,
-        flags=re.IGNORECASE,
-    )
-    name = re.sub(
-        r"\s*(?:จำกัด\s*\(มหาชน\)|จำกัด|\(มหาชน\)|มหาชน|บจก\.?|หจก\.?)\s*$",
-        "",
-        name,
-        flags=re.IGNORECASE,
-    )
-    name = re.sub(r"\s+", " ", name).strip(" -")
-    return name or "Unknown"
-
-def is_numeric_branch_code(value) -> bool:
-    branch_code = str(value or "").strip()
-    return bool(branch_code) and branch_code[0].isdigit()
-
-def _build_numeric_branch_map(rows) -> dict:
-    branch_map = {}
-    for row in rows or []:
-        if not row or len(row) < 2:
-            continue
-        branch_code = str(row[0] or "").strip()
-        branch_name = clean_branch_display_name(row[1])
-        if is_numeric_branch_code(branch_code) and branch_name != "Unknown":
-            # Master อาจมีรหัสซ้ำ ให้แถวล่าสุดในชีตเป็นค่าหลัก
-            branch_map[branch_code] = branch_name
-    return branch_map
-
-def load_numeric_branch_master() -> dict:
-    """Load numeric branch names from Master!B:C and cache them for 30 minutes."""
-    now = time.time()
-    with numeric_branch_master_lock:
-        cached_data = numeric_branch_master_cache.get("data") or {}
-        if cached_data and numeric_branch_master_cache.get("expires_at", 0) > now:
-            return cached_data
-
-        branch_map = {}
-        try:
-            sheet_name = urllib.parse.quote(NUMERIC_BRANCH_MASTER_SHEET_NAME)
-            csv_url = (
-                f"https://docs.google.com/spreadsheets/d/{NUMERIC_BRANCH_MASTER_SPREADSHEET_ID}/gviz/tq"
-                f"?tqx=out:csv&gid={NUMERIC_BRANCH_MASTER_GID}&sheet={sheet_name}&range=B:C"
-            )
-            request = urllib.request.Request(csv_url, headers={"User-Agent": "Pro-LPN-Scanner/1.0"})
-            with urllib.request.urlopen(request, timeout=15) as response:
-                csv_text = response.read().decode("utf-8-sig")
-            branch_map = _build_numeric_branch_map(csv.reader(io.StringIO(csv_text)))
-        except Exception as public_error:
-            print(f"Numeric branch Master public CSV unavailable: {public_error}")
-
-        if not branch_map:
-            try:
-                from google.oauth2 import service_account
-                from google.auth.transport.requests import Request as GoogleAuthRequest
-
-                credentials = service_account.Credentials.from_service_account_file(
-                    "bq-key.json",
-                    scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"],
-                )
-                credentials.refresh(GoogleAuthRequest())
-                range_name = urllib.parse.quote(f"{NUMERIC_BRANCH_MASTER_SHEET_NAME}!B:C", safe="")
-                api_url = (
-                    f"https://sheets.googleapis.com/v4/spreadsheets/{NUMERIC_BRANCH_MASTER_SPREADSHEET_ID}"
-                    f"/values/{range_name}?majorDimension=ROWS&valueRenderOption=FORMATTED_VALUE"
-                )
-                request = urllib.request.Request(
-                    api_url,
-                    headers={"Authorization": f"Bearer {credentials.token}"},
-                )
-                with urllib.request.urlopen(request, timeout=15) as response:
-                    payload = json.loads(response.read().decode("utf-8"))
-                branch_map = _build_numeric_branch_map(payload.get("values", []))
-            except Exception as auth_error:
-                print(f"Numeric branch Master authenticated read unavailable: {auth_error}")
-
-        if branch_map:
-            numeric_branch_master_cache["data"] = branch_map
-            numeric_branch_master_cache["expires_at"] = now + NUMERIC_BRANCH_MASTER_CACHE_TTL_SECONDS
-            return branch_map
-
-        # ถ้าชีตขัดข้องชั่วคราว ให้ใช้แคชเดิมแทนและลองโหลดใหม่เร็วขึ้น
-        numeric_branch_master_cache["expires_at"] = now + 60
-        return cached_data
-
-def to_float(value, default: float = 0.0) -> float:
-    try:
-        if value is None or value == "":
-            return default
-        return float(value)
-    except (TypeError, ValueError):
-        return default
-
-def calculate_direct_total_qty(lpn: str, detail_rows, fallback_total) -> int:
-    fallback_qty = max(1, int(math.ceil(to_float(fallback_total, 1))))
-    if not is_direct_qty_lpn_value(lpn):
-        return fallback_qty
-
-    pack_case_map = load_pack_case_map()
-    total_qty = 0
-
-    for detail in detail_rows or []:
-        owner = str(get_row_value(detail, "owner", "") or "").strip().upper()
-        product_code = str(get_row_value(detail, "product_code", "") or "").strip().upper()
-        pieces = to_float(get_row_value(detail, "total_pieces", 0))
-        row_total_qty = to_float(get_row_value(detail, "row_total_qty", 0))
-        case_count = pack_case_map.get(f"{owner}|{product_code}") or pack_case_map.get(product_code)
-
-        if case_count and pieces > 0:
-            total_qty += max(1, int(math.ceil(pieces / case_count)))
-        elif row_total_qty > 0:
-            total_qty += max(1, int(math.ceil(row_total_qty)))
-        else:
-            total_qty += 1
-
-    return total_qty if total_qty > 0 else fallback_qty
+    cleaned = _BRANCH_PREFIX_RE.sub("", name)
+    cleaned = _BRANCH_SUFFIX_RE.sub("", cleaned)
+    cleaned = _WHITESPACE_RE.sub(" ", cleaned).strip(" -") or "Unknown"
+    if len(_branch_name_cache) < 20000:
+        _branch_name_cache[name] = cleaned
+    return cleaned
 
 PENDING_WAVES_CACHE_TTL_SECONDS = 300
 PENDING_WAVES_BOOTSTRAP = [
@@ -1916,18 +1704,6 @@ pending_waves_cache_lock = Lock()
 is_refreshing_pending_waves = False
 is_refreshing_pending_waves_lock = Lock()
 
-# Valid LPNs Validation Cache to prevent slow BigQuery queries on every scan
-VALID_LPNS_CACHE_TTL = 1800  # ⚡ 30 นาที (Standard Plan: RAM เพียงพอ เพิ่มจาก 10 นาที)
-valid_lpns_cache = {}  # wave_no -> {"lpns": set((lpn, branch_code)), "expires_at": float}
-valid_lpns_cache_lock = Lock()
-
-# --- ULTRA-FAST WAVE AND BOOKING SEARCH CACHE ---
-WAVE_CACHE_TTL = 1800  # 30 นาที cache (Standard Plan: 2GB RAM เพียงพอ)
-WAVE_FORCE_REFRESH_COOLDOWN_SECONDS = 2.0
-wave_cache = {}  # wave_detail_str -> {"data": dict, "expires_at": float, "fetched_at": float}
-wave_cache_lock = Lock()
-wave_query_locks = {}
-wave_query_locks_guard = Lock()
 
 BOOKING_WAVES_CACHE_TTL = 1800  # 30 นาที cache
 BOOKING_FORCE_REFRESH_COOLDOWN_SECONDS = 5.0
@@ -1961,7 +1737,7 @@ pallet_shared_state = {}
 pallet_shared_state_lock = Lock()
 
 def record_shared_pallet_state(wave_ids, branch_code: str, pallet_no: int, color: str = "", submitted: bool = False):
-    """Keep pallet color/submission visible to every handheld before BigQuery cache catches up."""
+    """Keep pallet color/submission visible to every handheld before the Sheet cache catches up."""
     branch = str(branch_code or "").strip().upper()
     no = int(pallet_no or 0)
     if not branch or no <= 0:
@@ -2124,641 +1900,30 @@ def apply_local_overlay(wave_detail_str: str, raw_data: dict) -> dict:
     data["zone_summary"] = list(zones_calc.values())
     return data
 
-def fetch_wave_data_from_bq(search_wave_id: int) -> dict:
-    wave_scan_str = str(search_wave_id)
-    wave_detail_str = f"{search_wave_id:010d}"
-
-    # =============================================================
-    # ⚡ ข้าม QC CTEs ทั้งหมดเมื่อ QC_FEATURE_ENABLED = False
-    # ลด complexity ของ query ลงมากกว่า 50% เมื่อ QC ถูก Hold
-    # =============================================================
-    if QC_FEATURE_ENABLED:
-        qc_ctes = f"""
-        QCRaw AS (
-            SELECT
-                TRIM(string_field_18) AS Order_Number,
-                TRIM(string_field_31) AS Product_Code,
-                ARRAY_AGG(
-                    NULLIF(TRIM(string_field_56), '') IGNORE NULLS
-                    ORDER BY string_field_66 DESC LIMIT 1
-                )[SAFE_OFFSET(0)] AS Picker,
-                MAX(SAFE_CAST(NULLIF(REGEXP_REPLACE(IFNULL(string_field_93, ''), r'[^0-9.-]', ''), '') AS FLOAT64)) AS Unit_Price
-            FROM `pro-analytics-db.logistics_db.transaction_raw`
-            WHERE SAFE_CAST(REGEXP_REPLACE(IFNULL(string_field_41, ''), r'[^0-9]', '') AS INT64) = {search_wave_id}
-            GROUP BY Order_Number, Product_Code
-        ),
-        QCBase AS (
-            SELECT
-                TRIM(UPPER(d.LPN)) AS Clean_LPN,
-                TRIM(UPPER(d.Branch_Code)) AS Branch_Code,
-                TRIM(UPPER(d.Owner)) AS Owner,
-                CASE
-                    WHEN TRIM(UPPER(d.Owner)) = 'DM02' THEN 'MART'
-                    WHEN TRIM(UPPER(d.Owner)) IN ('DP02', 'DG02', 'DS02', 'DO02') THEN 'PUN'
-                END AS QC_Group,
-                COALESCE(NULLIF(TRIM(UPPER(d.Zone)), ''), 'UNKNOWN') AS Zone,
-                COALESCE(NULLIF(TRIM(UPPER(d.Product_Code)), ''), 'UNKNOWN') AS Product_Code,
-                COALESCE(NULLIF(TRIM(UPPER(r.Picker)), ''), 'UNKNOWN') AS Picker,
-                COALESCE(r.Unit_Price, 0) AS Unit_Price,
-                GREATEST(COALESCE(d.Total_Qty, 1), 1) AS Workload
-            FROM `pro-analytics-db.logistics_db.wave_lpn_detail_record` AS d
-            LEFT JOIN QCRaw AS r
-              ON TRIM(d.Order_Number) = r.Order_Number
-             AND TRIM(d.Product_Code) = r.Product_Code
-            WHERE SAFE_CAST(REGEXP_REPLACE(TRIM(CAST(d.Wave_Number AS STRING)), r'[^0-9]', '') AS INT64) = {search_wave_id}
-        ),
-        QCZoneMetrics AS (
-            SELECT QC_Group, Zone, SUM(Workload) AS Metric
-            FROM QCBase WHERE QC_Group IS NOT NULL GROUP BY QC_Group, Zone
-        ),
-        QCZoneScores AS (
-            SELECT *, IF(Zone = 'UNKNOWN', 0.5, CUME_DIST() OVER (PARTITION BY QC_Group ORDER BY Metric)) AS Score
-            FROM QCZoneMetrics
-        ),
-        QCItemMetrics AS (
-            SELECT QC_Group, Product_Code, SUM(Workload) AS Metric, AVG(Unit_Price) AS Unit_Price
-            FROM QCBase WHERE QC_Group IS NOT NULL GROUP BY QC_Group, Product_Code
-        ),
-        QCItemScores AS (
-            SELECT *,
-                IF(Product_Code = 'UNKNOWN', 0.5, CUME_DIST() OVER (PARTITION BY QC_Group ORDER BY Metric)) AS Focus_Score,
-                IF(Unit_Price <= 0, 0.5, CUME_DIST() OVER (PARTITION BY QC_Group ORDER BY Unit_Price)) AS Price_Score
-            FROM QCItemMetrics
-        ),
-        QCPickerMetrics AS (
-            SELECT QC_Group, Picker, COUNT(*) AS Metric
-            FROM QCBase WHERE QC_Group IS NOT NULL GROUP BY QC_Group, Picker
-        ),
-        QCPickerScores AS (
-            SELECT *, IF(Picker = 'UNKNOWN', 0.5, CUME_DIST() OVER (PARTITION BY QC_Group ORDER BY Metric)) AS Score
-            FROM QCPickerMetrics
-        ),
-        QCStoreMetrics AS (
-            SELECT QC_Group, Branch_Code, SUM(Workload) AS Metric
-            FROM QCBase WHERE QC_Group IS NOT NULL GROUP BY QC_Group, Branch_Code
-        ),
-        QCStoreScores AS (
-            SELECT *, CUME_DIST() OVER (PARTITION BY QC_Group ORDER BY Metric) AS Score
-            FROM QCStoreMetrics
-        ),
-        QCLpnRisk AS (
-            SELECT
-                b.Clean_LPN,
-                b.Branch_Code,
-                b.QC_Group,
-                AVG(CASE
-                    WHEN b.QC_Group = 'MART' THEN (z.Score * 0.20) + (i.Focus_Score * 0.30) + (p.Score * 0.40) + (s.Score * 0.10)
-                    WHEN b.QC_Group = 'PUN' THEN (i.Focus_Score + i.Price_Score + p.Score) / 3
-                END) AS QC_Risk,
-                NOT (b.QC_Group = 'PUN' AND REGEXP_CONTAINS(b.Clean_LPN, r'^(BP|SP)')) AS QC_Eligible
-            FROM QCBase AS b
-            LEFT JOIN QCZoneScores AS z USING (QC_Group, Zone)
-            LEFT JOIN QCItemScores AS i USING (QC_Group, Product_Code)
-            LEFT JOIN QCPickerScores AS p USING (QC_Group, Picker)
-            LEFT JOIN QCStoreScores AS s USING (QC_Group, Branch_Code)
-            WHERE b.QC_Group IS NOT NULL
-            GROUP BY b.Clean_LPN, b.Branch_Code, b.QC_Group, QC_Eligible
-        ),
-        QCRanked AS (
-            SELECT *,
-                IF(QC_Eligible, ROW_NUMBER() OVER (
-                    PARTITION BY QC_Group
-                    ORDER BY IF(QC_Eligible, 0, 1), QC_Risk DESC, Clean_LPN, Branch_Code
-                ), NULL) AS QC_Rank,
-                COUNTIF(QC_Eligible) OVER (PARTITION BY QC_Group) AS Eligible_Count
-            FROM QCLpnRisk
-        ),
-        QCStatus AS (
-            SELECT *,
-                QC_Eligible AND QC_Rank <= GREATEST(1, CAST(CEIL(Eligible_Count * IF(QC_Group = 'MART', 0.50, 0.60)) AS INT64)) AS QC_Required
-            FROM QCRanked
-        ),"""
-        qc_select = """
-            COALESCE(MAX(qc.QC_Required), FALSE) AS qc_required,
-            ROUND(MAX(qc.QC_Risk), 4) AS qc_risk,
-            MAX(qc.QC_Group) AS qc_source,"""
-        qc_join = f"""
-        LEFT JOIN QCStatus AS qc
-          ON TRIM(UPPER(d.LPN)) = qc.Clean_LPN
-         AND TRIM(UPPER(d.Branch_Code)) = qc.Branch_Code"""
-    else:
-        # 🚀 QC ถูก Hold → ข้าม QC CTEs ทั้งหมด ลด query ลง 50%+
-        qc_ctes = ""
-        qc_select = """
-            FALSE AS qc_required,
-            CAST(0.0 AS FLOAT64) AS qc_risk,
-            CAST(NULL AS STRING) AS qc_source,"""
-        qc_join = ""
-
-    query = f"""
-        WITH {qc_ctes}
-        ScanRows AS (
-            SELECT
-                TRIM(CAST(Wave_Number AS STRING)) AS Wave_Number,
-                SAFE_CAST(REGEXP_REPLACE(TRIM(CAST(Wave_Number AS STRING)), r'[^0-9]', '') AS INT64) AS Scan_Wave_ID,
-                TRIM(UPPER(LPN)) AS Clean_LPN,
-                Qty,
-                Scan_Type,
-                Color,
-                TRIM(UPPER(IFNULL(Branch_Code, ''))) AS Scan_Branch,
-                TRIM(IFNULL(Emp_ID, '')) AS Emp_ID,
-                IFNULL(Pallet_No, 0) AS Pallet_No,
-                Timestamp,
-                IF(Qty = 0 OR Scan_Type IN ('RESET_BOX', 'CANCEL_COMBINE') OR STARTS_WITH(Scan_Type, 'CORRECTION|'), 1, 0) AS Is_Reset
-            FROM `pro-analytics-db.logistics_db.app_scan_transactions`
-            -- Wave_Number อาจถูกเก็บเป็น 58903, 0000058903 หรือ WAVE-58903
-            WHERE SAFE_CAST(REGEXP_REPLACE(TRIM(CAST(Wave_Number AS STRING)), r'[^0-9]', '') AS INT64) = {search_wave_id}
-        ),
-        LatestReset AS (
-            SELECT Scan_Wave_ID, Clean_LPN, Scan_Branch, MAX(Timestamp) AS Reset_Timestamp
-            FROM ScanRows
-            WHERE Is_Reset = 1
-            GROUP BY Scan_Wave_ID, Clean_LPN, Scan_Branch
-        ),
-        ValidScanRows AS (
-            SELECT r.*
-            FROM ScanRows AS r
-            LEFT JOIN LatestReset AS lr
-             ON r.Scan_Wave_ID = lr.Scan_Wave_ID
-             AND r.Clean_LPN = lr.Clean_LPN
-             AND r.Scan_Branch = lr.Scan_Branch
-            WHERE r.Is_Reset = 0
-              AND IFNULL(r.Qty, 0) > 0
-              AND UPPER(IFNULL(r.Scan_Type, '')) != 'CLOSE_SUMMARY'
-              AND (lr.Reset_Timestamp IS NULL OR r.Timestamp > lr.Reset_Timestamp)
-        ),
-        PalletColorAggregatedScans AS (
-            SELECT
-                Scan_Wave_ID,
-                Clean_LPN,
-                Scan_Branch,
-                Pallet_No,
-                UPPER(IFNULL(Color, 'None')) AS Color_Key,
-                ARRAY_AGG(Color ORDER BY Timestamp DESC LIMIT 1)[OFFSET(0)] AS Color,
-                ARRAY_AGG(Scan_Type ORDER BY Timestamp DESC LIMIT 1)[OFFSET(0)] AS Scan_Type,
-                ARRAY_AGG(Emp_ID ORDER BY Timestamp DESC LIMIT 1)[OFFSET(0)] AS Emp_ID,
-                SUM(Qty) AS Qty,
-                MAX(Timestamp) AS Max_Timestamp
-            FROM ValidScanRows
-            GROUP BY Scan_Wave_ID, Clean_LPN, Scan_Branch, Pallet_No, Color_Key
-        ),
-        ScanHistory AS (
-            SELECT
-                Scan_Wave_ID,
-                Clean_LPN,
-                Scan_Branch,
-                SUM(Qty) AS Scanned_Qty,
-                MAX(Pallet_No) AS Scanned_Pallet_No,
-                ARRAY_AGG(Scan_Type ORDER BY Max_Timestamp DESC LIMIT 1)[OFFSET(0)] AS Scan_Type,
-                ARRAY_AGG(Color ORDER BY Max_Timestamp DESC LIMIT 1)[OFFSET(0)] AS Color,
-                STRING_AGG(DISTINCT NULLIF(TRIM(Emp_ID), ''), ', ' ORDER BY NULLIF(TRIM(Emp_ID), '')) AS Scanner_Emp_IDs,
-                STRING_AGG(CONCAT(IFNULL(Color, 'None'), '~', CAST(Qty AS STRING), '~', IFNULL(Scan_Type, '')), '|') AS Color_Breakdown,
-                STRING_AGG(CONCAT(CAST(Pallet_No AS STRING), '~', IFNULL(Color, 'None'), '~', CAST(Qty AS STRING), '~', IFNULL(Scan_Type, '')), '|' ORDER BY Pallet_No, Max_Timestamp) AS Pallet_Breakdown
-            FROM PalletColorAggregatedScans
-            GROUP BY Scan_Wave_ID, Clean_LPN, Scan_Branch
-        ),
-        PalletSummary AS (
-            SELECT
-                Scan_Branch,
-                ARRAY_AGG(DISTINCT Pallet_No ORDER BY Pallet_No) AS Pallet_Nos
-            FROM ValidScanRows
-            -- นับเฉพาะพาเลทที่ยังมี LPN อยู่จริงในสถานะล่าสุด
-            -- ไม่รวมเลขที่เคยจองแล้วถูกยกเลิกหรือพาเลทที่ถูกแก้จนว่าง
-            WHERE IFNULL(Qty, 0) > 0 AND Pallet_No > 0 AND Scan_Branch != ''
-            GROUP BY Scan_Branch
-        ),
-        PalletColorSummary AS (
-            SELECT
-                Scan_Branch,
-                Pallet_No,
-                ARRAY_AGG(Color IGNORE NULLS ORDER BY Timestamp DESC LIMIT 1)[SAFE_OFFSET(0)] AS Pallet_Color
-            FROM ScanRows
-            WHERE Scan_Type = 'PALLET_START' AND Pallet_No > 0 AND Scan_Branch != ''
-            GROUP BY Scan_Branch, Pallet_No
-        ),
-        SubmittedPalletSummary AS (
-            SELECT
-                Scan_Branch,
-                ARRAY_AGG(DISTINCT Pallet_No ORDER BY Pallet_No) AS Submitted_Pallet_Nos
-            FROM ScanRows
-            WHERE Scan_Type = 'PALLET_SUBMIT' AND Pallet_No > 0 AND Scan_Branch != ''
-            GROUP BY Scan_Branch
-        ),
-        BranchCloseSummary AS (
-            SELECT
-                Scan_Branch,
-                MAX(Timestamp) AS Branch_Closed_At,
-                ARRAY_AGG(Emp_ID ORDER BY Timestamp DESC LIMIT 1)[SAFE_OFFSET(0)] AS Branch_Closed_By
-            FROM ScanRows
-            WHERE Scan_Type = 'CLOSE_JOB' AND Scan_Branch != ''
-            GROUP BY Scan_Branch
-        ),
-        WaveMonitoringFiltered AS (
-            SELECT
-                Branch_Code,
-                MAX(Branch_Name) AS Branch_Name,
-                Detail_Wave
-            FROM (
-                SELECT
-                    TRIM(Branch_Code) AS Branch_Code,
-                    TRIM(Branch_Name) AS Branch_Name,
-                    LPAD(CAST(SAFE_CAST(REGEXP_REPLACE(TRIM(CAST(Wave_Number AS STRING)), r'[^0-9]', '') AS INT64) AS STRING), 10, '0') AS Detail_Wave
-                FROM `pro-analytics-db.logistics_db.wave_monitoring`
-                WHERE SAFE_CAST(REGEXP_REPLACE(TRIM(CAST(Wave_Number AS STRING)), r'[^0-9]', '') AS INT64) = {search_wave_id}
-            )
-            GROUP BY Branch_Code, Detail_Wave
-        ),
-        WaveBranches AS (
-            SELECT DISTINCT TRIM(UPPER(Branch_Code)) AS Branch_Code
-            FROM `pro-analytics-db.logistics_db.wave_lpn_detail_record`
-            WHERE SAFE_CAST(REGEXP_REPLACE(TRIM(CAST(Wave_Number AS STRING)), r'[^0-9]', '') AS INT64) = {search_wave_id}
-              AND NULLIF(TRIM(Branch_Code), '') IS NOT NULL
-        ),
-        BranchNameHistory AS (
-            SELECT
-                TRIM(UPPER(w.Branch_Code)) AS Branch_Code,
-                ARRAY_AGG(
-                    NULLIF(TRIM(w.Branch_Name), '') IGNORE NULLS
-                    ORDER BY w.Created_At DESC
-                    LIMIT 1
-                )[SAFE_OFFSET(0)] AS Branch_Name
-            FROM `pro-analytics-db.logistics_db.wave_monitoring` AS w
-            INNER JOIN WaveBranches AS b
-              ON TRIM(UPPER(w.Branch_Code)) = b.Branch_Code
-            WHERE NULLIF(TRIM(w.Branch_Name), '') IS NOT NULL
-              AND LOWER(TRIM(w.Branch_Name)) != 'unknown'
-            GROUP BY Branch_Code
-        )
-        SELECT 
-            d.LPN, 
-            d.Zone, 
-            d.Wave_Number AS Full_Wave, 
-            TRIM(d.Branch_Code) AS Branch_Code, 
-            COALESCE(
-                MAX(IF(
-                    LOWER(TRIM(IFNULL(m.Branch_Name, ''))) IN ('', 'unknown', 'null', 'none'),
-                    NULL,
-                    TRIM(m.Branch_Name)
-                )),
-                MAX(h.Branch_Name),
-                'Unknown'
-            ) AS Branch_Name,
-            -- PP/SP LPNs can contain multiple product rows; show the total carton target for the whole LPN.
-            IF(
-                REGEXP_CONTAINS(UPPER(TRIM(d.LPN)), r'^(PP|SP)'),
-                SUM(IFNULL(d.Total_Qty, 1)),
-                MAX(IFNULL(d.Total_Qty, 1))
-            ) AS Total_Qty, 
-            IF(COALESCE(MAX(s.Scanned_Qty), 0) > 0, 'Scanned', 'Pending') AS status,
-            MAX(s.Scanned_Qty) AS qty,
-            MAX(s.Scan_Type) AS scan_type,
-            COALESCE(MAX(s.Scanned_Pallet_No), 0) AS pallet_no,
-            COALESCE(MAX(TRIM(d.Owner)), 'Unknown') AS owner,
-            MAX(s.Color) AS color,
-            MAX(s.Scanner_Emp_IDs) AS scanner_emp_ids,
-            MAX(s.Color_Breakdown) AS color_breakdown,
-            MAX(s.Pallet_Breakdown) AS pallet_breakdown,
-            ANY_VALUE(ps.Pallet_Nos) AS branch_pallet_nos,
-            MAX(pc.Pallet_Color) AS pallet_color,
-            ANY_VALUE(sps.Submitted_Pallet_Nos) AS branch_submitted_pallet_nos,
-            ANY_VALUE(bcs.Branch_Closed_At) AS branch_closed_at,
-            ANY_VALUE(bcs.Branch_Closed_By) AS branch_closed_by,
-            {qc_select}
-            ARRAY_AGG(STRUCT(
-                TRIM(d.Owner) AS owner,
-                TRIM(d.Product_Code) AS product_code,
-                d.Total_Pieces AS total_pieces,
-                d.Total_Qty AS row_total_qty
-            )) AS detail_rows
-        FROM `pro-analytics-db.logistics_db.wave_lpn_detail_record` AS d
-        LEFT JOIN WaveMonitoringFiltered AS m 
-          ON TRIM(d.Branch_Code) = m.Branch_Code
-         AND m.Detail_Wave = LPAD(
-             CAST(SAFE_CAST(REGEXP_REPLACE(TRIM(CAST(d.Wave_Number AS STRING)), r'[^0-9]', '') AS INT64) AS STRING),
-             10,
-             '0'
-         )
-        LEFT JOIN BranchNameHistory AS h
-          ON TRIM(UPPER(d.Branch_Code)) = h.Branch_Code
-        LEFT JOIN ScanHistory AS s
-         ON s.Scan_Wave_ID = {search_wave_id}
-         AND TRIM(UPPER(d.LPN)) = s.Clean_LPN
-         AND TRIM(UPPER(d.Branch_Code)) = s.Scan_Branch
-        LEFT JOIN PalletSummary AS ps
-          ON TRIM(UPPER(d.Branch_Code)) = ps.Scan_Branch
-        LEFT JOIN PalletColorSummary AS pc
-          ON TRIM(UPPER(d.Branch_Code)) = pc.Scan_Branch
-         AND COALESCE(s.Scanned_Pallet_No, 0) = pc.Pallet_No
-        LEFT JOIN SubmittedPalletSummary AS sps
-          ON TRIM(UPPER(d.Branch_Code)) = sps.Scan_Branch
-        LEFT JOIN BranchCloseSummary AS bcs
-          ON TRIM(UPPER(d.Branch_Code)) = bcs.Scan_Branch
-        {qc_join}
-        WHERE SAFE_CAST(REGEXP_REPLACE(TRIM(CAST(d.Wave_Number AS STRING)), r'[^0-9]', '') AS INT64) = {search_wave_id}
-        GROUP BY d.LPN, d.Zone, d.Branch_Code, d.Wave_Number
-    """
-
-    meta_query = f"""
-        SELECT 
-            COALESCE(MAX(TRIM(Vehicle_Booking_No)), '') AS booking_no,
-            COALESCE(MAX(TRIM(License_Plate)), '') AS license_plate
-        FROM `pro-analytics-db.logistics_db.wave_monitoring`
-        WHERE SAFE_CAST(REGEXP_REPLACE(TRIM(CAST(Wave_Number AS STRING)), r'[^0-9]', '') AS INT64) = {search_wave_id}
-    """
-
-    job_config = bigquery.QueryJobConfig(use_query_cache=True)
-    # 🚀 รัน meta_job และ query_job แบบ parallel เพื่อลดเวลาโดยรวม
-    meta_job = client.query(meta_query, job_config=job_config)
-    query_job = client.query(query, job_config=job_config)
-
-    meta_rows = list(meta_job.result(timeout=BQ_JOB_TIMEOUT_SECONDS))
-    booking_no = ""
-    license_plate = ""
-    if len(meta_rows) > 0:
-        booking_no = meta_rows[0]["booking_no"] or ""
-        license_plate = meta_rows[0]["license_plate"] or ""
-
-    sheet_meta = get_sheet_meta_for_wave(str(search_wave_id))
-    if sheet_meta:
-        if sheet_meta.get("booking"):
-            booking_no = sheet_meta["booking"]
-        if sheet_meta.get("plate"):
-            license_plate = sheet_meta["plate"]
-
-    results = query_job.result(timeout=BQ_JOB_TIMEOUT_SECONDS)
-
-    lpn_list = []
-    zones_calc = {}
-    row_count = 0
-    real_wave_no = f"{search_wave_id:010d}"
-    numeric_branch_map = None
-
-    for row in results:
-        row_count += 1
-        real_wave_no = row["Full_Wave"]
-        z = row["Zone"] if row["Zone"] else "N/A"
-        raw_code = row["Branch_Code"]
-        br_code_str = str(raw_code).strip() if raw_code else "Unknown"
-        if is_numeric_branch_code(br_code_str):
-            if numeric_branch_map is None:
-                numeric_branch_map = load_numeric_branch_master()
-            br_name = clean_branch_display_name(
-                numeric_branch_map.get(br_code_str) or row["Branch_Name"]
-            )
-        else:
-            br_name = clean_branch_display_name(row["Branch_Name"])
-        total_qty = calculate_direct_total_qty(row["LPN"], row["detail_rows"], row["Total_Qty"])
-        pallet_breakdown = []
-        for raw_part in str(row["pallet_breakdown"] or "").split("|"):
-            pieces = raw_part.split("~", 3)
-            if len(pieces) != 4:
-                continue
-            try:
-                part_pallet = int(pieces[0] or 0)
-                part_qty = int(pieces[2] or 0)
-            except (TypeError, ValueError):
-                continue
-            if part_qty > 0:
-                pallet_breakdown.append({"pallet_no": part_pallet, "color": pieces[1], "qty": part_qty, "type": pieces[3]})
-
-        lpn_list.append({
-            "lpn": row["LPN"],
-            "zone": z,
-            "branch": br_code_str,
-            "branch_name": br_name,
-            "status": row["status"],
-            "total_qty": total_qty,
-            "qty": row["qty"] if row["qty"] is not None else 0,
-            "scan_type": row["scan_type"],
-            "owner": row["owner"] or "Unknown",
-            "color": row["color"] or "None",
-            "scanner_emp_ids": row["scanner_emp_ids"] or "",
-            "color_breakdown": row["color_breakdown"] or "",
-            "pallet_breakdown": pallet_breakdown,
-            "pallet_no": row["pallet_no"] if row["pallet_no"] is not None else 0,
-            "branch_pallet_nos": list(row["branch_pallet_nos"] or []),
-            "pallet_color": row["pallet_color"] or "",
-            "branch_submitted_pallet_nos": list(row["branch_submitted_pallet_nos"] or []),
-            "branch_closed_at": (
-                row["branch_closed_at"].isoformat()
-                if row["branch_closed_at"] and hasattr(row["branch_closed_at"], "isoformat")
-                else str(row["branch_closed_at"] or "")
-            ),
-            "branch_closed_by": row["branch_closed_by"] or "",
-            # 🔒 QC_FEATURE_ENABLED=False → hold QC, เปลี่ยนเป็น True เมื่อเปิดใช้งาน
-            "qc_required": bool(row["qc_required"]) and QC_FEATURE_ENABLED,
-            "qc_status": ("ต้อง QC" if row["qc_required"] else "") if QC_FEATURE_ENABLED else "",
-            "qc_risk": float(row["qc_risk"] or 0),
-            "qc_source": row["qc_source"] or "",
-            "wave_no": str(row["Full_Wave"]).strip()
-        })
-
-        if z not in zones_calc:
-            zones_calc[z] = {"zone": z, "scanned": 0, "total": 0}
-        zones_calc[z]["total"] += 1
-        if row["status"] == "Scanned":
-            zones_calc[z]["scanned"] += 1
-
-    if row_count == 0:
-        raise HTTPException(status_code=404, detail=f"ไม่พบข้อมูล Wave [{search_wave_id}]")
-
-    return {
-        "wave_no": real_wave_no,
-        "booking_no": booking_no,
-        "license_plate": license_plate,
-        "lpn_list": lpn_list,
-        "zone_summary": list(zones_calc.values())
-    }
-
 def get_wave_data_internal(wave_no: str, force_refresh: bool = False) -> dict:
-    if UAT_SHEETS_ONLY:
-        if force_refresh:
-            with member_history_lock:
-                member_history_cache["expires_at"] = 0.0
-            with booking_wave_sheet_lock:
-                booking_wave_sheet_cache["expires_at"] = 0.0
-        return build_uat_wave_data(wave_no)
-    try:
-        search_wave_id = int(wave_no.strip())
-    except ValueError:
-        raise HTTPException(status_code=400, detail="รหัส Wave ต้องเป็นตัวเลขเท่านั้น")
+    """Build one Wave's document model from the Sheets caches.
 
-    wave_detail_str = f"{search_wave_id:010d}"
-    wave_clean = str(search_wave_id)
-    now = time.time()
-
-    data = None
-    with wave_cache_lock:
-        cached = wave_cache.get(wave_detail_str)
-        if cached:
-            cache_fresh = float(cached.get("expires_at") or 0) > now
-            fetched_recently = now - float(cached.get("fetched_at") or 0) < WAVE_FORCE_REFRESH_COOLDOWN_SECONDS
-            if (not force_refresh and cache_fresh) or (force_refresh and cache_fresh and fetched_recently):
-                data = copy.deepcopy(cached["data"])
-
-    if data is None:
-        # ป้องกันหลาย Handheld ยิง Query Wave เดียวกันพร้อมกันตอน cache หมดอายุ
-        with wave_query_locks_guard:
-            query_lock = wave_query_locks.setdefault(wave_detail_str, Lock())
-        with query_lock:
-            with wave_cache_lock:
-                cached = wave_cache.get(wave_detail_str)
-                current_time = time.time()
-                if cached:
-                    cache_fresh = float(cached.get("expires_at") or 0) > current_time
-                    fetched_recently = current_time - float(cached.get("fetched_at") or 0) < WAVE_FORCE_REFRESH_COOLDOWN_SECONDS
-                    if (not force_refresh and cache_fresh) or (force_refresh and cache_fresh and fetched_recently):
-                        data = copy.deepcopy(cached["data"])
-
-            if data is None:
-                data = fetch_wave_data_from_bq(search_wave_id)
-                fetched_at = time.time()
-                with wave_cache_lock:
-                    wave_cache[wave_detail_str] = {
-                        "data": data,
-                        "expires_at": fetched_at + WAVE_CACHE_TTL,
-                        "fetched_at": fetched_at,
-                    }
-                data = copy.deepcopy(data)
-
-    data["document_overrides"] = get_document_overrides_for_wave(
-        wave_clean, data.get("booking_no")
-    )
-    return data
-
-active_wave_refreshes = set()
-active_wave_refreshes_lock = Lock()
-
-def background_refresh_wave(wave_no: str):
-    try:
-        search_wave_id = int(wave_no.strip())
-        wave_detail_str = f"{search_wave_id:010d}"
-        wave_clean = str(search_wave_id)
-    except ValueError:
-        return
-
-    # Skip if this wave is already actively refreshing in a background task
-    with active_wave_refreshes_lock:
-        if wave_detail_str in active_wave_refreshes:
-            return
-        active_wave_refreshes.add(wave_detail_str)
-
-    try:
-        # Wait a short duration to let BigQuery ingest the stream
-        time.sleep(2.5)
-        get_wave_data_internal(wave_clean, force_refresh=True)
-    except Exception as e:
-        print(f"Background refresh error for wave {wave_clean}: {e}")
-    finally:
-        with active_wave_refreshes_lock:
-            active_wave_refreshes.discard(wave_detail_str)
-
-def get_valid_lpns_for_wave(wave_no: str) -> set:
-    import time
-    now = time.time()
-    try:
-        wave_clean = str(int(wave_no.strip()))
-        wave_detail_str = f"{int(wave_no.strip()):010d}"
-    except ValueError:
-        return set()
-
-    # Try to read from wave_cache first for near-instant validation
-    with wave_cache_lock:
-        cached = wave_cache.get(wave_detail_str)
-        if cached and cached["expires_at"] > now:
-            lpns = set()
-            for item in cached["data"].get("lpn_list", []):
-                lpns.add((item["lpn"].strip().upper(), item["branch"].strip().upper()))
-            return lpns
-    
-    with valid_lpns_cache_lock:
-        cache_entry = valid_lpns_cache.get(wave_clean)
-        if cache_entry and cache_entry["expires_at"] > now:
-            return cache_entry["lpns"]
-            
-    # Query BigQuery
-    query = f"""
-        SELECT DISTINCT TRIM(UPPER(CAST(LPN AS STRING))) AS LPN, TRIM(UPPER(CAST(Branch_Code AS STRING))) AS Branch_Code
-        FROM `pro-analytics-db.logistics_db.wave_lpn_detail_record`
-        WHERE SAFE_CAST(REGEXP_REPLACE(TRIM(CAST(Wave_Number AS STRING)), r'[^0-9]', '') AS INT64) = {wave_clean}
+    force_refresh expires the two source caches so the next read reloads them;
+    build_uat_wave_data() then works from freshly loaded rows.
     """
-    try:
-        query_job = client.query(query, job_config=bigquery.QueryJobConfig(use_query_cache=True))
-        rows = query_job.result(timeout=BQ_JOB_TIMEOUT_SECONDS)
-        lpns = set()
-        for row in rows:
-            lpn_val = str(row["LPN"]).strip().upper() if row["LPN"] else ""
-            branch_val = str(row["Branch_Code"]).strip().upper() if row["Branch_Code"] else ""
-            if lpn_val:
-                lpns.add((lpn_val, branch_val))
-        
-        if lpns:
-            with valid_lpns_cache_lock:
-                valid_lpns_cache[wave_clean] = {
-                    "lpns": lpns,
-                    "expires_at": now + VALID_LPNS_CACHE_TTL
-                }
-        return lpns
-    except Exception as e:
-        print(f"🚨 CACHE QUERY ERROR for Wave {wave_clean}: {str(e)}")
-        return set()
+    if force_refresh:
+        # force must actually re-read: load_member_history() alone would return the
+        # stale rows and refresh in background, which is wrong for a refresh button.
+        load_member_history(force=True)
+        load_booking_wave_sheet_meta(force=True)
+    return build_uat_wave_data(wave_no)
 
 
-def fetch_booking_waves_from_bq(booking_no: str) -> dict:
-    if UAT_SHEETS_ONLY:
-        sheet_meta = get_sheet_meta_for_booking(booking_no, force=True)
-        if not sheet_meta or not sheet_meta.get("waves"):
-            raise HTTPException(status_code=404, detail=f"ไม่พบ Booking [{booking_no}] ใน Sheet Booking & Wave")
-        return {
-            "waves": list(sheet_meta.get("waves") or []),
-            "license_plate": str(sheet_meta.get("plate") or ""),
-            "carrier": str(sheet_meta.get("carrier") or ""),
-            "sender": str(sheet_meta.get("sender") or ""),
-        }
-    clean_booking = booking_no.strip().upper()
-    raw_booking = booking_no.strip()
-    # ✅ ใช้ query parameters แทนการต่อสตริง (อุด SQL injection ผ่านเลข Booking)
-    query = """
-        SELECT DISTINCT
-            TRIM(Wave_Number) AS monitor_wave,
-            REGEXP_REPLACE(TRIM(Wave_Number), r'^WAVE-', '') AS detail_wave,
-            CAST(SAFE_CAST(REGEXP_REPLACE(TRIM(Wave_Number), r'[^0-9]', '') AS INT64) AS STRING) AS scan_wave,
-            TRIM(License_Plate) AS License_Plate
-        FROM `pro-analytics-db.logistics_db.wave_monitoring`
-        WHERE (Vehicle_Booking_No = @clean_booking OR Vehicle_Booking_No = @raw_booking)
-          AND Wave_Number IS NOT NULL
-          AND Wave_Number != ''
-    """
-    booking_config = bigquery.QueryJobConfig(
-        use_query_cache=True,
-        query_parameters=[
-            bigquery.ScalarQueryParameter("clean_booking", "STRING", clean_booking),
-            bigquery.ScalarQueryParameter("raw_booking", "STRING", raw_booking),
-        ],
-    )
-    query_job = client.query(query, job_config=booking_config)
-    results = list(query_job.result(timeout=BQ_JOB_TIMEOUT_SECONDS))
-    if not results:
-        sheet_meta = get_sheet_meta_for_booking(booking_no)
-        if sheet_meta and sheet_meta.get("waves"):
-            return {
-                "waves": sheet_meta["waves"],
-                "license_plate": sheet_meta.get("plate", "")
-            }
-        raise HTTPException(status_code=404, detail=f"ไม่พบข้อมูลสำหรับ Booking No. [{booking_no}]")
-    
-    waves = []
-    license_plate = ""
-    for row in results:
-        detail_wave = str(row["detail_wave"]).strip()
-        if detail_wave:
-            waves.append(detail_wave)
-        if row["License_Plate"] and not license_plate:
-            license_plate = str(row["License_Plate"]).strip()
-            
+def fetch_booking_waves(booking_no: str) -> dict:
+    """Resolve a Booking to its Waves and transport details from the Booking & Wave sheet."""
+    sheet_meta = get_sheet_meta_for_booking(booking_no, force=True)
+    if not sheet_meta or not sheet_meta.get("waves"):
+        raise HTTPException(status_code=404, detail=f"ไม่พบ Booking [{booking_no}] ใน Sheet Booking & Wave")
     return {
-        "waves": waves,
-        "license_plate": license_plate
+        "waves": list(sheet_meta.get("waves") or []),
+        "license_plate": str(sheet_meta.get("plate") or ""),
+        "carrier": str(sheet_meta.get("carrier") or ""),
+        "sender": str(sheet_meta.get("sender") or ""),
     }
 
 def get_booking_waves_mapping(booking_no: str, force_refresh: bool = False) -> dict:
@@ -2783,7 +1948,7 @@ def get_booking_waves_mapping(booking_no: str, force_refresh: bool = False) -> d
                 fetched_recently = current_time - float(cached.get("fetched_at") or 0) < BOOKING_FORCE_REFRESH_COOLDOWN_SECONDS
                 if (not force_refresh and cache_fresh) or (force_refresh and cache_fresh and fetched_recently):
                     return cached["mapping"]
-        mapping = fetch_booking_waves_from_bq(booking_no)
+        mapping = fetch_booking_waves(booking_no)
         fetched_at = time.time()
         with booking_waves_cache_lock:
             booking_waves_cache[clean_booking] = {
@@ -2797,15 +1962,11 @@ def get_booking_data_internal(booking_no: str, force_refresh: bool = False) -> d
     mapping = get_booking_waves_mapping(booking_no, force_refresh)
     booking_clean = booking_no.strip().upper()
     wave_force_refresh = force_refresh
-    if UAT_SHEETS_ONLY and force_refresh:
+    if force_refresh:
         # Refresh the large Member Data sheet once before fan-out. Refreshing
-        # independently inside every Wave thread is slower and can expose
-        # different snapshots while the Sheet is still updating.
-        with member_history_lock:
-            member_history_cache["expires_at"] = 0.0
-        with booking_wave_sheet_lock:
-            booking_wave_sheet_cache["expires_at"] = 0.0
-        load_member_history()
+        # per Wave is slower and can expose different snapshots of the same read
+        # while the Sheet is still being written.
+        load_member_history(force=True)
         load_booking_wave_sheet_meta(force=True)
         wave_force_refresh = False
     assignments = get_booking_branch_assignments(force_refresh=force_refresh)
@@ -2829,29 +1990,26 @@ def get_booking_data_internal(booking_no: str, force_refresh: bool = False) -> d
     waves_included = set()
     wave_results = []
     
-    # จำกัด fan-out ไม่ให้ Booking ที่มีหลาย Wave ยิง BigQuery พร้อมกันจนคิว API อั้นทั้งระบบ
-    # Free มี 0.1 CPU/512 MB: จำกัด fan-out เพื่อลด peak RAM/context switching
-    with ThreadPoolExecutor(max_workers=max(1, min(3, len(waves)))) as executor:
-        futures = {executor.submit(get_wave_data_internal, wave, wave_force_refresh): wave for wave in waves}
-        for future in futures:
-            wave = futures[future]
-            try:
-                wave_data = future.result()
-                wave_data_overlaid = merge_member_history(apply_local_overlay(wave, wave_data), wave)
-                wave_results.append(wave_data_overlaid)
-            except HTTPException as e:
-                # A stale/failed branch-move record can reference a foreign Wave
-                # that is not part of this Booking's real mapping. It must not
-                # make confirmation of the newly selected Wave fail with the
-                # unrelated old Wave number.
-                if UAT_SHEETS_ONLY and wave not in native_waves and e.status_code == 404:
-                    print(f"⚠️ Ignoring unavailable transferred Wave {wave} while loading Booking {booking_clean}")
-                    continue
-                raise
-            except Exception as e:
-                print(f"🚨 Error fetching wave {wave} in booking {booking_no}: {e}")
-                raise
-                
+    # Every Wave is now built from the in-memory Sheets caches, so this loop is
+    # CPU-bound under the GIL: a thread pool added contention and peak RAM on a
+    # 0.1 CPU instance without overlapping any real I/O.
+    for wave in waves:
+        try:
+            wave_data = get_wave_data_internal(wave, wave_force_refresh)
+            wave_results.append(merge_member_history(apply_local_overlay(wave, wave_data), wave))
+        except HTTPException as e:
+            # A stale/failed branch-move record can reference a foreign Wave
+            # that is not part of this Booking's real mapping. It must not
+            # make confirmation of the newly selected Wave fail with the
+            # unrelated old Wave number.
+            if wave not in native_waves and e.status_code == 404:
+                print(f"⚠️ Ignoring unavailable transferred Wave {wave} while loading Booking {booking_clean}")
+                continue
+            raise
+        except Exception as e:
+            print(f"🚨 Error fetching wave {wave} in booking {booking_no}: {e}")
+            raise
+
     for wave_data_overlaid in wave_results:
         wave_key = str(int(str(wave_data_overlaid["wave_no"]).strip()))
         native_booking = str(wave_data_overlaid.get("booking_no") or "").strip().upper()
@@ -3107,7 +2265,7 @@ def get_booking_branch_assignments(force_refresh: bool = False) -> dict:
     now = time.time()
     with booking_assignments_cache_lock:
         if not force_refresh and booking_assignments_cache["expires_at"] > now:
-            return copy.deepcopy(booking_assignments_cache["data"])
+            return {key: dict(row) for key, row in booking_assignments_cache["data"].items()}
         try:
             ensure_booking_override_table()
             rows = read_uat_event_records("Booking Branch Moves", force=force_refresh)
@@ -3120,10 +2278,10 @@ def get_booking_branch_assignments(force_refresh: bool = False) -> dict:
                 "data": data,
                 "expires_at": time.time() + BOOKING_METADATA_CACHE_TTL_SECONDS,
             })
-            return copy.deepcopy(data)
+            return {key: dict(row) for key, row in data.items()}
         except Exception as exc:
             print(f"BOOKING OVERRIDE READ ERROR: {exc}")
-            return copy.deepcopy(booking_assignments_cache["data"])
+            return {key: dict(row) for key, row in booking_assignments_cache["data"].items()}
 
 def ensure_booking_split_table():
     global booking_split_table_ready
@@ -3139,7 +2297,7 @@ def get_booking_branch_splits(force_refresh: bool = False) -> dict:
     now = time.time()
     with booking_splits_cache_lock:
         if not force_refresh and booking_splits_cache["expires_at"] > now:
-            return copy.deepcopy(booking_splits_cache["data"])
+            return {key: dict(row) for key, row in booking_splits_cache["data"].items()}
         try:
             ensure_booking_split_table()
             rows = read_uat_event_records("Booking Branch Splits", force=force_refresh)
@@ -3153,10 +2311,10 @@ def get_booking_branch_splits(force_refresh: bool = False) -> dict:
                 "data": data,
                 "expires_at": time.time() + BOOKING_METADATA_CACHE_TTL_SECONDS,
             })
-            return copy.deepcopy(data)
+            return {key: dict(row) for key, row in data.items()}
         except Exception as exc:
             print(f"BOOKING SPLIT READ ERROR: {exc}")
-            return copy.deepcopy(booking_splits_cache["data"])
+            return {key: dict(row) for key, row in booking_splits_cache["data"].items()}
 
 
 def persist_target_booking_split_edits(summaries: list, emp_id: str, reason: str = "") -> list:
@@ -3206,7 +2364,7 @@ async def read_root():
         "status": "ok",
         "message": "Scanner API UAT is running",
         "environment": APP_ENV,
-        "data_source": "google_sheets" if UAT_SHEETS_ONLY else "bigquery",
+        "data_source": "google_sheets",
         "legacy_transport_workbook": "read_only",
         "scan_feature_enabled": SCAN_FEATURE_ENABLED,
         "scan_demo_only": SCAN_DEMO_ONLY,
@@ -3214,35 +2372,42 @@ async def read_root():
 
 # ✅ Health Check Endpoint: ตอบสนองเร็ว <5ms สำหรับ keep-alive heartbeat
 @app.get("/api/health")
-async def health_check(response: Response):
-    # ⚡ Cache-Control: s-maxage=5 ทำให้ CDN/Render ตอบ health check ได้ทันที ไม่ต้อง round-trip ถึง Python
+async def health_check(response: Response, deep: bool = False):
+    """Cheap by default so the keep-alive ping costs nothing; ?deep=1 verifies Google auth."""
     response.headers["Cache-Control"] = "no-store"
     response.headers["Connection"] = "keep-alive"
-    # ตรวจสอบสถานะ Google credentials
-    creds_source = "none"
-    creds_ok = False
+    if os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip():
+        creds_source = "GOOGLE_SERVICE_ACCOUNT_JSON"
+    elif os.path.exists(os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "")):
+        creds_source = f"file:{os.environ.get('GOOGLE_APPLICATION_CREDENTIALS')}"
+    else:
+        creds_source = "default_adc"
+    creds_ok = None
     creds_error = None
-    try:
-        if os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip():
-            creds_source = "GOOGLE_SERVICE_ACCOUNT_JSON"
-        elif os.path.exists(os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "")):
-            creds_source = f"file:{os.environ.get('GOOGLE_APPLICATION_CREDENTIALS')}"
-        else:
-            creds_source = "default_adc"
-        get_sheets_session()
-        creds_ok = True
-    except Exception as e:
-        creds_error = str(e)[:200]
+    if deep:
+        # Building the session touches the token endpoint, so only do it on request.
+        try:
+            get_sheets_session()
+            creds_ok = True
+        except Exception as e:
+            creds_ok = False
+            creds_error = str(e)[:200]
+    with member_history_lock:
+        history_rows = len(member_history_cache.get("data") or {})
+        history_fresh = member_history_cache.get("expires_at", 0) > time.time()
     return {
         "status": "ok", "version": APP_VERSION, "timestamp": time.time(),
         "environment": APP_ENV,
-        "data_source": "google_sheets" if UAT_SHEETS_ONLY else "bigquery",
+        "data_source": "google_sheets",
         "legacy_transport_workbook": "read_only",
         "scan_feature_enabled": SCAN_FEATURE_ENABLED,
+        "uptime_seconds": int(time.time() - PROCESS_STARTED_AT),
+        "member_data": {"rows": history_rows, "fresh": history_fresh},
         "google_credentials": {
             "source": creds_source,
             "ok": creds_ok,
             "error": creds_error,
+            "checked": bool(deep),
         },
     }
 
@@ -3634,7 +2799,7 @@ def get_usage_dashboard(response: Response, days: int = 7, q: str = "", employee
         "system": {
             "api_version": APP_VERSION,
             "environment": APP_ENV,
-            "data_source": "google_sheets" if UAT_SHEETS_ONLY else "bigquery",
+            "data_source": "google_sheets",
             "scan_feature_enabled": SCAN_FEATURE_ENABLED,
             "uptime_seconds": round(time.time() - PROCESS_STARTED_AT),
             "dashboard_query_ms": round((time.perf_counter() - started) * 1000),
@@ -3645,62 +2810,30 @@ def get_usage_dashboard(response: Response, days: int = 7, q: str = "", employee
     return payload
 
 def sync_document_summary_reports(summaries: list):
-    if UAT_SHEETS_ONLY:
-        # Manual document totals must update both UAT sources before the API
-        # reports success. The legacy transport workbook remains read-only.
-        test_summaries = [normalize_report_summary(summary) for summary in summaries or []]
-        test_summaries = [summary for summary in test_summaries
-                          if not summary.get("is_hidden") and
-                          (summary.get("total", 0) > 0 or summary.get("allow_zero_update"))]
-        member_summaries = [summary for summary in test_summaries if not summary.get("booking_split")]
-        failures = []
-        try:
-            write_member_history_summaries(member_summaries)
-        except Exception as exc:
-            failures.append(f"Member Data: {exc}")
-        try:
-            write_uat_report_test_summaries(test_summaries)
-        except Exception as exc:
-            failures.append(f"UAT Delivery report: {exc}")
-        if failures:
-            raise RuntimeError(" | ".join(failures))
+    """Write the given totals to both writable Sheets; the legacy workbook stays read-only.
+
+    Automatic zero snapshots are dropped here so a branch that has not been
+    counted yet never creates a zero row. An intentional zero correction carries
+    allow_zero_update and is allowed through, but only to clear an existing row.
+    """
+    normalized = [normalize_report_summary(summary) for summary in summaries or []]
+    normalized = [summary for summary in normalized
+                  if not summary.get("is_hidden")
+                  and (summary.get("total", 0) > 0 or summary.get("allow_zero_update"))]
+    if not normalized:
         return
-    # Automatic zero snapshots must not create report rows.
-    # Intentional zero corrections may pass through to clear an existing row only.
-    summaries = [normalize_report_summary(summary) for summary in summaries or []]
-    summaries = [summary for summary in summaries
-                 if summary.get("total", 0) > 0 or summary.get("allow_zero_update")]
-    if not summaries:
-        return
+    # Member Data ไม่มีคอลัมน์ Booking จึงเก็บได้แค่ 1 แถวต่อ Wave+Branch
+    # ส่วนรายงานรองรับแยก Booking และรับยอดที่แบ่งได้
+    member_summaries = [summary for summary in normalized if not summary.get("booking_split")]
     failures = []
-    # Member Data ไม่มีคอลัมน์ Booking จึงเก็บยอดรวมเดิม 1 แถวต่อ Wave+Branch
-    # ส่วน Delivery report รองรับแยก Booking และรับยอดแบ่งได้
-    member_summaries = [summary for summary in summaries if not summary.get("booking_split")]
     try:
         write_member_history_summaries(member_summaries)
     except Exception as exc:
-        print(f"🚨 Member Data batch write error: {exc}")
-        failed = []
-        for s in member_summaries:
-            try:
-                write_member_history_summary(s)
-            except Exception as single_exc:
-                failed.append(f"{s.get('wave')}/{s.get('branch')}: {single_exc}")
-        if failed:
-            failures.append("Member Data: " + "; ".join(failed))
-    if LEGACY_DELIVERY_REPORT_SYNC_ENABLED:
-        try:
-            write_delivery_report_summaries(summaries)
-        except Exception as exc:
-            print(f"🚨 Delivery report batch write error: {exc}")
-            failed = []
-            for s in summaries:
-                try:
-                    write_delivery_report_summary(s)
-                except Exception as single_exc:
-                    failed.append(f"{s.get('wave')}/{s.get('branch')}: {single_exc}")
-            if failed:
-                failures.append("Delivery report: " + "; ".join(failed))
+        failures.append(f"Member Data: {exc}")
+    try:
+        write_uat_report_test_summaries(normalized)
+    except Exception as exc:
+        failures.append(f"UAT Delivery report: {exc}")
     if failures:
         raise RuntimeError(" | ".join(failures))
 
@@ -3771,10 +2904,8 @@ def save_document_summary(data: DocumentSummaryBatchData, background_tasks: Back
         except Exception as exc:
             override_sheet_error = str(exc)
             print(f"🚨 Override Sheet pending; web overlay retained: {exc}")
-    # UAT mirror ใช้ยอดล่าสุดที่หน้าเอกสารแสดง เพื่อทดสอบยอดก่อนตัด staging tab;
-    # production ยังคงส่งเฉพาะสาขาที่ปิดจบแล้วตามกติกาเดิม.
-    report_summaries = (normalized if UAT_SHEETS_ONLY
-                        else [item for item in normalized if item.get("is_closed")])
+    # รายงานใช้ยอดล่าสุดที่หน้าเอกสารแสดงเสมอ ไม่รอให้สาขาปิดจบก่อน
+    report_summaries = list(normalized)
     # A target split edit also changes the source booking's remaining amount.
     # Refresh that exact Wave+Branch so Delivery report stays balanced.
     for source_booking, split_wave, split_branch in dict.fromkeys(affected_split_sources):
@@ -3798,8 +2929,7 @@ def save_document_summary(data: DocumentSummaryBatchData, background_tasks: Back
             "is_closed": any(item.get("branch_closed_at") for item in source_items),
             "allow_zero_update": True,
         })
-        if UAT_SHEETS_ONLY or source_summary["is_closed"]:
-            report_summaries.append(source_summary)
+        report_summaries.append(source_summary)
     if data.persist_overrides:
         # A manual save is transactional from the user's perspective: do not
         # say success until every totals Sheet has accepted the new values.
@@ -3983,12 +3113,12 @@ def check_wave(wave_no: str, force: bool = False):
         # Apply the in-memory scan overlays dynamically
         overlaid_data = apply_local_overlay(wave_no, raw_data)
         result = merge_member_history(overlaid_data, wave_no)
-        if UAT_SHEETS_ONLY:
-            result["booking_options"] = [
-                str(item.get("booking") or "").strip().upper()
-                for item in get_sheet_metas_for_wave(wave_no, force=force)
-                if str(item.get("booking") or "").strip()
-            ]
+        # 1 Wave อยู่ได้หลาย Booking: ส่งตัวเลือกกลับไปให้หน้าเว็บถาม ไม่เดาให้
+        result["booking_options"] = [
+            str(item.get("booking") or "").strip().upper()
+            for item in get_sheet_metas_for_wave(wave_no, force=force)
+            if str(item.get("booking") or "").strip()
+        ]
         return result
     except HTTPException:
         raise
@@ -3998,9 +3128,7 @@ def check_wave(wave_no: str, force: bool = False):
 
 # 🚀 [API 1.5] โหลดข้อมูล Booking
 def ensure_booking_source_complete(booking_no: str, booking_data: dict):
-    """Reject progressive Member Data snapshots until every planned branch exists."""
-    if not UAT_SHEETS_ONLY:
-        return
+    """Report progressive Member Data snapshots that are missing planned branches."""
     booking = re.sub(r"\s+", "", str(booking_no or "").upper())
     _, _, expected_map = load_wave_monitoring_pick_dates(force=False)
     missing = []
@@ -4040,7 +3168,7 @@ def check_booking(booking_no: str, force: bool = False):
             ensure_booking_source_complete(booking_no, booking_data)
             return booking_data
         except HTTPException as first_error:
-            if not UAT_SHEETS_ONLY or first_error.status_code not in (404, 409):
+            if first_error.status_code not in (404, 409):
                 raise
             # Member Data is populated progressively. Re-read one consistent
             # snapshot before declaring a multi-Wave Booking incomplete.
@@ -4215,9 +3343,8 @@ def split_booking_branch(data: BookingBranchSplitData):
             {"wave_no": wave_clean, "booking_no": booking, "lpn_list": branch_view_items}, branch
         )
         is_closed = any(item.get("branch_closed_at") for item in branch_view_items)
-        if UAT_SHEETS_ONLY or is_closed:
-            summary.update({"booking": booking, "booking_split": True, "is_closed": is_closed})
-            split_report_summaries.append(summary)
+        summary.update({"booking": booking, "booking_split": True, "is_closed": is_closed})
+        split_report_summaries.append(summary)
     queue_report_summary_snapshots(split_report_summaries, delay_seconds=0.0)
     return {"status": "success", "message": "แบ่งยอดเข้าสอง Booking เรียบร้อย",
             "source_booking": source, "target_booking": target, "allocated": requested,
@@ -4245,75 +3372,27 @@ def start_pallet(data: PalletStartData):
     if color not in ("Green", "Blue", "Red"):
         raise HTTPException(status_code=400, detail="สีพาเลทไม่ถูกต้อง")
 
-    if uat_scan_mode():
-        cache_key = (tuple(wave_ids), branch)
-        with pallet_allocation_lock:
-            prior = [] if SCAN_DEMO_ONLY else [row for row in read_uat_event_records("Scan Transactions")
-                                               if str(row.get("Branch_Code") or "").strip().upper() == branch
-                                               and str(row.get("Wave_Number") or "").strip() in {str(w) for w in wave_ids}]
-            next_no = max([int(row.get("Pallet_No") or 0) for row in prior] + [int(pallet_counter_cache.get(cache_key, 0) or 0)]) + 1
-            pallet_counter_cache[cache_key] = next_no
-        for wave_id in wave_ids:
-            save_uat_scan_event(str(wave_id), f"PALLET_{branch}_{next_no}", branch, branch_name,
-                                0, "PALLET_START", color, emp_id, next_no,
-                                f"uat-pallet:{wave_id}:{branch}:{next_no}")
-        record_shared_pallet_state(wave_ids, branch, next_no, color=color, submitted=False)
-        return {"status": "success", "pallet_no": next_no, "color": color, "allocated_by": emp_id}
-
+    wave_keys = {str(w) for w in wave_ids}
     cache_key = (tuple(wave_ids), branch)
     with pallet_allocation_lock:
-        cached_max = int(pallet_counter_cache.get(cache_key, 0) or 0)
-        if cached_max > 0:
-            next_no = cached_max + 1
-        else:
-            max_query = """
-                SELECT COALESCE(MAX(SAFE_CAST(Pallet_No AS INT64)), 0) AS max_no
-                FROM `pro-analytics-db.logistics_db.app_scan_transactions`
-                WHERE SAFE_CAST(REGEXP_REPLACE(TRIM(CAST(Wave_Number AS STRING)), r'[^0-9]', '') AS INT64) IN UNNEST(@wave_ids)
-                  AND TRIM(UPPER(IFNULL(Branch_Code, ''))) = @branch
-                  AND SAFE_CAST(Pallet_No AS INT64) > 0
-            """
-            max_config = bigquery.QueryJobConfig(query_parameters=[
-                bigquery.ArrayQueryParameter("wave_ids", "INT64", wave_ids),
-                bigquery.ScalarQueryParameter("branch", "STRING", branch),
-            ])
-            row = next(iter(client.query(max_query, job_config=max_config).result(timeout=BQ_JOB_TIMEOUT_SECONDS)))
-            next_no = int(row["max_no"] or 0) + 1
-        marker_lpn = f"PALLET_{branch}_{next_no}"
-        marker_time = datetime.datetime.now(datetime.timezone.utc).isoformat()
-        markers = [{
-            "Wave_Number": str(wave_id),
-            "LPN": marker_lpn,
-            "Scan_Type": "PALLET_START",
-            "Color": color,
-            "Qty": 0,
-            "Timestamp": marker_time,
-            "Branch_Code": branch,
-            "Branch_Name": branch_name,
-            "Emp_ID": emp_id,
-            "Pallet_No": next_no,
-        } for wave_id in wave_ids]
-        errors = client.insert_rows_json(
-            client.dataset("logistics_db").table("app_scan_transactions"),
-            markers,
-            row_ids=[f"pallet:{wave_id}:{branch}:{next_no}" for wave_id in wave_ids],
-        )
-        if errors:
-            raise HTTPException(status_code=500, detail=f"จองเลขพาเลทไม่สำเร็จ: {errors}")
+        prior = [] if SCAN_DEMO_ONLY else [
+            row for row in read_uat_event_records("Scan Transactions")
+            if str(row.get("Branch_Code") or "").strip().upper() == branch
+            and str(row.get("Wave_Number") or "").strip() in wave_keys
+        ]
+        next_no = max([_history_int(row.get("Pallet_No")) for row in prior]
+                      + [_history_int(pallet_counter_cache.get(cache_key, 0))]) + 1
         pallet_counter_cache[cache_key] = next_no
-
+    for wave_id in wave_ids:
+        save_uat_scan_event(str(wave_id), f"PALLET_{branch}_{next_no}", branch, branch_name,
+                            0, "PALLET_START", color, emp_id, next_no,
+                            f"uat-pallet:{wave_id}:{branch}:{next_no}")
     record_shared_pallet_state(wave_ids, branch, next_no, color=color, submitted=False)
-
-    return {
-        "status": "success",
-        "pallet_no": next_no,
-        "color": color,
-        "allocated_by": emp_id,
-    }
+    return {"status": "success", "pallet_no": next_no, "color": color, "allocated_by": emp_id}
 
 @app.post("/api/submit-pallet")
 def submit_pallet(data: PalletSubmitData):
-    """Share a completed pallet with every handheld while keeping an auditable marker in BigQuery."""
+    """Share a completed pallet with every handheld and keep an auditable marker."""
     if not SCAN_FEATURE_ENABLED:
         scan_hold_error()
     wave_ids = {int(str(w).strip()) for w in data.waves if str(w).strip().isdigit()}
@@ -4332,36 +3411,14 @@ def submit_pallet(data: PalletSubmitData):
     if not wave_ids or not branch or pallet_no <= 0:
         raise HTTPException(status_code=400, detail="ข้อมูล Wave สาขา หรือเลขพาเลทไม่ครบ")
 
-    if uat_scan_mode():
-        for wave_id in wave_ids:
-            save_uat_scan_event(str(wave_id), f"PALLET_SUBMIT_{branch}_{pallet_no}", branch, branch_name,
-                                0, "PALLET_SUBMIT", color or "None", emp_id, pallet_no,
-                                f"uat-pallet-submit:{wave_id}:{branch}:{pallet_no}")
-        record_shared_pallet_state(wave_ids, branch, pallet_no, color=color, submitted=True)
-        return {"status": "success", "pallet_no": pallet_no, "submitted_by": emp_id, "report_sync": "not_needed"}
-
-    marker_time = datetime.datetime.now(datetime.timezone.utc).isoformat()
-    markers = [{
-        "Wave_Number": str(wave_id),
-        "LPN": f"PALLET_SUBMIT_{branch}_{pallet_no}",
-        "Scan_Type": "PALLET_SUBMIT",
-        "Color": color or "None",
-        "Qty": 0,
-        "Timestamp": marker_time,
-        "Branch_Code": branch,
-        "Branch_Name": branch_name,
-        "Emp_ID": emp_id,
-        "Pallet_No": pallet_no,
-    } for wave_id in wave_ids]
-    errors = client.insert_rows_json(
-        client.dataset("logistics_db").table("app_scan_transactions"),
-        markers,
-        row_ids=[f"pallet-submit:{wave_id}:{branch}:{pallet_no}" for wave_id in wave_ids],
-    )
-    if errors:
-        raise HTTPException(status_code=500, detail=f"ส่งสถานะพาเลทไม่สำเร็จ: {errors}")
+    # The marker key comes from Wave+branch+pallet, so a network retry can never
+    # append a second submission row for the same pallet.
+    for wave_id in wave_ids:
+        save_uat_scan_event(str(wave_id), f"PALLET_SUBMIT_{branch}_{pallet_no}", branch, branch_name,
+                            0, "PALLET_SUBMIT", color or "None", emp_id, pallet_no,
+                            f"uat-pallet-submit:{wave_id}:{branch}:{pallet_no}")
     record_shared_pallet_state(wave_ids, branch, pallet_no, color=color, submitted=True)
-    # รายงาน Google Sheet ใช้เฉพาะยอดตอนปิดสาขา จึงไม่ต้อง query BigQuery ซ้ำตอนส่งทุกพาเลท
+    # รายงาน Google Sheet ใช้เฉพาะยอดตอนปิดสาขา จึงไม่ต้องซิงก์ตอนส่งทุกพาเลท
     return {"status": "success", "pallet_no": pallet_no, "submitted_by": emp_id, "report_sync": "not_needed"}
 
 def encode_correction_audit(payload: dict) -> str:
@@ -4378,6 +3435,7 @@ def decode_correction_audit(scan_type: str) -> Optional[dict]:
 
 @app.post("/api/correct-lpn")
 def correct_lpn(data: CorrectionData, background_tasks: BackgroundTasks):
+    """Record an intentional quantity correction with a full audit trail in the UAT workbook."""
     if not SCAN_FEATURE_ENABLED:
         scan_hold_error()
     try:
@@ -4399,34 +3457,20 @@ def correct_lpn(data: CorrectionData, background_tasks: BackgroundTasks):
         raise HTTPException(status_code=400, detail="กรุณาระบุ LPN สาขา และเหตุผลการแก้ไข")
     if new_qty < 0:
         raise HTTPException(status_code=400, detail="ยอดใหม่ต้องเป็น 0 ขึ้นไป")
-    valid_pairs = get_valid_lpns_for_wave(wave_clean)
-    if valid_pairs and (lpn, branch) not in valid_pairs:
-        raise HTTPException(status_code=400, detail=f"ไม่พบ LPN [{lpn}] ใน Wave/Branch นี้")
 
-    audit_color = f"AUDIT:{correction_id}"
-    duplicate_query = """
-        SELECT COUNT(*) AS found
-        FROM `pro-analytics-db.logistics_db.app_scan_transactions`
-        WHERE SAFE_CAST(REGEXP_REPLACE(TRIM(CAST(Wave_Number AS STRING)), r'[^0-9]', '') AS INT64) = @wave
-          AND TRIM(UPPER(LPN)) = @lpn
-          AND Color = @audit_color
-    """
-    duplicate_config = bigquery.QueryJobConfig(query_parameters=[
-        bigquery.ScalarQueryParameter("wave", "INT64", int(wave_clean)),
-        bigquery.ScalarQueryParameter("lpn", "STRING", lpn),
-        bigquery.ScalarQueryParameter("audit_color", "STRING", audit_color),
-    ])
-    duplicate_row = next(iter(client.query(duplicate_query, job_config=duplicate_config).result(timeout=BQ_JOB_TIMEOUT_SECONDS)))
-    if int(duplicate_row["found"] or 0) > 0:
+    audit_txn = f"correction:{correction_id}"
+    # A retry of the same correction must never apply the new quantity twice.
+    if transaction_already_processed(audit_txn):
         queue_branch_totals_reconciliation([(wave_clean, branch)])
-        return {"status": "success", "correction_id": correction_id, "duplicate": True, "report_sync": "queued"}
+        return {"status": "success", "correction_id": correction_id, "duplicate": True,
+                "report_sync": "queued"}
 
-    fresh = apply_local_overlay(wave_clean, get_wave_data_internal(wave_clean, force_refresh=True))
+    fresh = apply_local_overlay(wave_clean, get_wave_data_internal(wave_clean))
     current = next((item for item in fresh.get("lpn_list", [])
                     if str(item.get("lpn", "")).strip().upper() == lpn
                     and str(item.get("branch", "")).strip().upper() == branch), None)
     if not current:
-        raise HTTPException(status_code=404, detail=f"ไม่พบข้อมูลปัจจุบันของ LPN [{lpn}]")
+        raise HTTPException(status_code=404, detail=f"ไม่พบ LPN [{lpn}] ใน Wave {wave_clean} สาขา {branch}")
 
     old_snapshot = {
         "qty": int(current.get("qty") or 0),
@@ -4443,7 +3487,6 @@ def correct_lpn(data: CorrectionData, background_tasks: BackgroundTasks):
         "color": color if new_qty > 0 else "None",
         "pallet_no": pallet_no if new_qty > 0 else 0,
     }
-    now = datetime.datetime.now(datetime.timezone.utc)
     audit_payload = {
         "correction_id": correction_id,
         "wave_no": wave_clean,
@@ -4454,70 +3497,50 @@ def correct_lpn(data: CorrectionData, background_tasks: BackgroundTasks):
         "reason": reason,
         "note": note,
         "emp_id": emp_id,
-        "corrected_at": now.isoformat(),
+        "corrected_at": _uat_now_iso(),
     }
     audit_type = "CORRECTION|" + encode_correction_audit(audit_payload)
-    insert_query = """
-        INSERT INTO `pro-analytics-db.logistics_db.app_scan_transactions`
-        (Wave_Number, LPN, Scan_Type, Color, Qty, Timestamp, Branch_Code, Branch_Name, Emp_ID, Pallet_No)
-        SELECT @wave_str, @lpn, @audit_type, @audit_color, 0, @audit_time, @branch, @branch_name, @emp_id, @old_pallet
-        UNION ALL
-        SELECT @wave_str, @lpn, @new_type, @new_color, @new_qty, @new_time, @branch, @branch_name, @emp_id, @new_pallet
-        FROM UNNEST([1]) AS guard_row
-        WHERE @new_qty > 0
-    """
-    config = bigquery.QueryJobConfig(query_parameters=[
-        bigquery.ScalarQueryParameter("wave_str", "STRING", wave_clean),
-        bigquery.ScalarQueryParameter("lpn", "STRING", lpn),
-        bigquery.ScalarQueryParameter("audit_type", "STRING", audit_type),
-        bigquery.ScalarQueryParameter("audit_color", "STRING", audit_color),
-        bigquery.ScalarQueryParameter("audit_time", "TIMESTAMP", now),
-        bigquery.ScalarQueryParameter("branch", "STRING", branch),
-        bigquery.ScalarQueryParameter("branch_name", "STRING", (data.branch_name or "").strip()),
-        bigquery.ScalarQueryParameter("emp_id", "STRING", emp_id),
-        bigquery.ScalarQueryParameter("old_pallet", "INT64", int(old_snapshot["pallet_no"] or 0)),
-        bigquery.ScalarQueryParameter("new_type", "STRING", scan_type),
-        bigquery.ScalarQueryParameter("new_color", "STRING", color),
-        bigquery.ScalarQueryParameter("new_qty", "INT64", new_qty),
-        bigquery.ScalarQueryParameter("new_time", "TIMESTAMP", now + datetime.timedelta(milliseconds=1)),
-        bigquery.ScalarQueryParameter("new_pallet", "INT64", pallet_no),
-    ])
-    client.query(insert_query, job_config=config).result(timeout=BQ_JOB_TIMEOUT_SECONDS)
+    branch_name = (data.branch_name or "").strip()
 
-    record_local_scan(wave_clean, lpn, branch, 0, audit_type, audit_color, 0)
+    # Audit row first: the history must survive even if the value row is retried.
+    save_uat_scan_event(wave_clean, lpn, branch, branch_name, 0, audit_type,
+                        f"AUDIT:{correction_id}", emp_id,
+                        int(old_snapshot["pallet_no"] or 0), audit_txn)
     if new_qty > 0:
-        record_local_scan(wave_clean, lpn, branch, new_qty, scan_type, color, pallet_no)
+        save_uat_scan_event(wave_clean, lpn, branch, branch_name, new_qty, scan_type,
+                            color, emp_id, pallet_no, f"correction-value:{correction_id}")
+    else:
+        save_uat_scan_event(wave_clean, lpn, branch, branch_name, 0, "RESET_BOX",
+                            "None", emp_id, 0, f"correction-reset:{correction_id}")
     queue_branch_totals_reconciliation([(wave_clean, branch)])
-    # ไม่ refresh BigQuery ซ้ำทุกครั้ง: local overlay อัปเดตทุกเครื่องได้ทันทีอยู่แล้ว
-    return {"status": "success", "correction_id": correction_id, "audit": audit_payload, "report_sync": "queued"}
+    return {"status": "success", "correction_id": correction_id, "audit": audit_payload,
+            "report_sync": "queued"}
 
 @app.get("/api/corrections")
 def get_corrections(waves: str, branch: str, lpn: Optional[str] = None):
-    wave_ids = sorted({int(part.strip()) for part in str(waves or "").split(",") if part.strip().isdigit()})
+    """Correction history for one branch, newest first, read from the UAT scan log."""
+    wave_ids = {str(int(part.strip())) for part in str(waves or "").split(",") if part.strip().isdigit()}
     branch_clean = (branch or "").strip().upper()
     lpn_clean = (lpn or "").strip().upper()
     if not wave_ids or not branch_clean:
         raise HTTPException(status_code=400, detail="ข้อมูล Wave หรือสาขาไม่ครบ")
-    query = """
-        SELECT Scan_Type, Timestamp
-        FROM `pro-analytics-db.logistics_db.app_scan_transactions`
-        WHERE SAFE_CAST(REGEXP_REPLACE(TRIM(CAST(Wave_Number AS STRING)), r'[^0-9]', '') AS INT64) IN UNNEST(@wave_ids)
-          AND TRIM(UPPER(IFNULL(Branch_Code, ''))) = @branch
-          AND STARTS_WITH(Scan_Type, 'CORRECTION|')
-          AND (@lpn = '' OR TRIM(UPPER(LPN)) = @lpn)
-        ORDER BY Timestamp DESC
-        LIMIT 200
-    """
-    config = bigquery.QueryJobConfig(query_parameters=[
-        bigquery.ArrayQueryParameter("wave_ids", "INT64", wave_ids),
-        bigquery.ScalarQueryParameter("branch", "STRING", branch_clean),
-        bigquery.ScalarQueryParameter("lpn", "STRING", lpn_clean),
-    ])
     history = []
-    for row in client.query(query, job_config=config).result(timeout=BQ_JOB_TIMEOUT_SECONDS):
-        decoded = decode_correction_audit(row["Scan_Type"])
+    for row in reversed(read_uat_event_records("Scan Transactions")):
+        scan_type = str(row.get("Scan_Type") or "")
+        if not scan_type.startswith("CORRECTION|"):
+            continue
+        wave_digits = re.sub(r"\D", "", str(row.get("Wave_Number") or ""))
+        if not wave_digits or str(int(wave_digits)) not in wave_ids:
+            continue
+        if str(row.get("Branch_Code") or "").strip().upper() != branch_clean:
+            continue
+        if lpn_clean and str(row.get("LPN") or "").strip().upper() != lpn_clean:
+            continue
+        decoded = decode_correction_audit(scan_type)
         if decoded:
             history.append(decoded)
+        if len(history) >= 200:
+            break
     return {"status": "success", "history": history}
 
 # 🚀 [API 2] บันทึกข้อมูลสแกนทีละกล่อง
@@ -4537,7 +3560,6 @@ def process_scan(data: ScanData, background_tasks: BackgroundTasks):
     emp_val = (data.emp_id or "").strip()
     type_val = (data.type or "").strip()
     color_val = (data.color or "").strip()
-    base_pallet_breakdown = []
     transaction_id = (data.transaction_id or "").strip()
     if transaction_already_processed(transaction_id):
         return {"status": "success", "message": "Already saved", "duplicate": True}
@@ -4546,63 +3568,19 @@ def process_scan(data: ScanData, background_tasks: BackgroundTasks):
     except (ValueError, TypeError):
         pallet_no_val = 0
 
-    if uat_scan_mode():
-        # Member Data is the read-only source in this deployment.  Validate the
-        # Wave/branch there, then write the scan only to the isolated workbook.
-        source = build_uat_wave_data(wave_clean)
-        known_branches = {str(item.get("branch") or "").strip().upper()
-                          for item in source.get("lpn_list") or []}
-        if branch_val.upper() not in known_branches:
-            raise HTTPException(status_code=400, detail=f"ไม่พบสาขา [{branch_val}] ใน Wave {wave_clean}")
-        saved = save_uat_scan_event(wave_clean, lpn_val, branch_val, branch_name_val,
-                                    data.qty, type_val, color_val, emp_val, pallet_no_val, transaction_id)
-        return {"status": "success", "message": "Saved" if saved else "Already saved",
-                "duplicate": not saved, "report_sync": "not_needed"}
-
-    # Check cache first
-    valid_pairs = get_valid_lpns_for_wave(wave_clean)
-
-    if valid_pairs:
-        if (lpn_val.upper(), branch_val.upper()) not in valid_pairs:
-            print(f"🚫 REJECTED | LPN: {lpn_val} ไม่พบใน Wave {wave_clean} / Branch {branch_val}")
-            raise HTTPException(
-                status_code=400,
-                detail=f"ไม่พบ LPN [{data.lpn}] ใน Wave {wave_clean} สาขา {data.branch_code}"
-            )
-    else:
-        # Fallback to direct query only if cache is empty
-        # ✅ ใช้ query parameters แทนการต่อสตริง
-        check_query = """
-            SELECT COUNT(*) AS found
-            FROM `pro-analytics-db.logistics_db.wave_lpn_detail_record`
-            WHERE SAFE_CAST(REGEXP_REPLACE(TRIM(CAST(Wave_Number AS STRING)), r'[^0-9]', '') AS INT64) = @wave_id
-              AND TRIM(UPPER(CAST(LPN AS STRING))) = @lpn
-              AND TRIM(UPPER(CAST(Branch_Code AS STRING))) = @branch
-        """
-        check_config = bigquery.QueryJobConfig(query_parameters=[
-            bigquery.ScalarQueryParameter("wave_id", "INT64", int(wave_clean)),
-            bigquery.ScalarQueryParameter("lpn", "STRING", lpn_val.upper()),
-            bigquery.ScalarQueryParameter("branch", "STRING", branch_val.upper()),
-        ])
-        try:
-            check_result = client.query(check_query, job_config=check_config).result()
-            found = next(iter(check_result))["found"]
-            if found == 0:
-                print(f"🚫 REJECTED (DB Fallback) | LPN: {lpn_val} ไม่พบใน Wave {wave_clean} / Branch {branch_val}")
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"ไม่พบ LPN [{data.lpn}] ใน Wave {wave_clean} สาขา {data.branch_code}"
-                )
-        except HTTPException:
-            raise
-        except Exception as e:
-            print(f"🚨 CHECK FALLBACK ERROR | LPN: {lpn_val} | Error: {str(e)}")
-            raise HTTPException(status_code=500, detail=str(e))
+    # Member Data is the read-only plan for this Wave. Validate the branch there,
+    # then write the scan only into the isolated UAT workbook.
+    source = build_uat_wave_data(wave_clean)
+    known_branches = {str(item.get("branch") or "").strip().upper()
+                      for item in source.get("lpn_list") or []}
+    if branch_val.upper() not in known_branches:
+        raise HTTPException(status_code=400, detail=f"ไม่พบสาขา [{branch_val}] ใน Wave {wave_clean}")
 
     # PP/SP ใช้ยอดสะสม: ตรวจว่าระหว่างนั้นไม่มีเครื่องอื่นแก้ยอดเดียวกัน
     # ถ้าค่าเริ่มต้นไม่ตรง ให้ผู้ใช้โหลดค่าล่าสุดแทนการเขียนทับข้อมูลของอีกเครื่อง
+    base_pallet_breakdown = []
     if data.expected_previous_qty is not None and type_val not in ("RESET_BOX", "CANCEL_COMBINE"):
-        current_data = apply_local_overlay(wave_clean, get_wave_data_internal(wave_clean))
+        current_data = apply_local_overlay(wave_clean, source)
         current_item = next((item for item in current_data.get("lpn_list", [])
                              if str(item.get("lpn", "")).strip().upper() == lpn_val.upper()
                              and str(item.get("branch", "")).strip().upper() == branch_val.upper()), None)
@@ -4615,39 +3593,11 @@ def process_scan(data: ScanData, background_tasks: BackgroundTasks):
                 detail=f"LPN [{lpn_val}] ถูกอีกเครื่องอัปเดตแล้ว (ยอดล่าสุด {current_qty} กล่อง / เครื่องนี้เริ่มจาก {expected_qty}) กรุณารอหน้าจออัปเดตแล้วสแกนใหม่"
             )
 
-    print(f"📦 SCAN | Wave: {wave_clean} | LPN: {lpn_val} | Branch: {branch_val} | Emp: {emp_val}")
-
-    # Write to BigQuery using insert_rows_json (Streaming API is near-instant, <100ms)
-    import datetime
-    table_id = "pro-analytics-db.logistics_db.app_scan_transactions"
-    row_to_insert = {
-        "Wave_Number": wave_clean,
-        "LPN": lpn_val,
-        "Scan_Type": type_val,
-        "Color": color_val,
-        "Qty": data.qty,
-        "Timestamp": datetime.datetime.utcnow().isoformat() + "Z",
-        "Branch_Code": branch_val,
-        "Branch_Name": branch_name_val,
-        "Emp_ID": emp_val,
-        "Pallet_No": pallet_no_val
-    }
-
-    try:
-        insert_kwargs = {"row_ids": [transaction_id]} if transaction_id else {}
-        errors = client.insert_rows_json(client.dataset("logistics_db").table("app_scan_transactions"), [row_to_insert], **insert_kwargs)
-        if errors:
-            print(f"🚨 INSERT ROWS JSON ERROR | LPN: {lpn_val} | Errors: {errors}")
-            raise Exception(f"BigQuery streaming errors: {errors}")
-        mark_transaction_processed(transaction_id)
-        record_local_scan(wave_clean, lpn_val, branch_val, data.qty, type_val, color_val, pallet_no_val, base_pallet_breakdown)
-        print(f"✅ SAVED | LPN: {lpn_val}")
-        return {"status": "success", "message": "Saved", "report_sync": "not_needed"}
-    except Exception as e:
-        # ห้าม fallback ด้วย SQL INSERT เพราะ response หลุดหลัง BigQuery รับแล้วจะทำให้ยอดซ้ำ
-        # Frontend จะ retry ด้วย transaction_id/insertId เดิม จึง dedupe ได้อย่างปลอดภัย
-        print(f"🚨 INSERT RETRY REQUIRED | LPN: {lpn_val} | Error: {str(e)}")
-        raise HTTPException(status_code=503, detail="Server ยังไม่ยืนยันการบันทึก ระบบจะส่งรายการเดิมซ้ำให้อัตโนมัติ")
+    saved = save_uat_scan_event(wave_clean, lpn_val, branch_val, branch_name_val,
+                                data.qty, type_val, color_val, emp_val, pallet_no_val,
+                                transaction_id, base_pallet_breakdown)
+    return {"status": "success", "message": "Saved" if saved else "Already saved",
+            "duplicate": not saved, "report_sync": "not_needed"}
 
 
 # 🚀 [API 2.5] บันทึกข้อมูลสแกนเป็นชุด (Batch)
@@ -4658,197 +3608,40 @@ def process_scan_batch(data: ScanBatchData, background_tasks: BackgroundTasks):
     if not data.scans:
         return {"status": "success", "message": "No scans to process", "processed_count": 0}
 
-    if uat_scan_mode():
-        processed, failed, ids = 0, [], []
-        branch_cache = {}
-        for item in data.scans:
-            try:
-                wave_clean = str(int(item.wave_no))
-                if wave_clean not in branch_cache:
-                    branch_cache[wave_clean] = {str(row.get("branch") or "").strip().upper()
-                                                for row in build_uat_wave_data(wave_clean).get("lpn_list") or []}
-                branch = (item.branch_code or "").strip().upper()
-                if branch not in branch_cache[wave_clean]:
-                    raise ValueError(f"ไม่พบสาขา [{branch}] ใน Wave {wave_clean}")
-                txn = (item.transaction_id or "").strip()
-                saved = save_uat_scan_event(wave_clean, item.lpn, branch, item.branch_name,
-                                            item.qty, item.type, item.color, item.emp_id,
-                                            int(item.pallet_no or 0), txn)
-                if saved:
-                    processed += 1
-                if txn:
-                    ids.append(txn)
-            except Exception as exc:
-                failed.append({"lpn": item.lpn, "transaction_id": item.transaction_id, "reason": str(exc)})
-        return {"status": "success" if not failed else ("partial_success" if processed else "failed"),
-                "processed_count": processed, "failed_count": len(failed),
-                "processed_transaction_ids": ids, "errors": failed, "report_sync": "not_needed"}
-
-    import datetime
-    table_ref = client.dataset("logistics_db").table("app_scan_transactions")
-    rows_to_insert = []
-    accepted_scans = []
-    row_ids = []
-    failed_scans = []
-    processed_transaction_ids = []
+    processed, failed, ids = 0, [], []
+    branch_cache = {}
     for item in data.scans:
-        item_transaction_id = (item.transaction_id or "").strip()
-        if transaction_already_processed(item_transaction_id):
-            if item_transaction_id:
-                processed_transaction_ids.append(item_transaction_id)
-            continue
+        txn = (item.transaction_id or "").strip()
         try:
+            # A queue retry resends the same transaction_id; report it as done
+            # instead of appending a second row for the same box.
+            if txn and transaction_already_processed(txn):
+                ids.append(txn)
+                continue
             wave_clean = str(int(item.wave_no))
-        except ValueError:
-            failed_scans.append({"lpn": item.lpn, "transaction_id": item_transaction_id, "reason": "รหัส Wave ไม่ถูกต้อง"})
-            continue
-
-        lpn_val = (item.lpn or "").strip()
-        branch_val = (item.branch_code or "").strip()
-        branch_name_val = (item.branch_name or "").strip()
-        emp_val = (item.emp_id or "").strip()
-        type_val = (item.type or "").strip()
-        color_val = (item.color or "").strip()
-        try:
-            pallet_no_val = int(item.pallet_no or 0)
-        except (ValueError, TypeError):
-            pallet_no_val = 0
-
-        # Check cache first
-        valid_pairs = get_valid_lpns_for_wave(wave_clean)
-        
-        # If cache has items, perform the check
-        if valid_pairs:
-            if (lpn_val.upper(), branch_val.upper()) not in valid_pairs:
-                print(f"🚫 BATCH REJECTED | LPN: {lpn_val} ไม่พบใน Wave {wave_clean} / Branch {branch_val}")
-                failed_scans.append({"lpn": item.lpn, "transaction_id": item_transaction_id, "reason": "ไม่พบ LPN ใน Wave/Branch"})
-                continue
-        else:
-            # Fallback to direct query if cache is empty
-            # ✅ ใช้ query parameters แทนการต่อสตริง
-            check_query = """
-                SELECT COUNT(*) AS found
-                FROM `pro-analytics-db.logistics_db.wave_lpn_detail_record`
-                WHERE SAFE_CAST(REGEXP_REPLACE(TRIM(CAST(Wave_Number AS STRING)), r'[^0-9]', '') AS INT64) = @wave_id
-                  AND TRIM(UPPER(CAST(LPN AS STRING))) = @lpn
-                  AND TRIM(UPPER(CAST(Branch_Code AS STRING))) = @branch
-            """
-            check_config = bigquery.QueryJobConfig(query_parameters=[
-                bigquery.ScalarQueryParameter("wave_id", "INT64", int(wave_clean)),
-                bigquery.ScalarQueryParameter("lpn", "STRING", lpn_val.upper()),
-                bigquery.ScalarQueryParameter("branch", "STRING", branch_val.upper()),
-            ])
-            try:
-                check_result = client.query(check_query, job_config=check_config).result()
-                found = next(iter(check_result))["found"]
-                if found == 0:
-                    failed_scans.append({"lpn": item.lpn, "transaction_id": item_transaction_id, "reason": "ไม่พบ LPN ใน Wave/Branch (Fallback)"})
-                    continue
-            except Exception as e:
-                failed_scans.append({"lpn": item.lpn, "transaction_id": item_transaction_id, "reason": f"Check error: {str(e)}"})
-                continue
-
-        rows_to_insert.append({
-            "Wave_Number": wave_clean,
-            "LPN": lpn_val,
-            "Scan_Type": type_val,
-            "Color": color_val,
-            "Qty": item.qty,
-            "Timestamp": datetime.datetime.utcnow().isoformat() + "Z",
-            "Branch_Code": branch_val,
-            "Branch_Name": branch_name_val,
-            "Emp_ID": emp_val,
-            "Pallet_No": pallet_no_val
-        })
-        accepted_scans.append((wave_clean, lpn_val, branch_val, item.qty, type_val, color_val, pallet_no_val, item_transaction_id))
-        row_ids.append(item_transaction_id or str(uuid.uuid4()))
-
-    # Trigger background refreshes
-    # ไม่สร้าง BigQuery query เพิ่มตามจำนวน Wave หลัง batch; overlay ถูกบันทึกไว้แล้ว
-
-    if not rows_to_insert:
-        return {
-            "status": "success" if processed_transaction_ids and not failed_scans else "failed",
-            "message": "Already saved" if processed_transaction_ids else "ไม่มีข้อมูลสแกนที่ผ่านการตรวจสอบ",
-            "processed_count": 0,
-            "failed_count": len(failed_scans),
-            "processed_transaction_ids": processed_transaction_ids,
-            "errors": failed_scans,
-            "report_sync": "not_needed",
-        }
-
-    try:
-        errors = client.insert_rows_json(table_ref, rows_to_insert, row_ids=row_ids)
-        if errors:
-            print(f"🚨 BATCH INSERT ROWS JSON ERROR | Errors: {errors}")
-            # Streaming API อาจรับสำเร็จเพียงบางแถว ห้าม fallback ทั้ง batch เพราะยอดจะซ้ำ
-            failed_indexes = {int(error.get("index")) for error in errors if error.get("index") is not None}
-            if not failed_indexes:
-                failed_indexes = set(range(len(rows_to_insert)))
-            streamed_scans = [scan for index, scan in enumerate(accepted_scans) if index not in failed_indexes]
-            for scan in streamed_scans:
-                record_local_scan(*scan[:7])
-                mark_transaction_processed(scan[7])
-                if scan[7]:
-                    processed_transaction_ids.append(scan[7])
-            error_by_index = {int(error.get("index")): error for error in errors if error.get("index") is not None}
-            for index in sorted(failed_indexes):
-                scan = accepted_scans[index]
-                failed_scans.append({
-                    "lpn": scan[1],
-                    "transaction_id": scan[7],
-                    "reason": f"BigQuery ยังไม่รับรายการ: {error_by_index.get(index, {})}",
-                })
-            return {
-                "status": "partial_success" if streamed_scans else "failed",
-                "processed_count": len(streamed_scans),
-                "failed_count": len(failed_scans),
-                "processed_transaction_ids": processed_transaction_ids,
-                "errors": failed_scans,
-                "report_sync": "not_needed",
-            }
-        for scan in accepted_scans:
-            record_local_scan(*scan[:7])
-            mark_transaction_processed(scan[7])
-            if scan[7]:
-                processed_transaction_ids.append(scan[7])
-        print(f"✅ BATCH SAVED | Processed: {len(rows_to_insert)} | Failed: {len(failed_scans)}")
-        return {
-            "status": "success", 
-            "message": "Saved", 
-            "processed_count": len(rows_to_insert), 
-            "failed_count": len(failed_scans),
-            "processed_transaction_ids": processed_transaction_ids,
-            "errors": failed_scans,
-            "report_sync": "not_needed",
-        }
-    except Exception as e:
-        # ไม่ยิง SQL ซ้ำทั้งชุดเมื่อไม่รู้ว่า BigQuery รับไปแล้วหรือยัง
-        # ให้ Handheld retry ด้วย transaction_id เดิมเพื่อใช้ insertId dedupe
-        print(f"🚨 BATCH RETRY REQUIRED | Error: {str(e)}")
-        raise HTTPException(status_code=503, detail="Server ยังไม่ยืนยันรายการชุดนี้ ระบบจะส่งซ้ำด้วยรหัสเดิมอัตโนมัติ")
-
-
-def run_close_job_queries_in_background(wave_clean: str, branch: str, insert_zero_query: str, frontend_summary: dict = None):
-    # CLOSE_JOB marker ถูก streaming แบบ durable ก่อนตอบ API แล้ว ส่วน AUTO_NOT_FOUND ทำเบื้องหลัง
-    # และ retry ได้ เพราะ Qty=0 จึง idempotent และไม่ทำให้ยอดกล่องเพิ่ม
-    for attempt in range(1, 6):
-        try:
-            client.query(insert_zero_query).result(timeout=BQ_JOB_TIMEOUT_SECONDS)
-            queue_branch_totals_reconciliation([(wave_clean, branch)], delay_seconds=0.25)
-            print(f"✅ BACKGROUND CLOSE JOB COMPLETE | Wave: {wave_clean} | Branch: {branch}")
-            return
-        except Exception as e:
-            print(f"🚨 BACKGROUND CLOSE JOB RETRY {attempt}/5 | Wave: {wave_clean} | Branch: {branch} | Error: {str(e)}")
-            if attempt < 5:
-                time.sleep(min(15, attempt * 2))
-    # Marker ยังอยู่ใน BigQuery จึงให้ startup recovery/การเปิดงานครั้งถัดไป reconcile Sheet ได้เสมอ
-    queue_branch_totals_reconciliation([(wave_clean, branch)], delay_seconds=0.25)
-
+            if wave_clean not in branch_cache:
+                branch_cache[wave_clean] = {str(row.get("branch") or "").strip().upper()
+                                            for row in build_uat_wave_data(wave_clean).get("lpn_list") or []}
+            branch = (item.branch_code or "").strip().upper()
+            if branch not in branch_cache[wave_clean]:
+                raise ValueError(f"ไม่พบสาขา [{branch}] ใน Wave {wave_clean}")
+            saved = save_uat_scan_event(wave_clean, item.lpn, branch, item.branch_name,
+                                        item.qty, item.type, item.color, item.emp_id,
+                                        int(item.pallet_no or 0), txn)
+            if saved:
+                processed += 1
+            if txn:
+                ids.append(txn)
+        except Exception as exc:
+            failed.append({"lpn": item.lpn, "transaction_id": item.transaction_id, "reason": str(exc)})
+    return {"status": "success" if not failed else ("partial_success" if processed else "failed"),
+            "processed_count": processed, "failed_count": len(failed),
+            "processed_transaction_ids": ids, "errors": failed, "report_sync": "not_needed"}
 
 # 🚀 [API 5] ปิดจบงานสาขา
 @app.post("/api/close-job")
 def close_job(data: CloseJobData, background_tasks: BackgroundTasks):
+    """Close one branch and record the exact totals shown on screen into the UAT workbook."""
     if not SCAN_FEATURE_ENABLED:
         scan_hold_error()
     try:
@@ -4856,13 +3649,11 @@ def close_job(data: CloseJobData, background_tasks: BackgroundTasks):
     except ValueError:
         raise HTTPException(status_code=400, detail="รหัส Wave ไม่ถูกต้อง")
 
-    def esc(val):
-        return str(val or "").replace("\\", "\\\\").replace("'", "\\'")
-
     branch = data.branch.strip().upper()
-    branch_sql = esc(branch)
-    emp_id = esc((data.emp_id or "").strip())
-    completed_at = esc((data.completed_at or "").strip())
+    if not branch:
+        raise HTTPException(status_code=400, detail="กรุณาระบุรหัสสาขา")
+    emp_id = (data.emp_id or "").strip()
+    completed_at = (data.completed_at or "").strip() or _uat_now_iso()
 
     frontend_summary = None
     if data.summary:
@@ -4874,81 +3665,40 @@ def close_job(data: CloseJobData, background_tasks: BackgroundTasks):
                 detail="ยังปิดสาขาไม่ได้: พบรายการ LPN แต่ยอดรวมเป็น 0 กรุณารีเฟรชข้อมูลและตรวจคิวส่งก่อนกดปิดอีกครั้ง",
             )
 
-    insert_zero_query = f"""
-        INSERT INTO `pro-analytics-db.logistics_db.app_scan_transactions`
-        (`Wave_Number`, `LPN`, `Scan_Type`, `Color`, `Qty`, `Timestamp`)
-        WITH Expected AS (
-            SELECT TRIM(UPPER(CAST(LPN AS STRING))) AS LPN
-            FROM `pro-analytics-db.logistics_db.wave_lpn_detail_record`
-            WHERE SAFE_CAST(REGEXP_REPLACE(TRIM(CAST(Wave_Number AS STRING)), r'[^0-9]', '') AS INT64) = {wave_clean}
-              AND TRIM(UPPER(CAST(Branch_Code AS STRING))) = '{branch_sql}'
-        ),
-        Scanned AS (
-            SELECT TRIM(UPPER(CAST(LPN AS STRING))) AS LPN
-            FROM `pro-analytics-db.logistics_db.app_scan_transactions`
-            WHERE SAFE_CAST(REGEXP_REPLACE(TRIM(CAST(Wave_Number AS STRING)), r'[^0-9]', '') AS INT64) = {wave_clean}
-        )
-        SELECT '{wave_clean}', e.LPN, 'AUTO_NOT_FOUND', 'None', 0, CURRENT_TIMESTAMP()
-        FROM Expected e
-        LEFT JOIN Scanned s ON e.LPN = s.LPN
-        WHERE s.LPN IS NULL
-    """
-
-    marker_timestamp = completed_at or (datetime.datetime.now(datetime.timezone.utc).isoformat())
-    marker_row = {
-        "Wave_Number": wave_clean,
-        "LPN": f"BRANCH_{branch}",
-        "Scan_Type": "CLOSE_JOB",
-        "Color": "None",
-        "Qty": 0,
-        "Timestamp": marker_timestamp,
-        "Branch_Code": branch,
-        "Emp_ID": emp_id,
-        "Pallet_No": 0,
-    }
-    marker_rows = [marker_row]
-    marker_row_ids = [f"close-{wave_clean}-{branch}-{marker_timestamp}"]
-    if frontend_summary and frontend_summary.get("total", 0) > 0:
-        marker_rows.append({
+    # The close marker must be durable before the API reports success, so a
+    # restart can never lose the fact that this branch was finished.
+    summary = frontend_summary or {}
+    try:
+        append_uat_event_rows("Branch Close Status", [{
+            "Event_ID": str(uuid.uuid4()),
             "Wave_Number": wave_clean,
-            "LPN": f"BRANCH_SUMMARY_{branch}",
-            "Scan_Type": "CLOSE_SUMMARY",
-            "Color": json.dumps(frontend_summary, ensure_ascii=False, separators=(",", ":")),
-            "Qty": int(frontend_summary["total"]),
-            "Timestamp": marker_timestamp,
+            "Booking_No": str(summary.get("booking") or "").strip().upper(),
             "Branch_Code": branch,
-            "Branch_Name": frontend_summary.get("branch_name") or branch,
+            "Branch_Name": str(summary.get("branch_name") or branch),
+            "Status": "CLOSED",
+            "M_Count": int(summary.get("m") or 0),
+            "Red_Count": int(summary.get("red") or 0),
+            "Blue_Count": int(summary.get("blue") or 0),
+            "Green_Count": int(summary.get("green") or 0),
+            "Black_Count": int(summary.get("black") or 0),
+            "Total_Count": int(summary.get("total") or 0),
+            "Pallet_Count": int(summary.get("pallet") or 0),
             "Emp_ID": emp_id,
-            "Pallet_No": int(frontend_summary.get("pallet") or 0),
-        })
-        marker_row_ids.append(f"close-summary-{wave_clean}-{branch}-{marker_timestamp}")
-    marker_errors = client.insert_rows_json(
-        client.dataset("logistics_db").table("app_scan_transactions"),
-        marker_rows,
-        row_ids=marker_row_ids,
-    )
-    if marker_errors:
-        raise HTTPException(status_code=503, detail=f"บันทึกสถานะปิดสาขายังไม่สำเร็จ: {marker_errors}")
+            "Completed_At": completed_at,
+            "Created_At": _uat_now_iso(),
+        }])
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"บันทึกสถานะปิดสาขายังไม่สำเร็จ: {exc}")
 
     record_shared_branch_closed(wave_clean, branch, completed_at, emp_id)
-
     if frontend_summary:
-        # Fast snapshot from the exact numbers visible on screen; server reconciliation follows.
+        # The screen totals are authoritative; the report worker writes them next.
         queue_report_summary_snapshots([frontend_summary], delay_seconds=0.0)
-
-    # ตอบกลับทันที: งาน BigQuery ทั้งหมดทำเบื้องหลัง ไม่ query ซ้ำใน request ปิดสาขา
-    background_tasks.add_task(
-        run_close_job_queries_in_background,
-        wave_clean,
-        branch,
-        insert_zero_query,
-        frontend_summary
-    )
 
     return {
         "status": "success",
-        "message": f"ปิดจบงานสาขา {branch} และบันทึกยอด 0 ให้กล่องที่ค้างสำเร็จ! (ระบบกำลังบันทึกเบื้องหลัง)",
-        "completed_at": data.completed_at
+        "message": f"ปิดจบงานสาขา {branch} เรียบร้อย ระบบกำลังบันทึกยอดเข้ารายงาน",
+        "completed_at": completed_at,
     }
 
 @app.get("/api/member-history-status")
@@ -4974,144 +3724,83 @@ def member_history_status():
         raise HTTPException(status_code=503, detail=f"Google Sheet ยังเขียนไม่ได้: {exc}")
 
 
-def query_pending_waves_from_bigquery():
-    if UAT_SHEETS_ONLY:
-        def history_sort_key(row):
-            try:
-                return datetime.datetime.strptime(
-                    f"{str(row.get('date') or '').strip()} {str(row.get('time') or '').strip()}",
-                    "%d/%m/%Y %H:%M",
-                )
-            except ValueError:
-                return datetime.datetime.min
+def query_pending_waves():
+    """Latest 50 Waves from Member Data, newest recorded first (no extra Sheet I/O)."""
+    def history_sort_key(row):
+        try:
+            return datetime.datetime.strptime(
+                f"{str(row.get('date') or '').strip()} {str(row.get('time') or '').strip()}",
+                "%d/%m/%Y %H:%M",
+            )
+        except ValueError:
+            return datetime.datetime.min
 
-        # Member Data อาจมี Wave เก่าที่กรอกเลขผิด จึงเรียงตามวัน/เวลาบันทึกจริง
-        # และคืนแต่ละ Wave เพียงครั้งเดียว แทนการเรียงจากเลข Wave อย่างเดียว
-        recent_rows = sorted(load_member_history().values(), key=history_sort_key, reverse=True)
-        wave_ids = []
-        seen = set()
-        for row in recent_rows:
-            wave = str(row.get("wave") or "").strip()
-            if not wave.isdigit() or wave in seen:
-                continue
-            seen.add(wave)
-            wave_ids.append(int(wave))
-            if len(wave_ids) >= 50:
-                break
-        return {
-            "success": True,
-            "waves": [{"wave_no": f"{wave_id:010d}"} for wave_id in wave_ids],
-            "cached": False,
-            "source": "Member Data",
-        }
-    query = """
-        WITH Waves AS (
-            SELECT DISTINCT
-                SAFE_CAST(REGEXP_REPLACE(TRIM(CAST(Wave_Number AS STRING)), r'[^0-9]', '') AS INT64) AS Wave_ID
-            FROM `pro-analytics-db.logistics_db.wave_lpn_detail_record`
-            WHERE Wave_Number IS NOT NULL
-              AND TRIM(CAST(Wave_Number AS STRING)) != ''
-        )
-        SELECT LPAD(CAST(Wave_ID AS STRING), 10, '0') AS Wave_Number
-        FROM Waves
-        WHERE Wave_ID IS NOT NULL
-        ORDER BY Wave_ID DESC
-        LIMIT 50
-    """
-    query_job = client.query(
-        query,
-        job_config=bigquery.QueryJobConfig(use_query_cache=True)
-    )
-    results = query_job.result(timeout=BQ_JOB_TIMEOUT_SECONDS)
-    waves = [{"wave_no": str(row["Wave_Number"]).strip()} for row in results]
-    return {"success": True, "waves": waves, "cached": False}
+    # Member Data อาจมี Wave เก่าที่กรอกเลขผิด จึงเรียงตามวัน/เวลาบันทึกจริง
+    # และคืนแต่ละ Wave เพียงครั้งเดียว แทนการเรียงจากเลข Wave อย่างเดียว
+    recent_rows = sorted(load_member_history().values(), key=history_sort_key, reverse=True)
+    wave_ids = []
+    seen = set()
+    for row in recent_rows:
+        wave = str(row.get("wave") or "").strip()
+        if not wave.isdigit() or wave in seen:
+            continue
+        seen.add(wave)
+        wave_ids.append(int(wave))
+        if len(wave_ids) >= 50:
+            break
+    return {
+        "success": True,
+        "waves": [{"wave_no": f"{wave_id:010d}"} for wave_id in wave_ids],
+        "cached": False,
+        "source": "Member Data",
+    }
 
 
 def _startup_warm_cache():
-    """Free plan: warm Google Sheets caches in one background flow after cold start."""
+    """Free plan: warm every Sheet cache in one background flow so the first request is fast."""
+    # 1) Member Data first: every document read depends on it, so loading it here
+    #    means a request arriving during warm-up waits once instead of twice.
     try:
-        data = query_pending_waves_from_bigquery()
+        load_member_history()
+    except Exception as exc:
+        print(f"⚠️ Member Data warm-up skipped: {exc}")
+
+    # 2) Pending waves are derived from the history already in memory (no extra I/O).
+    try:
+        data = query_pending_waves()
         with pending_waves_cache_lock:
             pending_waves_cache["data"] = data
             pending_waves_cache["expires_at"] = time.time() + PENDING_WAVES_CACHE_TTL_SECONDS
-        print("✅ Startup cache warm-up complete (pending waves)")
-
-        # อุ่นเฉพาะ Wave ล่าสุดหนึ่งรายการเพื่อลด peak RAM/CPU ตอนเครื่องเพิ่งตื่น
-        waves_to_preload = (data.get("waves") or [])[:1]
-        if waves_to_preload:
-            import threading
-            def _preload_waves():
-                for w in waves_to_preload:
-                    try:
-                        wno = str(w.get("wave_no") or "").strip()
-                        if wno:
-                            get_wave_data_internal(wno, force_refresh=False)
-                            print(f"⚡ Preloaded wave {wno} into cache")
-                    except Exception as we:
-                        print(f"⚠️ Wave preload skipped {w}: {we}")
-            threading.Thread(target=_preload_waves, daemon=True).start()
-    except Exception as e:
-        print(f"⚠️ Startup cache warm-up failed (non-critical): {e}")
-
-    # เตรียม metadata Booking ล่วงหน้า เพื่อให้การค้นหา Booking ครั้งแรกไม่ต้องรอ DDL + 2 queries
-    try:
-        get_booking_branch_assignments()
-        get_booking_branch_splits()
+        print(f"✅ Pending waves warm | {len(data.get('waves') or [])} waves")
     except Exception as exc:
-        print(f"⚠️ Booking metadata warm-up skipped: {exc}")
+        print(f"⚠️ Pending waves warm-up skipped: {exc}")
 
-    # โหลดประวัติกล่องจาก Member Data ไว้ล่วงหน้า ไม่ให้การค้นหา Wave แรกต้องรอ Google Sheet
-    load_member_history()
-
-    if UAT_SHEETS_ONLY:
+    # 3) Everything the first Wave/Booking search would otherwise load on demand.
+    for label, warm in (
+        ("Booking & Wave", lambda: load_booking_wave_sheet_meta(force=True)),
+        ("UAT event tabs", ensure_uat_event_sheets),
+        ("branch moves", get_booking_branch_assignments),
+        ("branch splits", get_booking_branch_splits),
+        ("pick dates", lambda: load_wave_monitoring_pick_dates(force=True)),
+    ):
         try:
-            load_booking_wave_sheet_meta(force=True)
-            ensure_uat_event_sheets()
-            print("✅ UAT Google Sheets data source ready")
+            warm()
         except Exception as exc:
-            # ไม่ทำให้ Service ล้มตอนเริ่ม หากเพิ่งแชร์ Sheet หรือ API สะดุดชั่วคราว
-            print(f"⚠️ UAT Sheet setup skipped at startup: {exc}")
+            # A cold start must never fail because one Sheet is briefly unreachable.
+            print(f"⚠️ {label} warm-up skipped: {exc}")
+    print("✅ Startup warm-up complete (Google Sheets only)")
 
-
-def recover_recent_report_syncs():
-    """Recover only closed/corrected branches; open scans must not trigger Sheet/BigQuery rebuilds."""
-    if UAT_SHEETS_ONLY:
-        return
-    try:
-        query = """
-            SELECT DISTINCT
-                CAST(SAFE_CAST(REGEXP_REPLACE(TRIM(CAST(Wave_Number AS STRING)), r'[^0-9]', '') AS INT64) AS STRING) AS wave,
-                TRIM(UPPER(CAST(Branch_Code AS STRING))) AS branch
-            FROM `pro-analytics-db.logistics_db.app_scan_transactions`
-            WHERE SAFE_CAST(Timestamp AS TIMESTAMP) >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 24 HOUR)
-              AND SAFE_CAST(REGEXP_REPLACE(TRIM(CAST(Wave_Number AS STRING)), r'[^0-9]', '') AS INT64) IS NOT NULL
-              AND NULLIF(TRIM(CAST(Branch_Code AS STRING)), '') IS NOT NULL
-              AND (
-                    UPPER(TRIM(CAST(Scan_Type AS STRING))) IN ('CLOSE_JOB', 'CLOSE_SUMMARY')
-                    OR STARTS_WITH(UPPER(TRIM(CAST(Scan_Type AS STRING))), 'CORRECTION|')
-                  )
-            LIMIT 500
-        """
-        rows = list(client.query(query).result(timeout=BQ_JOB_TIMEOUT_SECONDS))
-        pairs = {(str(row["wave"] or ""), str(row["branch"] or "").strip().upper()) for row in rows}
-        pairs = {(wave, branch) for wave, branch in pairs if wave and branch}
-        if pairs:
-            queue_branch_totals_reconciliation(pairs, delay_seconds=1.0)
-            print(f"♻️ REPORT SYNC RECOVERY | queued={len(pairs)} recent Wave+Branch pairs")
-    except Exception as exc:
-        print(f"⚠️ REPORT SYNC RECOVERY skipped: {exc}")
 
 @app.on_event("startup")
 async def startup_event():
-    """Free plan: return health quickly, then warm Sheet caches in background."""
+    """Free plan: answer the health check immediately, then warm Sheet caches in background."""
     ensure_report_sync_worker_started()
-    threading.Thread(target=_startup_warm_cache, daemon=True).start()
-    threading.Thread(target=recover_recent_report_syncs, daemon=True, name="report-sync-recovery").start()
+    threading.Thread(target=_startup_warm_cache, daemon=True, name="startup-warm").start()
 
 def run_pending_waves_refresh_in_background():
     global is_refreshing_pending_waves
     try:
-        data = query_pending_waves_from_bigquery()
+        data = query_pending_waves()
         with pending_waves_cache_lock:
             pending_waves_cache["data"] = data
             pending_waves_cache["expires_at"] = time.time() + PENDING_WAVES_CACHE_TTL_SECONDS
@@ -5146,7 +3835,7 @@ def get_pending_waves(background_tasks: BackgroundTasks, force: bool = False):
     with is_refreshing_pending_waves_lock:
         is_refreshing_pending_waves = True
     try:
-        data = query_pending_waves_from_bigquery()
+        data = query_pending_waves()
         with pending_waves_cache_lock:
             pending_waves_cache["data"] = data
             pending_waves_cache["expires_at"] = time.time() + PENDING_WAVES_CACHE_TTL_SECONDS
@@ -5159,85 +3848,3 @@ def get_pending_waves(background_tasks: BackgroundTasks, force: bool = False):
         with is_refreshing_pending_waves_lock:
             is_refreshing_pending_waves = False
 
-
-# 🔍 [DEBUG] ตรวจการคำนวณจำนวนกล่องของ PP/SP รายตัว (read-only)
-# ใช้หาสาเหตุ "SP นับไม่ตรง": ดูว่าแต่ละบรรทัดสินค้าใน LPN เจอใน pack_case_map ไหม,
-# case_count เท่าไหร่, total_pieces เท่าไหร่, และใช้กติกา (A/B/C) ตัวไหนคำนวณ
-@app.get("/api/debug-carton")
-def debug_carton(wave_no: str, lpn: str):
-    try:
-        search_wave_id = int(wave_no.strip())
-    except ValueError:
-        raise HTTPException(status_code=400, detail="รหัส Wave ต้องเป็นตัวเลขเท่านั้น")
-
-    lpn_target = lpn.strip().upper()
-    wave_detail_str = f"{search_wave_id:010d}"
-
-    query = """
-        SELECT
-            TRIM(CAST(d.Owner AS STRING)) AS owner,
-            TRIM(CAST(d.Product_Code AS STRING)) AS product_code,
-            d.Total_Pieces AS total_pieces,
-            d.Total_Qty AS row_total_qty
-        FROM `pro-analytics-db.logistics_db.wave_lpn_detail_record` AS d
-        WHERE SAFE_CAST(REGEXP_REPLACE(TRIM(CAST(d.Wave_Number AS STRING)), r'[^0-9]', '') AS INT64) = @wave_id
-          AND TRIM(UPPER(CAST(d.LPN AS STRING))) = @lpn
-    """
-    config = bigquery.QueryJobConfig(
-        use_query_cache=True,
-        query_parameters=[
-            bigquery.ScalarQueryParameter("wave_id", "INT64", search_wave_id),
-            bigquery.ScalarQueryParameter("lpn", "STRING", lpn_target),
-        ],
-    )
-
-    try:
-        rows = list(client.query(query, job_config=config).result(timeout=BQ_JOB_TIMEOUT_SECONDS))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-    if not rows:
-        raise HTTPException(status_code=404, detail=f"ไม่พบ LPN [{lpn_target}] ใน Wave [{search_wave_id}]")
-
-    pack_case_map = load_pack_case_map()
-    breakdown = []
-    total_qty = 0
-    for r in rows:
-        owner = str(get_row_value(r, "owner", "") or "").strip().upper()
-        product_code = str(get_row_value(r, "product_code", "") or "").strip().upper()
-        pieces = to_float(get_row_value(r, "total_pieces", 0))
-        row_total_qty = to_float(get_row_value(r, "row_total_qty", 0))
-        key = f"{owner}|{product_code}"
-        case_count = pack_case_map.get(key) or pack_case_map.get(product_code)
-
-        if case_count and pieces > 0:
-            cartons = max(1, int(math.ceil(pieces / case_count)))
-            rule = "A: ceil(total_pieces / case_count)"
-        elif row_total_qty > 0:
-            cartons = max(1, int(math.ceil(row_total_qty)))
-            rule = "B: fallback ceil(row_total_qty)"
-        else:
-            cartons = 1
-            rule = "C: default 1"
-        total_qty += cartons
-
-        breakdown.append({
-            "owner": owner,
-            "product_code": product_code,
-            "pack_case_map_key": key,
-            "in_pack_case_map": case_count is not None,
-            "case_count": case_count,
-            "total_pieces": pieces,
-            "row_total_qty": row_total_qty,
-            "cartons_counted": cartons,
-            "rule_used": rule,
-        })
-
-    return {
-        "wave_no": wave_detail_str,
-        "lpn": lpn_target,
-        "is_direct_qty_prefix": is_direct_qty_lpn_value(lpn_target),
-        "detail_row_count": len(rows),
-        "computed_total_qty": total_qty if total_qty > 0 else 1,
-        "rows": breakdown,
-    }

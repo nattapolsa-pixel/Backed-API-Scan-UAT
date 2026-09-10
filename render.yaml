@@ -9,7 +9,11 @@ services:
     buildCommand: pip install --no-cache-dir -r requirements.txt
     # Cache และ single-flight locks อยู่ใน memory ของ process; ใช้ 1 worker เพื่อให้ทุก request
     # แชร์ cache เดียวกัน ส่วน FastAPI ยังรองรับ blocking Sheet I/O พร้อมกันผ่าน threadpool
+    #
+    # --timeout 120 คือเพดานของ worker ตัวเดียว: การอ่าน Member Data ย้ายไปทำเบื้องหลัง
+    # แล้ว (stale-while-revalidate) จึงไม่มี request ไหนควรใช้เวลาใกล้เพดานนี้อีก
     startCommand: gunicorn main:app -w 1 -k uvicorn.workers.UvicornWorker --worker-connections 200 --backlog 256 --bind 0.0.0.0:$PORT --timeout 120 --keep-alive 10 --graceful-timeout 20
+    # ?deep=1 เท่านั้นที่ตรวจ Google credentials; health check ปกติตอบทันทีไม่แตะเครือข่าย
     healthCheckPath: /api/health
     autoDeployTrigger: commit
     envVars:
@@ -17,13 +21,15 @@ services:
         sync: false
       - key: APP_ENV
         value: uat
-      - key: UAT_SHEETS_ONLY
-        value: "true"
+      # SCAN_FEATURE_ENABLED=false คือสถานะ hold ตาม UAT.md
+      # ทุก endpoint ของการสแกน/ปิดจบสาขาจะตอบ 423 แทนการทำงาน
       - key: SCAN_FEATURE_ENABLED
-        value: "true"
-      - key: APP_VERSION
-        value: 1.3.9-free
+        value: "false"
+      # ถ้าเปิดสแกน: true = แก้เฉพาะ state ใน memory (หายเมื่อ restart)
+      #              false = เขียนลงแท็บ Scan Transactions จริง
       - key: SCAN_DEMO_ONLY
         value: "true"
+      - key: APP_VERSION
+        value: 1.4.0-free
       - key: UAT_DATABASE_SPREADSHEET_ID
         value: 1RJcsrbWnGO7gMiq9bhBR4bA9Twh1NjqP6816dXOW9DI
