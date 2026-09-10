@@ -12,7 +12,12 @@ services:
     #
     # --timeout 120 คือเพดานของ worker ตัวเดียว: การอ่าน Member Data ย้ายไปทำเบื้องหลัง
     # แล้ว (stale-while-revalidate) จึงไม่มี request ไหนควรใช้เวลาใกล้เพดานนี้อีก
-    startCommand: gunicorn main:app -w 1 -k uvicorn.workers.UvicornWorker --worker-connections 200 --backlog 256 --bind 0.0.0.0:$PORT --timeout 120 --keep-alive 10 --graceful-timeout 20
+    #
+    # --max-requests รีไซเคิล worker เป็นระยะ เพื่อคืน RAM ก่อนจะชน 512 MB
+    # (Events ของ service เคยขึ้น "Ran out of memory" หลายรอบต่อวัน)
+    # การรีไซเคิลถูกลงเพราะ Member Data ถูก snapshot ไว้บนดิสก์แล้ว worker ใหม่
+    # อ่านจากไฟล์ ไม่ต้องดาวน์โหลด 44k แถวซ้ำ
+    startCommand: gunicorn main:app -w 1 -k uvicorn.workers.UvicornWorker --worker-connections 200 --backlog 256 --bind 0.0.0.0:$PORT --timeout 120 --keep-alive 10 --graceful-timeout 20 --max-requests 400 --max-requests-jitter 100
     # ?deep=1 เท่านั้นที่ตรวจ Google credentials; health check ปกติตอบทันทีไม่แตะเครือข่าย
     healthCheckPath: /api/health
     autoDeployTrigger: commit
