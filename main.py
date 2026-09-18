@@ -60,6 +60,7 @@ if not os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
 # get_sheets_session(), so a cold start never waits on an auth round-trip.
 APP_ENV = os.environ.get("APP_ENV", "uat").strip().lower()
 APP_VERSION = os.environ.get("APP_VERSION", "1.4.0-free").strip()
+EMPLOYEE_LOOKUP_URL = "https://script.google.com/macros/s/AKfycbybmW6N7TxfsHqEa-Fx6ayy8M8xfjKGmTYO27izmbEoLJmQRrFD3i9c0XogP0fG6tlG/exec"
 SCAN_DEMO_ONLY = os.environ.get("SCAN_DEMO_ONLY", "true").strip().lower() in ("1", "true", "yes", "on")
 # Scan is held by default.  The Render flag can be enabled briefly for an
 # isolated presentation, without changing any document workflow.
@@ -2420,6 +2421,24 @@ async def health_check(response: Response, deep: bool = False):
         },
     }
 
+@app.get("/api/employee")
+async def employee_lookup(emp_id: str, response: Response):
+    """Proxy employee verification so new devices do not depend on browser CORS to Apps Script."""
+    response.headers["Cache-Control"] = "no-store"
+    clean_id = str(emp_id or "").strip()[:80]
+    if not clean_id:
+        raise HTTPException(status_code=400, detail="emp_id is required")
+    url = EMPLOYEE_LOOKUP_URL + "?emp_id=" + urllib.parse.quote(clean_id, safe="")
+    try:
+        request = urllib.request.Request(url, headers={"User-Agent": "Pro-Scanner-UAT/1.4"})
+        with urllib.request.urlopen(request, timeout=8) as upstream:
+            payload = json.loads(upstream.read().decode("utf-8"))
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"employee service unavailable: {type(exc).__name__}")
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=502, detail="invalid employee service response")
+    return payload
+
 
 @app.get("/api/test-sheets-write")
 def test_sheets_write():
@@ -3856,4 +3875,3 @@ def get_pending_waves(background_tasks: BackgroundTasks, force: bool = False):
     finally:
         with is_refreshing_pending_waves_lock:
             is_refreshing_pending_waves = False
-
