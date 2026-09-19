@@ -1927,6 +1927,23 @@ def fetch_booking_waves(booking_no: str) -> dict:
     sheet_meta = get_sheet_meta_for_booking(booking_no)
     if not sheet_meta or not sheet_meta.get("waves"):
         sheet_meta = get_sheet_meta_for_booking(booking_no, force=True)
+    # Some newer bookings are present in Wave_Monitoring (Column I) before
+    # the auxiliary Booking & Wave tab is updated. Resolve them from the
+    # authoritative monitoring rows instead of reporting a false 404.
+    if not sheet_meta or not sheet_meta.get("waves"):
+        requested = re.sub(r"\s+", "", str(booking_no or "").upper())
+        requested_compact = requested.replace("-", "")
+        exact, _, _ = load_wave_monitoring_pick_dates(force=True)
+        monitoring_waves = sorted({
+            wave for (book, wave), _pick_date in exact.items()
+            if book in (requested, requested_compact)
+        }, key=lambda value: int(value))
+        if monitoring_waves:
+            sheet_meta = {
+                "booking": requested,
+                "waves": monitoring_waves,
+                "carrier": "", "sender": "", "plate": "",
+            }
     if not sheet_meta or not sheet_meta.get("waves"):
         raise HTTPException(status_code=404, detail=f"ไม่พบ Booking [{booking_no}] ใน Sheet Booking & Wave")
     return {
