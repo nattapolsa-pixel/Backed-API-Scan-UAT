@@ -13,6 +13,7 @@ import io
 import os
 import tempfile
 import re
+import sys
 import time
 import copy
 import uuid
@@ -136,6 +137,28 @@ def fetch_gviz_text(url: str, timeout: int = GVIZ_HTTP_TIMEOUT_SECONDS) -> str:
         if "gzip" in (response.headers.get("Content-Encoding") or "").lower():
             payload = gzip.decompress(payload)
     return payload.decode("utf-8-sig")
+
+
+def stream_gviz_lines(url: str, timeout: int = GVIZ_HTTP_TIMEOUT_SECONDS):
+    """Yield a gviz CSV export line by line, decompressing as it arrives.
+
+    Only for exports too large to hold in memory - today that is Member Data.
+    fetch_gviz_text() is still the right call for the small reads, where one
+    string is simpler than a stream.
+    """
+    request = urllib.request.Request(url, headers={
+        "User-Agent": "Pro-Scanner-UAT/1.0",
+        "Accept-Encoding": "gzip",
+    })
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        body = response
+        if "gzip" in (response.headers.get("Content-Encoding") or "").lower():
+            body = gzip.GzipFile(fileobj=response)
+        # newline="" is what the csv module requires so that a quoted field
+        # containing a line break is still read as one field.
+        text = io.TextIOWrapper(body, encoding="utf-8-sig", newline="")
+        for line in text:
+            yield line
 
 # ฐานข้อมูลเหตุการณ์ของ UAT: ทุกอย่างที่หน้าเว็บเขียนกลับ เก็บเป็น event log 6 แท็บ
 # แถวถูก append เท่านั้น และการอ่านใช้แถวล่าสุดต่อ key (ดู read_uat_event_records)
@@ -825,6 +848,14 @@ def get_document_overrides_for_wave(wave_no: str, booking_no: str = "") -> dict:
 
     exact_overrides = {}
     legacy_overrides = {}
+    # overrides must exist before the try: it is only assigned on the success
+    # path, so any failure reading the UAT sheet used to fall through to
+    # "return overrides" and raise UnboundLocalError, which FastAPI turns into a
+    # 500. One Google hiccup (quota, token refresh, timeout) therefore made
+    # EVERY check-wave and check-booking fail, not just the override lookup.
+    # Reproduced locally: "cannot access local variable 'overrides' where it is
+    # not associated with a value" on every search.
+    overrides = {}
     try:
         rows = [row for row in read_uat_event_records("Document Overrides")
                 if re.sub(r"\D", "", str(row.get("Wave_Number") or "")) == clean_wave]
@@ -1401,10 +1432,33 @@ def _history_int(value) -> int:
 _NON_DIGIT_RE = re.compile(r"\D")
 
 
-def _parse_member_history_csv(csv_text: str) -> dict:
-    """Turn the Member Data CSV export into {(wave, branch): summary}."""
+def _parse_member_history_rows(line_source) -> dict:
+    """Turn Member Data CSV lines into {(wave, branch): summary}.
+
+    Takes an *iterator of lines*, never one big string. Measured on the real
+    sheet (143,681 usable rows / 27 MB of CSV), the old
+    csv.reader(io.StringIO(fetch_gviz_text(url))) shape held the 4 MB gzip
+    payload, the 27 MB decompressed bytes, the 46.5 MB decoded str and a second
+    46.5 MB copy inside StringIO all at once - about 120 MB of pure transport
+    overhead on a 512 MB instance, on top of the 123 MB the parsed rows occupy.
+    Streaming keeps only the current line.
+
+    date/time/bu/branch repeat across tens of thousands of rows, so they are
+    shared through sys.intern instead of allocating a new str per row: measured
+    123 MB -> 92 MB retained for the same data.
+    """
     history = {}
-    rows = csv.reader(io.StringIO(csv_text))
+    shared = {}
+
+    def share(value):
+        text = str(value or "").strip()
+        cached = shared.get(text)
+        if cached is None:
+            cached = sys.intern(text)
+            shared[text] = cached
+        return cached
+
+    rows = csv.reader(line_source)
     next(rows, None)
     for row in rows:
         if len(row) < 16:
@@ -1413,16 +1467,22 @@ def _parse_member_history_csv(csv_text: str) -> dict:
         branch = str(row[3] or "").strip().upper()
         if not wave_digits or not branch:
             continue
-        wave = str(int(wave_digits))
+        wave = share(str(int(wave_digits)))
+        branch = share(branch)
         history[(wave, branch)] = {
-            "date": str(row[0] or "").strip(), "time": str(row[1] or "").strip(),
+            "date": share(row[0]), "time": share(row[1]),
             "wave": wave, "branch": branch, "branch_name": clean_branch_display_name(row[4]),
-            "bu": str(row[5] or "").strip() or "Unknown", "label_count": _history_int(row[6]),
+            "bu": share(row[5]) or "Unknown", "label_count": _history_int(row[6]),
             "m": _history_int(row[8]), "red": _history_int(row[9]), "blue": _history_int(row[10]),
             "green": _history_int(row[11]), "black": _history_int(row[12]),
             "total": _history_int(row[13]), "pallet": _history_int(row[14])
         }
     return history
+
+
+def _parse_member_history_csv(csv_text: str) -> dict:
+    """String entry point kept for callers that already hold the whole export."""
+    return _parse_member_history_rows(io.StringIO(csv_text))
 
 
 def _store_member_history(history: dict, ttl_seconds: float):
@@ -1472,7 +1532,7 @@ def _load_member_history_snapshot() -> dict:
         return {}
 
 
-def _refresh_member_history(requested_at=None) -> dict:
+def _refresh_member_history(requested_at=None, must_download: bool = False) -> dict:
     """Download and publish Member Data. Only one thread does this at a time.
 
     The refresh lock also collapses concurrent bursts: whoever arrives second
@@ -1481,33 +1541,51 @@ def _refresh_member_history(requested_at=None) -> dict:
     """
     global member_history_refreshing
     with member_history_refresh_lock:
-        now = time.time()
-        with member_history_lock:
-            cached = member_history_cache.get("data") or {}
-            if cached and (
-                (requested_at is None and member_history_cache.get("expires_at", 0) > now)
-                or (requested_at is not None and member_history_cache.get("loaded_at", 0) >= requested_at)
-            ):
-                return cached
-        url = (
-            f"https://docs.google.com/spreadsheets/d/{MEMBER_HISTORY_SPREADSHEET_ID}"
-            f"/gviz/tq?tqx=out:csv&gid={MEMBER_HISTORY_GID}"
-        )
+        # The reset must cover EVERY exit from this function, including the
+        # "someone else already refreshed" early return below. It used to sit on
+        # the download's own try/finally, so the early return leaked the flag and
+        # permanently disabled background refresh for the rest of the worker's
+        # life: load_member_history() only spawns a refresh when the flag is
+        # False. The snapshot path hit that leak on every restart, because it
+        # publishes a fresh 30s cache *before* spawning this thread, so the
+        # thread always took the early return. Symptom on the live service:
+        # /api/health reported member_data.fresh=false for as long as the worker
+        # lived, and only force=true (a synchronous full reload) ever refreshed.
         try:
-            started = time.time()
-            history = _parse_member_history_csv(fetch_gviz_text(url, timeout=MEMBER_HISTORY_HTTP_TIMEOUT))
-            if not history:
-                raise ValueError("Member Data returned no usable rows")
-            _store_member_history(history, MEMBER_HISTORY_CACHE_TTL_SECONDS)
-            _save_member_history_snapshot(history)
-            print(f"✅ Member Data loaded: {len(history)} branch summaries in {time.time() - started:.1f}s")
-            return history
-        except Exception as exc:
-            print(f"⚠️ Member Data load failed, keeping previous rows: {exc}")
+            now = time.time()
             with member_history_lock:
-                # Retry soon, but do not hammer Google while it is unhappy.
-                member_history_cache["expires_at"] = time.time() + MEMBER_HISTORY_ERROR_BACKOFF_SECONDS
-                return member_history_cache.get("data") or {}
+                cached = member_history_cache.get("data") or {}
+                # must_download is the snapshot-warm path: the cache looks fresh
+                # only because a 30s TTL was just published from the local file,
+                # so the early return would skip the download this thread exists
+                # to perform and leave the worker serving up-to-6-hour-old rows
+                # for its whole life.
+                if cached and not must_download and (
+                    (requested_at is None and member_history_cache.get("expires_at", 0) > now)
+                    or (requested_at is not None and member_history_cache.get("loaded_at", 0) >= requested_at)
+                ):
+                    return cached
+            url = (
+                f"https://docs.google.com/spreadsheets/d/{MEMBER_HISTORY_SPREADSHEET_ID}"
+                f"/gviz/tq?tqx=out:csv&gid={MEMBER_HISTORY_GID}"
+            )
+            try:
+                started = time.time()
+                history = _parse_member_history_rows(
+                    stream_gviz_lines(url, timeout=MEMBER_HISTORY_HTTP_TIMEOUT)
+                )
+                if not history:
+                    raise ValueError("Member Data returned no usable rows")
+                _store_member_history(history, MEMBER_HISTORY_CACHE_TTL_SECONDS)
+                _save_member_history_snapshot(history)
+                print(f"✅ Member Data loaded: {len(history)} branch summaries in {time.time() - started:.1f}s")
+                return history
+            except Exception as exc:
+                print(f"⚠️ Member Data load failed, keeping previous rows: {exc}")
+                with member_history_lock:
+                    # Retry soon, but do not hammer Google while it is unhappy.
+                    member_history_cache["expires_at"] = time.time() + MEMBER_HISTORY_ERROR_BACKOFF_SECONDS
+                    return member_history_cache.get("data") or {}
         finally:
             with member_history_lock:
                 member_history_refreshing = False
@@ -1526,9 +1604,21 @@ def load_member_history(force: bool = False) -> dict:
     """
     global member_history_refreshing
     if force:
-        # Do not expire a valid shared snapshot for every waiting client.
-        # A refresh completed after this request started already satisfies it.
-        return _refresh_member_history(requested_at=time.time())
+        # force no longer downloads 144k rows inside the request thread.
+        # Measured: one force=true request peaked past the 512 MB limit and the
+        # worker was killed (HTTP 502 after 13.3s), taking every other handheld's
+        # in-flight request with it, because -w 1 means one process serves
+        # everyone. The refresh is now scheduled in the background and the caller
+        # gets the current rows immediately; a Wave that is genuinely missing is
+        # read on its own through fetch_member_history_rows_for_wave(), which
+        # costs ~300 bytes instead of 27 MB.
+        schedule_member_history_refresh()
+        now = time.time()
+        with member_history_lock:
+            cached = member_history_cache.get("data") or {}
+        if cached:
+            return cached
+        return _refresh_member_history()
     now = time.time()
     with member_history_lock:
         cached = member_history_cache.get("data") or {}
@@ -1549,20 +1639,96 @@ def load_member_history(force: bool = False) -> dict:
     snapshot = _load_member_history_snapshot()
     if snapshot:
         _store_member_history(snapshot, MEMBER_HISTORY_SNAPSHOT_TTL_SECONDS)
-        with member_history_lock:
-            if not member_history_refreshing:
-                member_history_refreshing = True
-                threading.Thread(target=_refresh_member_history, daemon=True,
-                                 name="member-history-refresh").start()
+        # must_download: the snapshot is only a placeholder, the sheet is the truth.
+        schedule_member_history_refresh(must_download=True)
         return snapshot
     return _refresh_member_history()
+
+
+def schedule_member_history_refresh(must_download: bool = False) -> bool:
+    """Start at most one background Member Data refresh. Never blocks the caller."""
+    global member_history_refreshing
+    with member_history_lock:
+        if member_history_refreshing:
+            return False
+        member_history_refreshing = True
+    threading.Thread(target=_refresh_member_history, daemon=True,
+                     kwargs={"must_download": must_download},
+                     name="member-history-refresh").start()
+    return True
+
+
+# A Wave the cache has not seen is looked up on its own instead of re-reading the
+# whole sheet. Negative answers are remembered briefly so a Wave that genuinely
+# does not exist cannot turn a mistyped number into one Google query per request.
+MEMBER_HISTORY_WAVE_MISS_TTL_SECONDS = 60
+member_history_wave_miss = {}
+
+
+def fetch_member_history_rows_for_wave(wave: str) -> list:
+    """Read one Wave's rows straight from Member Data and fold them into the cache.
+
+    The WAVE column stores both zero-padded ('0000033707') and bare ('62259')
+    forms, so the query matches either. Measured cost: ~300 bytes on the wire and
+    2.7-3.7s of Google query time for the 2-5 rows a Wave actually has - against
+    4 MB / 27 MB / a dead worker for the full reload this replaces.
+    """
+    wave_key = str(wave).strip()
+    if not wave_key.isdigit():
+        return []
+    now = time.time()
+    with member_history_lock:
+        missed_at = member_history_wave_miss.get(wave_key, 0)
+    if now - missed_at < MEMBER_HISTORY_WAVE_MISS_TTL_SECONDS:
+        return []
+
+    padded = f"{int(wave_key):010d}"
+    query = f"select * where C = '{wave_key}' or C = '{padded}'"
+    url = (
+        f"https://docs.google.com/spreadsheets/d/{MEMBER_HISTORY_SPREADSHEET_ID}"
+        f"/gviz/tq?tqx=out:csv&gid={MEMBER_HISTORY_GID}&tq={urllib.parse.quote(query)}"
+    )
+    try:
+        found = _parse_member_history_rows(stream_gviz_lines(url, timeout=GVIZ_HTTP_TIMEOUT_SECONDS))
+    except Exception as exc:
+        print(f"⚠️ Member Data single-Wave read failed for {wave_key}: {exc}")
+        return []
+
+    rows = [row for row in found.values() if str(row.get("wave") or "") == wave_key]
+    if not rows:
+        with member_history_lock:
+            if len(member_history_wave_miss) > 512:
+                member_history_wave_miss.clear()
+            member_history_wave_miss[wave_key] = time.time()
+        return []
+
+    with member_history_lock:
+        data = member_history_cache.get("data")
+        by_wave = member_history_cache.get("by_wave")
+        if isinstance(data, dict) and isinstance(by_wave, dict):
+            for key, row in found.items():
+                data[key] = row
+            by_wave[wave_key] = rows
+            # build_member_history_items() memoises per (wave, generation), so the
+            # generation must move or it would keep serving the empty list it just
+            # cached for this Wave.
+            member_history_cache["generation"] = int(member_history_cache.get("generation") or 0) + 1
+            member_history_items_cache.clear()
+        member_history_wave_miss.pop(wave_key, None)
+    print(f"⚡ Member Data Wave {wave_key} read directly: {len(rows)} branches")
+    return rows
 
 
 def member_history_rows_for_wave(wave: str) -> list:
     """All Member Data rows for one Wave, via the index instead of a full scan."""
     load_member_history()
+    wave_key = str(wave)
     with member_history_lock:
-        return list((member_history_cache.get("by_wave") or {}).get(str(wave)) or [])
+        rows = list((member_history_cache.get("by_wave") or {}).get(wave_key) or [])
+    if rows:
+        return rows
+    # Not in this worker's snapshot: read just this Wave rather than everything.
+    return fetch_member_history_rows_for_wave(wave_key)
 
 
 def build_member_history_items(wave_no: str) -> list:
@@ -1601,6 +1767,13 @@ def build_member_history_items(wave_no: str) -> list:
     # Callers treat these items as read-only, and one Wave is rebuilt several
     # times per request (document build, overlay merge, Booking fan-out).
     # Keyed by history generation so a refresh invalidates it automatically.
+    #
+    # An empty result is never memoised: it usually means the single-Wave read
+    # was rate-limited or timed out, and caching that would keep answering
+    # "Wave not found" until the next full refresh (up to 10 minutes) even after
+    # the rows became readable.
+    if not items:
+        return items
     if len(member_history_items_cache) > MEMBER_HISTORY_ITEMS_CACHE_MAX:
         member_history_items_cache.clear()
     member_history_items_cache[cache_key] = items
@@ -2432,8 +2605,13 @@ async def read_root():
 
 # ✅ Health Check Endpoint: ตอบสนองเร็ว <5ms สำหรับ keep-alive heartbeat
 @app.get("/api/health")
-async def health_check(response: Response, deep: bool = False):
-    """Cheap by default so the keep-alive ping costs nothing; ?deep=1 verifies Google auth."""
+def health_check(response: Response, deep: bool = False):
+    """Cheap by default so the keep-alive ping costs nothing; ?deep=1 verifies Google auth.
+
+    Not async: this takes the blocking member_history_lock, and ?deep=1 does a
+    Google token round-trip. On an async route both would run on the event loop
+    and stall every other in-flight request on the single worker.
+    """
     response.headers["Cache-Control"] = "no-store"
     response.headers["Connection"] = "keep-alive"
     if os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip():
@@ -2472,8 +2650,15 @@ async def health_check(response: Response, deep: bool = False):
     }
 
 @app.get("/api/employee")
-async def employee_lookup(emp_id: str, response: Response):
-    """Proxy employee verification so new devices do not depend on browser CORS to Apps Script."""
+def employee_lookup(emp_id: str, response: Response):
+    """Proxy employee verification so new devices do not depend on browser CORS to Apps Script.
+
+    Deliberately NOT `async def`: the Apps Script call below is a blocking
+    urlopen with an 8 second timeout. On an async route that runs *on the event
+    loop*, so one slow login froze every other request on this service - there
+    is only one worker and every handheld shares it. A plain `def` route is run
+    in FastAPI's threadpool, where blocking I/O belongs.
+    """
     response.headers["Cache-Control"] = "no-store"
     clean_id = str(emp_id or "").strip()[:80]
     if not clean_id:
@@ -3181,13 +3366,22 @@ def check_wave(wave_no: str, force: bool = False):
         try:
             raw_data = get_wave_data_internal(wave_no, force_refresh=force)
         except HTTPException as exc:
-            history_items = build_member_history_items(wave_no)
-            if exc.status_code != 404 or not history_items:
+            if exc.status_code != 404:
                 raise
-            raw_data = {
-                "wave_no": f"{int(str(wave_no).strip()):010d}", "booking_no": "",
-                "license_plate": "", "lpn_list": history_items, "zone_summary": []
-            }
+            # A Wave can be added to Member Data after the Free instance has
+            # warmed its 10-minute cache. Re-read once before reporting 404;
+            # this avoids a false "server unavailable" modal for new rows.
+            load_member_history(force=True)
+            try:
+                raw_data = get_wave_data_internal(wave_no, force_refresh=False)
+            except HTTPException:
+                history_items = build_member_history_items(wave_no)
+                if not history_items:
+                    raise
+                raw_data = {
+                    "wave_no": f"{int(str(wave_no).strip()):010d}", "booking_no": "",
+                    "license_plate": "", "lpn_list": history_items, "zone_summary": []
+                }
         # Apply the in-memory scan overlays dynamically
         overlaid_data = apply_local_overlay(wave_no, raw_data)
         result = merge_member_history(overlaid_data, wave_no)
