@@ -583,6 +583,7 @@ def normalize_booking_key(value: str) -> str:
 
 def load_booking_wave_sheet_meta(force: bool = False) -> tuple:
     now = time.time()
+    requested_at = now
     with booking_wave_sheet_lock:
         if not force and booking_wave_sheet_cache["expires_at"] > now:
             return booking_wave_sheet_cache["bookings"], booking_wave_sheet_cache["waves"]
@@ -590,7 +591,8 @@ def load_booking_wave_sheet_meta(force: bool = False) -> tuple:
     with booking_wave_sheet_refresh_lock:
         now = time.time()
         with booking_wave_sheet_lock:
-            if not force and booking_wave_sheet_cache["expires_at"] > now:
+            if ((not force and booking_wave_sheet_cache["expires_at"] > now)
+                    or booking_wave_sheet_cache.get("loaded_at", 0) >= requested_at):
                 return booking_wave_sheet_cache["bookings"], booking_wave_sheet_cache["waves"]
 
         booking_map = {}
@@ -648,7 +650,8 @@ def load_booking_wave_sheet_meta(force: bool = False) -> tuple:
             with booking_wave_sheet_lock:
                 booking_wave_sheet_cache["bookings"] = booking_map
                 booking_wave_sheet_cache["waves"] = wave_map
-                booking_wave_sheet_cache["expires_at"] = now + BOOKING_WAVE_SHEET_CACHE_TTL_SECONDS
+                booking_wave_sheet_cache["loaded_at"] = time.time()
+                booking_wave_sheet_cache["expires_at"] = time.time() + BOOKING_WAVE_SHEET_CACHE_TTL_SECONDS
         except Exception as e:
             print(f"⚠️ Error loading Booking & Wave Google Sheet meta: {e}")
             with booking_wave_sheet_lock:
@@ -713,14 +716,27 @@ def _parse_pick_date(value):
     return None
 
 
+wave_monitoring_refresh_lock = Lock()
+
+
 def load_wave_monitoring_pick_dates(force: bool = False) -> tuple:
+    # Publish whole snapshots; readers never mutate their maps or branch sets.
+    # Coalesce simultaneous cold/forced reads into one Google request.
+    requested_at = time.time()
+    with wave_monitoring_refresh_lock:
+        if wave_monitoring_pick_date_cache.get("loaded_at", 0) >= requested_at:
+            force = False
+        return _load_wave_monitoring_pick_dates(force)
+
+
+def _load_wave_monitoring_pick_dates(force: bool = False) -> tuple:
     """Load Wave(A), Planned Pick Date(B), Booking(I) without touching Delivery report."""
     now = time.time()
     with wave_monitoring_pick_date_lock:
         if not force and wave_monitoring_pick_date_cache["expires_at"] > now:
-            return (copy.deepcopy(wave_monitoring_pick_date_cache["exact"]),
-                    copy.deepcopy(wave_monitoring_pick_date_cache["waves"]),
-                    copy.deepcopy(wave_monitoring_pick_date_cache["branches"]))
+            return (wave_monitoring_pick_date_cache["exact"],
+                    wave_monitoring_pick_date_cache["waves"],
+                    wave_monitoring_pick_date_cache["branches"])
 
     exact = {}
     wave_dates = {}
@@ -758,6 +774,7 @@ def load_wave_monitoring_pick_dates(force: bool = False) -> tuple:
         with wave_monitoring_pick_date_lock:
             wave_monitoring_pick_date_cache.update({
                 "expires_at": time.time() + WAVE_MONITORING_CACHE_TTL_SECONDS,
+                "loaded_at": time.time(),
                 "exact": exact, "waves": wave_dates, "branches": expected_branches,
             })
     except Exception as exc:
@@ -1455,7 +1472,7 @@ def _load_member_history_snapshot() -> dict:
         return {}
 
 
-def _refresh_member_history() -> dict:
+def _refresh_member_history(requested_at=None) -> dict:
     """Download and publish Member Data. Only one thread does this at a time.
 
     The refresh lock also collapses concurrent bursts: whoever arrives second
@@ -1467,7 +1484,10 @@ def _refresh_member_history() -> dict:
         now = time.time()
         with member_history_lock:
             cached = member_history_cache.get("data") or {}
-            if cached and member_history_cache.get("expires_at", 0) > now:
+            if cached and (
+                (requested_at is None and member_history_cache.get("expires_at", 0) > now)
+                or (requested_at is not None and member_history_cache.get("loaded_at", 0) >= requested_at)
+            ):
                 return cached
         url = (
             f"https://docs.google.com/spreadsheets/d/{MEMBER_HISTORY_SPREADSHEET_ID}"
@@ -1506,9 +1526,9 @@ def load_member_history(force: bool = False) -> dict:
     """
     global member_history_refreshing
     if force:
-        with member_history_lock:
-            member_history_cache["expires_at"] = 0.0
-        return _refresh_member_history()
+        # Do not expire a valid shared snapshot for every waiting client.
+        # A refresh completed after this request started already satisfies it.
+        return _refresh_member_history(requested_at=time.time())
     now = time.time()
     with member_history_lock:
         cached = member_history_cache.get("data") or {}
@@ -1611,7 +1631,9 @@ def build_uat_wave_data(wave_no: str) -> dict:
         wave = str(int(str(wave_no).strip()))
     except ValueError:
         raise HTTPException(status_code=400, detail="รหัส Wave ต้องเป็นตัวเลขเท่านั้น")
-    items = build_member_history_items(wave)
+    # This model may append overrides and callers may edit nested fields.
+    # Never mutate the reusable per-Wave cache.
+    items = copy.deepcopy(build_member_history_items(wave))
     meta = get_sheet_meta_for_wave(wave)
     booking = str(meta.get("booking") or "").strip().upper()
     overrides = get_document_overrides_for_wave(wave, booking)
@@ -3782,18 +3804,35 @@ def member_history_status():
 
 def query_pending_waves():
     """Latest 50 Waves from Member Data, newest recorded first (no extra Sheet I/O)."""
+    parsed_dates = {}
     def history_sort_key(row):
+        raw = (str(row.get('date') or '').strip(), str(row.get('time') or '').strip())
+        if raw in parsed_dates:
+            return parsed_dates[raw]
         try:
-            return datetime.datetime.strptime(
-                f"{str(row.get('date') or '').strip()} {str(row.get('time') or '').strip()}",
+            value = datetime.datetime.strptime(
+                f"{raw[0]} {raw[1]}",
                 "%d/%m/%Y %H:%M",
             )
         except ValueError:
-            return datetime.datetime.min
+            value = datetime.datetime.min
+        parsed_dates[raw] = value
+        return value
 
     # Member Data อาจมี Wave เก่าที่กรอกเลขผิด จึงเรียงตามวัน/เวลาบันทึกจริง
     # และคืนแต่ละ Wave เพียงครั้งเดียว แทนการเรียงจากเลข Wave อย่างเดียว
-    recent_rows = sorted(load_member_history().values(), key=history_sort_key, reverse=True)
+    # Rank each Wave once instead of sorting every historical branch row.
+    # Keep the first row on ties, matching the stable ordering of the old sort.
+    latest_by_wave = {}
+    for row in load_member_history().values():
+        wave = str(row.get("wave") or "").strip()
+        if not wave.isdigit():
+            continue
+        stamp = history_sort_key(row)
+        previous = latest_by_wave.get(wave)
+        if previous is None or stamp > previous[0]:
+            latest_by_wave[wave] = (stamp, row)
+    recent_rows = [row for _, row in sorted(latest_by_wave.values(), key=lambda item: item[0], reverse=True)]
     wave_ids = []
     seen = set()
     for row in recent_rows:
@@ -3814,6 +3853,21 @@ def query_pending_waves():
 
 def _startup_warm_cache():
     """Free plan: warm every Sheet cache in one background flow so the first request is fast."""
+    def warm_source(label, loader):
+        try:
+            loader()
+        except Exception as exc:
+            print(f"⚠️ {label} warm-up skipped: {exc}")
+
+    # These independent network reads used to wait behind the entire Member
+    # Data download. Bound concurrency to three source downloads on Free.
+    source_threads = []
+    for label, loader in (("booking-meta", load_booking_wave_sheet_meta),
+                          ("pick-dates", load_wave_monitoring_pick_dates)):
+        worker = threading.Thread(target=warm_source, args=(label, loader),
+                                  daemon=True, name=f"warm-{label}")
+        worker.start()
+        source_threads.append(worker)
     # 1) Member Data first: every document read depends on it, so loading it here
     #    means a request arriving during warm-up waits once instead of twice.
     try:
@@ -3833,17 +3887,17 @@ def _startup_warm_cache():
 
     # 3) Everything the first Wave/Booking search would otherwise load on demand.
     for label, warm in (
-        ("Booking & Wave", lambda: load_booking_wave_sheet_meta(force=True)),
         ("UAT event tabs", ensure_uat_event_sheets),
         ("branch moves", get_booking_branch_assignments),
         ("branch splits", get_booking_branch_splits),
-        ("pick dates", lambda: load_wave_monitoring_pick_dates(force=True)),
     ):
         try:
             warm()
         except Exception as exc:
             # A cold start must never fail because one Sheet is briefly unreachable.
             print(f"⚠️ {label} warm-up skipped: {exc}")
+    for worker in source_threads:
+        worker.join()
     print("✅ Startup warm-up complete (Google Sheets only)")
 
 
