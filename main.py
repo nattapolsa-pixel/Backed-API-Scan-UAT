@@ -577,6 +577,10 @@ booking_wave_sheet_lock = Lock()
 booking_wave_sheet_refresh_lock = Lock()
 BOOKING_WAVE_SHEET_CACHE_TTL_SECONDS = 10 * 60
 
+def normalize_booking_key(value: str) -> str:
+    """Canonical comparison key for Booking values copied from Sheets."""
+    return re.sub(r"[^A-Z0-9]", "", str(value or "").upper())
+
 def load_booking_wave_sheet_meta(force: bool = False) -> tuple:
     now = time.time()
     with booking_wave_sheet_lock:
@@ -615,6 +619,7 @@ def load_booking_wave_sheet_meta(force: bool = False) -> tuple:
                     waves = [str(int(x)) for x in re.findall(r"\b\d{5,}\b", w)]
                     clean_b = re.sub(r"\s+", "", b.upper())
                     compact_b = clean_b.replace("-", "")
+                    canonical_b = normalize_booking_key(clean_b)
                     raw_num = re.sub(r"^B0*1*", "", compact_b)
                     entry = {
                         "booking": clean_b,
@@ -626,6 +631,8 @@ def load_booking_wave_sheet_meta(force: bool = False) -> tuple:
                     if clean_b:
                         booking_map[clean_b] = entry
                         booking_map[compact_b] = entry
+                        if canonical_b:
+                            booking_map[canonical_b] = entry
                         if raw_num:
                             booking_map[raw_num] = entry
                             booking_map[f"B001-{raw_num}"] = entry
@@ -671,7 +678,9 @@ def get_sheet_meta_for_booking(booking_no: str, force: bool = False) -> dict:
     booking_map, _ = load_booking_wave_sheet_meta(force=force)
     compact = clean_b.replace("-", "")
     raw_num = re.sub(r"^B0*1*", "", compact)
-    return booking_map.get(clean_b) or booking_map.get(compact) or booking_map.get(raw_num) or booking_map.get(f"B001-{raw_num}") or {}
+    return (booking_map.get(clean_b) or booking_map.get(compact)
+            or booking_map.get(normalize_booking_key(clean_b))
+            or booking_map.get(raw_num) or booking_map.get(f"B001-{raw_num}") or {})
 
 
 def _wave_tokens(value) -> list:
@@ -1933,10 +1942,12 @@ def fetch_booking_waves(booking_no: str) -> dict:
     if not sheet_meta or not sheet_meta.get("waves"):
         requested = re.sub(r"\s+", "", str(booking_no or "").upper())
         requested_compact = requested.replace("-", "")
+        requested_key = normalize_booking_key(requested)
         exact, _, _ = load_wave_monitoring_pick_dates(force=True)
         monitoring_waves = sorted({
             wave for (book, wave), _pick_date in exact.items()
-            if book in (requested, requested_compact)
+            if book in (requested, requested_compact, requested_key)
+            or normalize_booking_key(book) == requested_key
         }, key=lambda value: int(value))
         if monitoring_waves:
             sheet_meta = {
