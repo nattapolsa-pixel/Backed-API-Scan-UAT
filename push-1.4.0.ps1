@@ -64,21 +64,49 @@ function Push-Repo {
     Write-Host "=== $Label ===" -ForegroundColor Cyan
     Push-Location $Path
     try {
-        git rev-parse --abbrev-ref HEAD | ForEach-Object { Write-Host "branch: $_" }
+        # โฟลเดอร์เหล่านี้เป็น git worktree ที่ชื่อ branch ในเครื่องไม่ตรงกับ branch
+        # ปลายทาง (เช่น codex/optimize-uat-standard -> uat/main) ทำให้ `git push`
+        # เปล่า ๆ ไม่ทำงาน จึงต้องอ่าน upstream แล้วระบุปลายทางให้ชัด
+        $branch = (git rev-parse --abbrev-ref HEAD).Trim()
+        $upstream = (git rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>$null)
+        if (-not $upstream) {
+            Write-Host "branch: $branch (ไม่มี upstream — ข้าม ต้อง push เองครั้งแรก)" -ForegroundColor Yellow
+            return
+        }
+        $upstream = $upstream.Trim()
+        $remote, $remoteBranch = $upstream -split '/', 2
+        Write-Host "branch: $branch  ->  $remote/$remoteBranch"
+
         git status --short
-        if (-not (git status --porcelain)) {
-            Write-Host 'ไม่มีอะไรเปลี่ยน ข้าม' -ForegroundColor Yellow
+        if (git status --porcelain) {
+            if ($DryRun) {
+                Write-Host '--- DryRun: จะ commit ด้วยข้อความนี้ ---' -ForegroundColor Yellow
+                Write-Host $Message
+            }
+            else {
+                git add -A
+                git commit -m $Message
+            }
+        }
+        else {
+            Write-Host 'ไม่มีไฟล์ที่เปลี่ยน' -ForegroundColor Yellow
+        }
+
+        git fetch $remote --quiet
+        $pending = git log --oneline "$remote/$remoteBranch..HEAD"
+        if (-not $pending) {
+            Write-Host "ไม่มี commit ค้างส่ง $remote/$remoteBranch ตรงกันแล้ว" -ForegroundColor Yellow
             return
         }
+        Write-Host 'commit ที่จะ push:' -ForegroundColor Cyan
+        $pending | ForEach-Object { Write-Host "  $_" }
+
         if ($DryRun) {
-            Write-Host '--- DryRun: จะ commit ด้วยข้อความนี้ ---' -ForegroundColor Yellow
-            Write-Host $Message
+            Write-Host "--- DryRun: จะรัน  git push $remote HEAD:$remoteBranch ---" -ForegroundColor Yellow
             return
         }
-        git add -A
-        git commit -m $Message
-        git push
-        Write-Host "$Label pushed" -ForegroundColor Green
+        git push $remote "HEAD:$remoteBranch"
+        Write-Host "$Label pushed -> $remote/$remoteBranch" -ForegroundColor Green
     }
     finally { Pop-Location }
 }
