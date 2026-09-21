@@ -1616,6 +1616,45 @@ def _parse_member_history_csv(csv_text: str) -> dict:
     return _parse_member_history_rows(io.StringIO(csv_text))
 
 
+# Member Data's date column mixes Buddhist and Gregorian years: 2568/2569 and
+# 2026 both appear, and 7/9/2026 and 7/9/2569 are the SAME day in the live sheet.
+# A year past 2400 is therefore BE and must lose 543 before anything groups by it.
+MEMBER_HISTORY_RECENT_DAYS = 45
+_member_history_date_iso = {}
+
+
+def _member_history_row_date(row) -> str:
+    """ISO date for one Member Data row. Memoised: 144k rows share ~320 dates."""
+    raw = str(row.get("date") or "").strip()
+    if not raw:
+        return ""
+    cached = _member_history_date_iso.get(raw)
+    if cached is not None:
+        return cached
+    iso = ""
+    parts = re.split(r"[/\-.]", raw)
+    if len(parts) == 3:
+        try:
+            day, month, year = (int(part) for part in parts)
+            if year > 2400:
+                year -= 543
+            elif year < 100:
+                year += 2000
+            iso = datetime.date(year, month, day).isoformat()
+        except ValueError:
+            iso = ""
+    if len(_member_history_date_iso) < 4096:
+        _member_history_date_iso[raw] = iso
+    return iso
+
+
+def member_history_branches_by_date() -> dict:
+    """{ISO date: {(wave, branch), ...}} for recent days, copied so callers can iterate."""
+    with member_history_lock:
+        source = member_history_cache.get("by_date_keys") or {}
+        return {day: set(keys) for day, keys in source.items()}
+
+
 def _store_member_history(history: dict, ttl_seconds: float):
     """Publish a loaded history plus the per-Wave index every read needs.
 
@@ -1623,8 +1662,16 @@ def _store_member_history(history: dict, ttl_seconds: float):
     Waves did that five times per request.
     """
     by_wave = {}
+    by_date_keys = {}
+    # Only recent days are indexed: the dashboard never looks back more than 30
+    # days, and keeping all ~320 dates would hold 144k extra tuples on a 512 MB
+    # instance for numbers nothing reads.
+    recent_cutoff = (datetime.date.today() - datetime.timedelta(days=MEMBER_HISTORY_RECENT_DAYS)).isoformat()
     for row in history.values():
         by_wave.setdefault(row["wave"], []).append(row)
+        row_day = _member_history_row_date(row)
+        if row_day and row_day >= recent_cutoff:
+            by_date_keys.setdefault(row_day, set()).add((row["wave"], row["branch"]))
     carried = 0
     with member_history_lock:
         # Rows that arrived through fetch_member_history_rows_for_wave() are
@@ -1646,9 +1693,13 @@ def _store_member_history(history: dict, ttl_seconds: float):
             by_wave[wave_key] = kept
             for row in kept:
                 history.setdefault((row["wave"], row["branch"]), row)
+                row_day = _member_history_row_date(row)
+                if row_day and row_day >= recent_cutoff:
+                    by_date_keys.setdefault(row_day, set()).add((row["wave"], row["branch"]))
             carried += 1
         member_history_cache["data"] = history
         member_history_cache["by_wave"] = by_wave
+        member_history_cache["by_date_keys"] = by_date_keys
         member_history_cache["expires_at"] = time.time() + ttl_seconds
         member_history_cache["loaded_at"] = time.time()
         member_history_cache["generation"] = int(member_history_cache.get("generation") or 0) + 1
@@ -2016,6 +2067,12 @@ def fetch_member_history_rows_for_wave(wave: str) -> list:
             for key, row in found.items():
                 data[key] = row
             by_wave[wave_key] = rows
+            date_index = member_history_cache.get("by_date_keys")
+            if isinstance(date_index, dict):
+                for row in rows:
+                    row_day = _member_history_row_date(row)
+                    if row_day:
+                        date_index.setdefault(row_day, set()).add((row["wave"], row["branch"]))
             # Survive the next full refresh, which rebuilds by_wave from the
             # download alone (see _store_member_history).
             if len(member_history_direct_waves) > 256:
@@ -3152,20 +3209,35 @@ def _dashboard_reference_matches(row: dict, query: str) -> bool:
                for field in ("booking", "wave", "branch"))
 
 
-def _dashboard_correction_metrics(range_from, range_to, query: str) -> dict:
-    """Summarise real quantity corrections, excluding moves/splits/add-point rows.
+# The document page sends a full quantity payload for show/hide actions too, so
+# these reasons must never be read as a hand-edited total.
+DOCUMENT_VISIBILITY_REASONS = {"hide_branch", "restore_branch", "restore_all_branches"}
 
-    A correction is counted only when an override differs from the branch's
-    last closed/original snapshot. This prevents newly added branches and
-    transfer/split operations from being reported as bad data entry.
+
+def _dashboard_correction_metrics(range_from, range_to, query: str) -> dict:
+    """Daily data-entry accuracy: branches counted vs branches whose totals were hand-edited.
+
+    The denominator comes from Member Data: one row per (Wave, branch) carries
+    the date its totals were recorded, so "reviewed" is the work that actually
+    happened that day. Branch Close Status cannot be the baseline on this
+    deployment - /api/close-job is held behind SCAN_FEATURE_ENABLED (HTTP 423),
+    so that tab holds 0 rows and every single day used to report 0 reviewed /
+    0 corrected while the override log held 658 real edits.
+
+    The numerator counts a branch once per day when someone saved a manual
+    total for it. The document page only sends branches the operator actually
+    edited, so one row is one hand correction. Visibility actions and branches
+    moved or split between Bookings are excluded: that is transport
+    re-planning, not a data-entry mistake.
     """
+    definition = ("แก้ไขยอด = สาขาที่พนักงานกดบันทึกแก้ยอดกล่องเองในเอกสาร "
+                  "เทียบกับสาขาที่บันทึกยอดใน Member Data วันนั้น "
+                  "(ไม่รวมซ่อน/แสดงสาขา, ย้ายทั้งสาขา, แบ่งบางส่วน)")
     empty = {"summary": {"reviewed_branch_count": 0, "corrected_branch_count": 0,
                           "correct_branch_count": 0, "correction_rate_pct": 0},
-             "daily": [],
-             "definition": "แก้ไขยอด = ยอดหลังแก้ต่างจากยอดเดิม; ไม่รวมเพิ่มจุด/ย้ายสาขา/แบ่งบางส่วน"}
+             "daily": [], "definition": definition}
     try:
         overrides = read_uat_event_records("Document Overrides")
-        closes = read_uat_event_records("Branch Close Status")
         moves = read_uat_event_records("Booking Branch Moves")
         splits = read_uat_event_records("Booking Branch Splits")
     except Exception as exc:
@@ -3175,12 +3247,12 @@ def _dashboard_correction_metrics(range_from, range_to, query: str) -> dict:
     def norm(value):
         return re.sub(r"\s+", "", str(value or "").strip().upper())
 
-    def wave(value):
+    def wave_of(value):
         digits = re.sub(r"\D", "", str(value or ""))
         return str(int(digits)) if digits else ""
 
     def branch_key(row, booking_field="Booking_No"):
-        return (wave(row.get("Wave_Number")), norm(row.get(booking_field)), norm(row.get("Branch_Code")))
+        return (wave_of(row.get("Wave_Number")), norm(row.get(booking_field)), norm(row.get("Branch_Code")))
 
     excluded = set()
     for row in moves:
@@ -3192,44 +3264,47 @@ def _dashboard_correction_metrics(range_from, range_to, query: str) -> dict:
         if key[0] and key[2]:
             excluded.add((key[0], key[2]))
 
-    fields = ("M_Count", "Red_Count", "Blue_Count", "Green_Count", "Black_Count", "Total_Count", "Pallet_Count")
-    def values(row):
-        result = []
-        for field in fields:
-            try:
-                result.append(int(float(str(row.get(field) or 0).replace(",", ""))))
-            except (TypeError, ValueError):
-                result.append(0)
-        return tuple(result)
-
-    baseline = {}
+    # Read the baseline from the warm cache only. A supervisor opening the
+    # dashboard must never trigger the cold 144k-row download: that is the
+    # request that used to take the whole worker past 512 MB.
+    try:
+        with member_history_lock:
+            warm = bool(member_history_cache.get("data"))
+        if warm:
+            load_member_history()
+        else:
+            schedule_member_history_refresh()
+            print("Dashboard corrections baseline not warm yet; reporting edits only")
+    except Exception as exc:
+        print(f"Dashboard corrections baseline unavailable: {str(exc)[:160]}")
     reviewed_by_day = {}
     reviewed_keys = set()
-    for row in closes:
-        key = branch_key(row)
-        if not key[0] or not key[2] or (key[0], key[2]) in excluded:
+    for day_iso, keys in member_history_branches_by_date().items():
+        try:
+            day = datetime.date.fromisoformat(day_iso)
+        except ValueError:
             continue
-        baseline[key] = values(row)
-        created = _parse_event_datetime(row.get("Created_At"))
-        if created:
-            day = created.astimezone(datetime.timezone(datetime.timedelta(hours=7))).date()
-            if range_from <= day <= range_to and _dashboard_reference_matches(
-                    {"wave": key[0], "booking": key[1], "branch": key[2]}, query):
-                reviewed_keys.add(key)
-                reviewed_by_day[day.isoformat()] = reviewed_by_day.get(day.isoformat(), 0) + 1
+        if not (range_from <= day <= range_to):
+            continue
+        matched = {key for key in keys if _dashboard_reference_matches(
+            {"wave": key[0], "booking": "", "branch": key[1]}, query)}
+        if matched:
+            reviewed_by_day[day_iso] = len(matched)
+            reviewed_keys.update(matched)
 
     corrected_by_day = {}
     corrected_keys = set()
     for row in overrides:
         if norm(row.get("Action")) != "UPSERT":
             continue
+        if str(row.get("Is_Hidden") or "").strip().lower() in ("1", "true", "yes"):
+            continue
+        if str(row.get("Reason") or "").strip().lower() in DOCUMENT_VISIBILITY_REASONS:
+            continue
         key = branch_key(row)
         if not key[0] or not key[2] or (key[0], key[2]) in excluded:
             continue
         if not _dashboard_reference_matches({"wave": key[0], "booking": key[1], "branch": key[2]}, query):
-            continue
-        original = baseline.get(key) or baseline.get((key[0], "", key[2]))
-        if original is None or values(row) == original:
             continue
         created = _parse_event_datetime(row.get("Created_At"))
         if not created:
@@ -3237,30 +3312,30 @@ def _dashboard_correction_metrics(range_from, range_to, query: str) -> dict:
         day = created.astimezone(datetime.timezone(datetime.timedelta(hours=7))).date()
         if not (range_from <= day <= range_to):
             continue
-        unique = (day.isoformat(), key[0], key[1], key[2])
+        # One branch edited three times in a day is one branch, not three.
+        unique = (day.isoformat(), key[0], key[2])
         if unique in corrected_keys:
             continue
         corrected_keys.add(unique)
         corrected_by_day[day.isoformat()] = corrected_by_day.get(day.isoformat(), 0) + 1
 
-    date_keys = [(range_from + datetime.timedelta(days=i)).isoformat()
-                 for i in range((range_to - range_from).days + 1)]
     daily = []
-    for date_key in date_keys:
+    for offset in range((range_to - range_from).days + 1):
+        date_key = (range_from + datetime.timedelta(days=offset)).isoformat()
         reviewed = reviewed_by_day.get(date_key, 0)
         corrected = corrected_by_day.get(date_key, 0)
         daily.append({"date": date_key, "reviewed_branch_count": reviewed,
                       "corrected_branch_count": corrected,
                       "correct_branch_count": max(0, reviewed - corrected),
-                      "correction_rate_pct": round(corrected / reviewed * 100, 1) if reviewed else 0})
+                      "correction_rate_pct": min(100.0, round(corrected / reviewed * 100, 1)) if reviewed else 0})
     reviewed_total = len(reviewed_keys)
     corrected_total = len(corrected_keys)
     return {"summary": {"reviewed_branch_count": reviewed_total,
                          "corrected_branch_count": corrected_total,
                          "correct_branch_count": max(0, reviewed_total - corrected_total),
-                         "correction_rate_pct": round(corrected_total / reviewed_total * 100, 1) if reviewed_total else 0},
+                         "correction_rate_pct": min(100.0, round(corrected_total / reviewed_total * 100, 1)) if reviewed_total else 0},
             "daily": daily,
-            "definition": "แก้ไขยอด = ยอดหลังแก้ต่างจากยอดเดิม; ไม่รวมเพิ่มจุด/ย้ายสาขา/แบ่งบางส่วน"}
+            "definition": definition}
 
 
 @app.post("/api/usage-event")
