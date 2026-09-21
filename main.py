@@ -60,7 +60,7 @@ if not os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
 # Google Sheets is the only data source. Credentials are loaded lazily by
 # get_sheets_session(), so a cold start never waits on an auth round-trip.
 APP_ENV = os.environ.get("APP_ENV", "uat").strip().lower()
-APP_VERSION = os.environ.get("APP_VERSION", "1.4.0-free").strip()
+APP_VERSION = os.environ.get("APP_VERSION", "1.4.1-free").strip()
 EMPLOYEE_LOOKUP_URL = "https://script.google.com/macros/s/AKfycbybmW6N7TxfsHqEa-Fx6ayy8M8xfjKGmTYO27izmbEoLJmQRrFD3i9c0XogP0fG6tlG/exec"
 SCAN_DEMO_ONLY = os.environ.get("SCAN_DEMO_ONLY", "true").strip().lower() in ("1", "true", "yes", "on")
 # Scan is held by default.  The Render flag can be enabled briefly for an
@@ -92,6 +92,9 @@ member_history_items_cache = {}
 member_history_refreshing = False
 member_history_lock = Lock()
 member_history_refresh_lock = Lock()
+# Guards the cold-cache path (snapshot restore / first download) so only one
+# thread ever builds a dataset while the cache is empty.
+member_history_cold_lock = Lock()
 member_history_row_cache = {"expires_at": 0.0, "existing_map": {}, "last_data_row": 1}
 
 # UAT only: isolated reconciliation target.  This is deliberately separate
@@ -731,7 +734,9 @@ def _parse_pick_date(value):
     if not text:
         return None
     text = text.split("T", 1)[0].strip()
-    for pattern in ("%Y-%m-%d", "%d/%m/%Y", "%Y/%m/%d"):
+    # d/m/Y first: Wave_Monitoring stores Thai-format dates, so trying ISO first
+    # raised and swallowed a ValueError for all 17,190 rows on every read.
+    for pattern in ("%d/%m/%Y", "%Y-%m-%d", "%Y/%m/%d"):
         try:
             return datetime.datetime.strptime(text, pattern).date()
         except ValueError:
@@ -740,16 +745,58 @@ def _parse_pick_date(value):
 
 
 wave_monitoring_refresh_lock = Lock()
+wave_monitoring_refreshing = False
 
 
 def load_wave_monitoring_pick_dates(force: bool = False) -> tuple:
-    # Publish whole snapshots; readers never mutate their maps or branch sets.
-    # Coalesce simultaneous cold/forced reads into one Google request.
+    """Publish whole snapshots; readers never mutate their maps or branch sets.
+
+    Stale-while-revalidate, for the same reason Member Data has it. This tab is
+    a 10.9 MB CSV export (17,190 rows) and ensure_booking_source_complete() asks
+    for it on every successful check-booking, so with a plain 5-minute TTL one
+    operator's search blocked on the whole download every five minutes - purely
+    to produce a diagnostic print().
+
+    force=True still performs a real read, because the only caller that forces
+    is resolving a Booking that was just added to the sheet and would otherwise
+    not be found at all.
+    """
+    global wave_monitoring_refreshing
+    now = time.time()
+    with wave_monitoring_pick_date_lock:
+        snapshot = (wave_monitoring_pick_date_cache.get("exact") or {},
+                    wave_monitoring_pick_date_cache.get("waves") or {},
+                    wave_monitoring_pick_date_cache.get("branches") or {})
+        has_data = bool(snapshot[0] or snapshot[1])
+        fresh = wave_monitoring_pick_date_cache.get("expires_at", 0) > now
+        spawn = has_data and not fresh and not force and not wave_monitoring_refreshing
+        if spawn:
+            wave_monitoring_refreshing = True
+
+    if has_data and not force:
+        if spawn:
+            threading.Thread(target=_refresh_wave_monitoring_pick_dates, daemon=True,
+                             name="wave-monitoring-refresh").start()
+        return snapshot
+
     requested_at = time.time()
     with wave_monitoring_refresh_lock:
         if wave_monitoring_pick_date_cache.get("loaded_at", 0) >= requested_at:
             force = False
         return _load_wave_monitoring_pick_dates(force)
+
+
+def _refresh_wave_monitoring_pick_dates():
+    """Background half of the stale-while-revalidate above."""
+    global wave_monitoring_refreshing
+    try:
+        with wave_monitoring_refresh_lock:
+            _load_wave_monitoring_pick_dates(force=True)
+    except Exception as exc:
+        print(f"⚠️ Wave_Monitoring refresh failed: {exc}")
+    finally:
+        with wave_monitoring_pick_date_lock:
+            wave_monitoring_refreshing = False
 
 
 def _load_wave_monitoring_pick_dates(force: bool = False) -> tuple:
@@ -772,14 +819,19 @@ def _load_wave_monitoring_pick_dates(force: bool = False) -> tuple:
             f"https://docs.google.com/spreadsheets/d/{WAVE_MONITORING_SPREADSHEET_ID}"
             f"/export?format=csv&gid={WAVE_MONITORING_SHEET_GID}"
         )
-        rows = list(csv.reader(io.StringIO(fetch_gviz_text(url))))
-        headers = rows[0] if rows else []
+        # Streamed, and never turned into a list: this export measures
+        # 10,872,905 bytes over 17,190 rows, and list(csv.reader(StringIO(text)))
+        # held the decoded string, a second copy inside StringIO and every parsed
+        # row at the same time - about 40 MB of transient garbage per read on a
+        # 512 MB instance.
+        reader = csv.reader(stream_gviz_lines(url, timeout=MEMBER_HISTORY_HTTP_TIMEOUT))
+        headers = next(reader, [])
         header_index = {str(name).strip(): index for index, name in enumerate(headers)}
         wave_index = header_index.get("Wave_Number", 0)
         pick_date_index = header_index.get("Planned_Pick_Date", 1)
         booking_index = header_index.get("Vehicle_Booking_No", 8)
         branch_index = header_index.get("Branch_Code", 10)
-        for row in rows[1:]:
+        for row in reader:
             required_width = max(wave_index, pick_date_index, booking_index, branch_index) + 1
             row = list(row) + [""] * max(0, required_width - len(row))
             pick_date = _parse_pick_date(row[pick_date_index])
@@ -1460,7 +1512,22 @@ def _parse_member_history_rows(line_source) -> dict:
 
     rows = csv.reader(line_source)
     next(rows, None)
+    seen = 0
     for row in rows:
+        # Hand the CPU back periodically. Render Free gives this container 0.1 CPU
+        # as a hard quota, and a ~144,000-iteration loop burns through it fast
+        # enough to get cgroup-throttled, which freezes everything in the
+        # container - not just this thread. Sleeping stops consuming quota and
+        # lets the budget refill. ~36 pauses x 5 ms costs under 0.2 s.
+        #
+        # Honest caveat: this is a cheap hedge, not a measured fix. It could not
+        # be reproduced locally (a dev machine has no CPU quota, and the parse
+        # takes 1.7 s there instead of tens of seconds), so treat it as insurance.
+        # The measured cause of the two-minute stalls was the boot-time download
+        # below, which is now skipped when the snapshot is still recent.
+        seen += 1
+        if seen % 4000 == 0:
+            time.sleep(0.005)
         if len(row) < 16:
             row = list(row) + [""] * (16 - len(row))
         wave_digits = _NON_DIGIT_RE.sub("", row[2])
@@ -1504,32 +1571,80 @@ def _store_member_history(history: dict, ttl_seconds: float):
 
 
 def _save_member_history_snapshot(history: dict):
-    """Keep a compressed copy on local disk so a worker restart skips the download."""
+    """Keep a compressed copy on local disk so a worker restart skips the download.
+
+    Written in chunks with json.dumps rather than one json.dump(handle) call:
+    json.dump streams through json's *pure-Python* encoder (iterencode with
+    _one_shot=False never reaches the C encoder), which on 143k dicts is several
+    times slower - real CPU time on a 0.1 CPU instance, every refresh. json.dumps
+    uses the C encoder, and chunking keeps the encoded string small instead of
+    building one ~59 MB blob.
+    """
+    chunk = 5000
     try:
+        rows = list(history.values())
         with gzip.open(MEMBER_HISTORY_SNAPSHOT_PATH, "wt", encoding="utf-8", compresslevel=1) as handle:
-            json.dump(list(history.values()), handle, ensure_ascii=False, separators=(",", ":"))
+            handle.write("[")
+            for start in range(0, len(rows), chunk):
+                if start:
+                    handle.write(",")
+                part = json.dumps(rows[start:start + chunk], ensure_ascii=False, separators=(",", ":"))
+                handle.write(part[1:-1])  # strip this chunk's own brackets
+            handle.write("]")
     except Exception as exc:
         print(f"⚠️ Member Data snapshot not saved: {exc}")
 
 
-def _load_member_history_snapshot() -> dict:
-    """Read the local snapshot if it is recent enough to serve while refreshing."""
+def _load_member_history_snapshot():
+    """Read the local snapshot if it is recent enough to serve while refreshing.
+
+    Returns (history, age_seconds). The age matters to the caller: a snapshot
+    written two minutes ago does not justify re-downloading 144k rows.
+    """
     try:
         age = time.time() - os.path.getmtime(MEMBER_HISTORY_SNAPSHOT_PATH)
         if age > MEMBER_HISTORY_SNAPSHOT_MAX_AGE_SECONDS:
-            return {}
+            return {}, None
         with gzip.open(MEMBER_HISTORY_SNAPSHOT_PATH, "rt", encoding="utf-8") as handle:
             rows = json.load(handle)
-        history = {(row["wave"], row["branch"]): row for row in rows
-                   if row.get("wave") and row.get("branch")}
+        # json.load shares object KEYS but allocates a fresh str for every VALUE,
+        # so a restored dataset used to cost ~43% more RAM than the same data
+        # coming from the CSV parser (measured 119.8 MB vs 83.9 MB retained).
+        # The restore path is exactly the cold-start path, so it is the one that
+        # least of all can afford to be the heavy one. Share the repeating cells
+        # the same way _parse_member_history_rows does.
+        shared = {}
+
+        def share(value):
+            text = value if isinstance(value, str) else str(value or "")
+            cached = shared.get(text)
+            if cached is None:
+                cached = sys.intern(text)
+                shared[text] = cached
+            return cached
+
+        history = {}
+        for row in rows:
+            wave = row.get("wave")
+            branch = row.get("branch")
+            if not wave or not branch:
+                continue
+            wave = share(wave)
+            branch = share(branch)
+            row["wave"] = wave
+            row["branch"] = branch
+            for field in ("date", "time", "bu", "branch_name"):
+                if field in row:
+                    row[field] = share(row[field])
+            history[(wave, branch)] = row
         if history:
             print(f"⚡ Member Data restored from local snapshot: {len(history)} rows ({int(age)}s old)")
-        return history
+        return history, age
     except FileNotFoundError:
-        return {}
+        return {}, None
     except Exception as exc:
         print(f"⚠️ Member Data snapshot unreadable: {exc}")
-        return {}
+        return {}, None
 
 
 def _refresh_member_history(requested_at=None, must_download: bool = False) -> dict:
@@ -1636,13 +1751,45 @@ def load_member_history(force: bool = False) -> dict:
         return cached
 
     # Cold cache: a snapshot from this container lets the first request answer now.
-    snapshot = _load_member_history_snapshot()
-    if snapshot:
-        _store_member_history(snapshot, MEMBER_HISTORY_SNAPSHOT_TTL_SECONDS)
-        # must_download: the snapshot is only a placeholder, the sheet is the truth.
-        schedule_member_history_refresh(must_download=True)
-        return snapshot
-    return _refresh_member_history()
+    #
+    # Single-flighted, and it MUST be. Downloads were already serialized by
+    # member_history_refresh_lock, but the snapshot restore below used to run
+    # with no lock at all, and member_history_refreshing was only set after it
+    # finished. Every request arriving in the cold window therefore ran its own
+    # json.load of all 143k rows and built its own full dataset. That window is
+    # not rare: --max-requests 400 recycles this worker every 300-500 requests,
+    # and Render Free spins the instance down after 15 idle minutes, so a fresh
+    # empty cache happens many times a day. Three handhelds scanning in the same
+    # few seconds after a recycle came to ~3 x 135 MB plus the gunicorn master
+    # plus the interpreter - past 512 MB, and the worker was OOM-killed before a
+    # single byte had been downloaded. Now one thread restores and the others
+    # wait here and reuse what it published.
+    with member_history_cold_lock:
+        with member_history_lock:
+            cached = member_history_cache.get("data") or {}
+        if cached:
+            return cached
+        snapshot, snapshot_age = _load_member_history_snapshot()
+        if snapshot:
+            # Publish it for whatever is LEFT of a normal cache lifetime instead
+            # of a flat 30 s. A snapshot written two minutes before this worker
+            # started is as good as a fresh read, and giving it 30 s meant the
+            # very next search kicked off a full 144k-row download.
+            #
+            # That download is not free on 0.1 CPU: parsing saturates the CPU
+            # quota and, under the GIL, starves every other request on the single
+            # worker. Measured on the live service: /api/health timed out twice in
+            # a row for over two minutes on an instance that had already been up
+            # for 10 minutes, then answered in 63 s, then in 0.1 s once the
+            # refresh finished. So only pay for it when the snapshot is genuinely
+            # past its useful life, and let the normal stale-while-revalidate
+            # cycle drive it from there.
+            remaining = MEMBER_HISTORY_CACHE_TTL_SECONDS - (snapshot_age or 0)
+            _store_member_history(snapshot, max(MEMBER_HISTORY_SNAPSHOT_TTL_SECONDS, remaining))
+            if remaining <= 0:
+                schedule_member_history_refresh(must_download=True)
+            return snapshot
+        return _refresh_member_history()
 
 
 def schedule_member_history_refresh(must_download: bool = False) -> bool:
@@ -1918,7 +2065,15 @@ booking_waves_cache = {}  # booking_clean -> {"mapping": dict, "expires_at": flo
 booking_waves_cache_lock = Lock()
 booking_waves_query_locks = {}
 booking_waves_query_locks_guard = Lock()
-BOOKING_METADATA_CACHE_TTL_SECONDS = 15
+# 60s, not 15s: the underlying event rows are themselves cached for
+# UAT_EVENT_CACHE_TTL_SECONDS (45s), so a 15s TTL re-derived these maps from the
+# same cached rows several times per minute - and whichever search landed on the
+# expiry paid a Sheets read. Measured on the live service, an identical
+# check-booking cost 0.15s with these maps hot and ~3.4s right after they
+# expired. Staleness is not a risk: move_booking_branch and split_booking_branch
+# both reset expires_at to 0.0 on write, so an operator's own change is visible
+# immediately regardless of this TTL.
+BOOKING_METADATA_CACHE_TTL_SECONDS = 60
 booking_assignments_cache = {"data": {}, "expires_at": 0.0}
 booking_assignments_cache_lock = Lock()
 booking_splits_cache = {"data": {}, "expires_at": 0.0}
