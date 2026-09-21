@@ -60,7 +60,7 @@ if not os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
 # Google Sheets is the only data source. Credentials are loaded lazily by
 # get_sheets_session(), so a cold start never waits on an auth round-trip.
 APP_ENV = os.environ.get("APP_ENV", "uat").strip().lower()
-APP_VERSION = os.environ.get("APP_VERSION", "1.8.5-free").strip()
+APP_VERSION = os.environ.get("APP_VERSION", "1.8.6-free").strip()
 EMPLOYEE_LOOKUP_URL = "https://script.google.com/macros/s/AKfycbybmW6N7TxfsHqEa-Fx6ayy8M8xfjKGmTYO27izmbEoLJmQRrFD3i9c0XogP0fG6tlG/exec"
 
 # รายชื่อพนักงานสำหรับช่อง "เจ้าหน้าที่" บนใบคุมส่งสินค้า
@@ -3294,6 +3294,11 @@ def _dashboard_correction_metrics(range_from, range_to, query: str) -> dict:
 
     corrected_by_day = {}
     corrected_keys = set()
+    # Boxes are read from the override row itself. A "before vs after"
+    # difference is not available: Member Data is upserted with the edited
+    # figure (write_member_history_summaries), so the pre-edit total is gone
+    # by the time anything could compare against it.
+    day_branch_boxes = {}
     for row in overrides:
         if norm(row.get("Action")) != "UPSERT":
             continue
@@ -3312,26 +3317,44 @@ def _dashboard_correction_metrics(range_from, range_to, query: str) -> dict:
         day = created.astimezone(datetime.timezone(datetime.timedelta(hours=7))).date()
         if not (range_from <= day <= range_to):
             continue
-        # One branch edited three times in a day is one branch, not three.
+        # One branch edited three times in a day is one branch, not three,
+        # and the boxes that count are the ones it was left on.
         unique = (day.isoformat(), key[0], key[2])
+        boxes = 0
+        try:
+            boxes = max(0, int(float(str(row.get("Total_Count") or 0).replace(",", ""))))
+        except (TypeError, ValueError):
+            boxes = 0
+        previous = day_branch_boxes.get(unique)
+        if previous is None or created >= previous[0]:
+            day_branch_boxes[unique] = (created, boxes)
         if unique in corrected_keys:
             continue
         corrected_keys.add(unique)
         corrected_by_day[day.isoformat()] = corrected_by_day.get(day.isoformat(), 0) + 1
+
+    boxes_by_day = {}
+    for (date_key, _wave, _branch), (_created, boxes) in day_branch_boxes.items():
+        boxes_by_day[date_key] = boxes_by_day.get(date_key, 0) + boxes
 
     daily = []
     for offset in range((range_to - range_from).days + 1):
         date_key = (range_from + datetime.timedelta(days=offset)).isoformat()
         reviewed = reviewed_by_day.get(date_key, 0)
         corrected = corrected_by_day.get(date_key, 0)
+        boxes = boxes_by_day.get(date_key, 0)
         daily.append({"date": date_key, "reviewed_branch_count": reviewed,
                       "corrected_branch_count": corrected,
+                      "corrected_box_count": boxes,
+                      "avg_box_per_corrected_branch": round(boxes / corrected, 1) if corrected else 0,
                       "correct_branch_count": max(0, reviewed - corrected),
                       "correction_rate_pct": min(100.0, round(corrected / reviewed * 100, 1)) if reviewed else 0})
     reviewed_total = len(reviewed_keys)
     corrected_total = len(corrected_keys)
+    boxes_total = sum(boxes_by_day.values())
     return {"summary": {"reviewed_branch_count": reviewed_total,
                          "corrected_branch_count": corrected_total,
+                         "corrected_box_count": boxes_total,
                          "correct_branch_count": max(0, reviewed_total - corrected_total),
                          "correction_rate_pct": min(100.0, round(corrected_total / reviewed_total * 100, 1)) if reviewed_total else 0},
             "daily": daily,
