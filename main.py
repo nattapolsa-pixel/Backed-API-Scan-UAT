@@ -60,7 +60,7 @@ if not os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
 # Google Sheets is the only data source. Credentials are loaded lazily by
 # get_sheets_session(), so a cold start never waits on an auth round-trip.
 APP_ENV = os.environ.get("APP_ENV", "uat").strip().lower()
-APP_VERSION = os.environ.get("APP_VERSION", "1.8.6-free").strip()
+APP_VERSION = os.environ.get("APP_VERSION", "1.8.7-free").strip()
 EMPLOYEE_LOOKUP_URL = "https://script.google.com/macros/s/AKfycbybmW6N7TxfsHqEa-Fx6ayy8M8xfjKGmTYO27izmbEoLJmQRrFD3i9c0XogP0fG6tlG/exec"
 
 # รายชื่อพนักงานสำหรับช่อง "เจ้าหน้าที่" บนใบคุมส่งสินค้า
@@ -3214,7 +3214,7 @@ def _dashboard_reference_matches(row: dict, query: str) -> bool:
 DOCUMENT_VISIBILITY_REASONS = {"hide_branch", "restore_branch", "restore_all_branches"}
 
 
-def _dashboard_correction_metrics(range_from, range_to, query: str) -> dict:
+def _dashboard_correction_metrics(range_from, range_to, query: str, include_branches: bool = False) -> dict:
     """Daily data-entry accuracy: branches counted vs branches whose totals were hand-edited.
 
     The denominator comes from Member Data: one row per (Wave, branch) carries
@@ -3299,6 +3299,7 @@ def _dashboard_correction_metrics(range_from, range_to, query: str) -> dict:
     # figure (write_member_history_summaries), so the pre-edit total is gone
     # by the time anything could compare against it.
     day_branch_boxes = {}
+    branch_detail = {}
     for row in overrides:
         if norm(row.get("Action")) != "UPSERT":
             continue
@@ -3328,6 +3329,23 @@ def _dashboard_correction_metrics(range_from, range_to, query: str) -> dict:
         previous = day_branch_boxes.get(unique)
         if previous is None or created >= previous[0]:
             day_branch_boxes[unique] = (created, boxes)
+            if include_branches:
+                def _count(field):
+                    try:
+                        return max(0, int(float(str(row.get(field) or 0).replace(",", ""))))
+                    except (TypeError, ValueError):
+                        return 0
+                branch_detail[unique] = {
+                    "date": day.isoformat(),
+                    "saved_at": created.astimezone(datetime.timezone(datetime.timedelta(hours=7))).strftime("%Y-%m-%d %H:%M"),
+                    "wave_no": key[0], "booking_no": key[1], "branch_code": key[2],
+                    "branch_name": str(row.get("Branch_Name") or "").strip(),
+                    "m": _count("M_Count"), "red": _count("Red_Count"), "blue": _count("Blue_Count"),
+                    "green": _count("Green_Count"), "black": _count("Black_Count"),
+                    "total": boxes, "pallet": _count("Pallet_Count"),
+                    "reason": str(row.get("Reason") or "").strip(),
+                    "emp_id": str(row.get("Emp_ID") or "").strip(),
+                }
         if unique in corrected_keys:
             continue
         corrected_keys.add(unique)
@@ -3358,7 +3376,37 @@ def _dashboard_correction_metrics(range_from, range_to, query: str) -> dict:
                          "correct_branch_count": max(0, reviewed_total - corrected_total),
                          "correction_rate_pct": min(100.0, round(corrected_total / reviewed_total * 100, 1)) if reviewed_total else 0},
             "daily": daily,
+            "branches": sorted(branch_detail.values(),
+                               key=lambda item: (item["date"], item["branch_code"])) if include_branches else [],
             "definition": definition}
+
+
+@app.get("/api/corrections-export")
+def get_corrections_export(days: int = 30, q: str = "", date_from: str = "", date_to: str = ""):
+    """The rows behind the daily accuracy card, for the dashboard's Excel export.
+
+    Deliberately not part of /api/dashboard: the branch list is a few hundred
+    rows that only matter once somebody clicks export, and this service runs one
+    worker for every handheld on the floor.
+    """
+    days = max(1, min(int(days or 30), 30))
+    query = re.sub(r"\s+", " ", str(q or "").strip()).upper()[:120]
+    bangkok_tz = datetime.timezone(datetime.timedelta(hours=7))
+    today_bkk = datetime.datetime.now(datetime.timezone.utc).astimezone(bangkok_tz).date()
+    requested_from = _parse_report_date(date_from) if date_from else None
+    requested_to = _parse_report_date(date_to) if date_to else None
+    if date_from and not requested_from:
+        raise HTTPException(status_code=400, detail="date_from must be YYYY-MM-DD")
+    if date_to and not requested_to:
+        raise HTTPException(status_code=400, detail="date_to must be YYYY-MM-DD")
+    range_to = requested_to or today_bkk
+    range_from = requested_from or (range_to - datetime.timedelta(days=days - 1))
+    if range_from > range_to:
+        raise HTTPException(status_code=400, detail="date_from must not be after date_to")
+    result = _dashboard_correction_metrics(range_from, range_to, query, include_branches=True)
+    result.update({"status": "success", "query": query,
+                   "date_from": range_from.isoformat(), "date_to": range_to.isoformat()})
+    return result
 
 
 @app.post("/api/usage-event")
