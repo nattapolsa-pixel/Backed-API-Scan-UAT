@@ -60,7 +60,7 @@ if not os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
 # Google Sheets is the only data source. Credentials are loaded lazily by
 # get_sheets_session(), so a cold start never waits on an auth round-trip.
 APP_ENV = os.environ.get("APP_ENV", "uat").strip().lower()
-APP_VERSION = os.environ.get("APP_VERSION", "1.8.4-free").strip()
+APP_VERSION = os.environ.get("APP_VERSION", "1.8.5-free").strip()
 EMPLOYEE_LOOKUP_URL = "https://script.google.com/macros/s/AKfycbybmW6N7TxfsHqEa-Fx6ayy8M8xfjKGmTYO27izmbEoLJmQRrFD3i9c0XogP0fG6tlG/exec"
 
 # รายชื่อพนักงานสำหรับช่อง "เจ้าหน้าที่" บนใบคุมส่งสินค้า
@@ -1625,13 +1625,36 @@ def _store_member_history(history: dict, ttl_seconds: float):
     by_wave = {}
     for row in history.values():
         by_wave.setdefault(row["wave"], []).append(row)
+    carried = 0
     with member_history_lock:
+        # Rows that arrived through fetch_member_history_rows_for_wave() are
+        # usually appended to the sheet AFTER this download started. Assigning
+        # both dicts wholesale used to drop them, so a Wave the operator had just
+        # found disappeared again on the next refresh and every later request had
+        # to re-query Google for it - the "it worked a second ago" flapping
+        # behind the transfer 404s. Fresh rows still win whenever the download
+        # does contain that Wave.
+        previous = member_history_cache.get("by_wave") or {}
+        for wave_key in list(member_history_direct_waves):
+            if wave_key in by_wave:
+                member_history_direct_waves.discard(wave_key)
+                continue
+            kept = previous.get(wave_key)
+            if not kept:
+                member_history_direct_waves.discard(wave_key)
+                continue
+            by_wave[wave_key] = kept
+            for row in kept:
+                history.setdefault((row["wave"], row["branch"]), row)
+            carried += 1
         member_history_cache["data"] = history
         member_history_cache["by_wave"] = by_wave
         member_history_cache["expires_at"] = time.time() + ttl_seconds
         member_history_cache["loaded_at"] = time.time()
         member_history_cache["generation"] = int(member_history_cache.get("generation") or 0) + 1
         member_history_items_cache.clear()
+    if carried:
+        print(f"⚡ Member Data refresh kept {carried} directly-read Wave(s)")
 
 
 def _save_member_history_snapshot(history: dict):
@@ -1874,6 +1897,72 @@ def schedule_member_history_refresh(must_download: bool = False) -> bool:
 # does not exist cannot turn a mistyped number into one Google query per request.
 MEMBER_HISTORY_WAVE_MISS_TTL_SECONDS = 60
 member_history_wave_miss = {}
+# A failed read and a Wave that genuinely has no rows both produce an empty list.
+# Remembering which one happened is what lets build_uat_wave_data() answer
+# "read failed, try again" (503, which the handheld retries) instead of
+# "this Wave does not exist" (404, which the scan queue dead-letters).
+MEMBER_HISTORY_READ_ERROR_TTL_SECONDS = 120
+member_history_wave_read_error = {}
+# Waves resolved one at a time are normally rows appended to the sheet after the
+# last full download started, so a completed refresh must not drop them.
+member_history_direct_waves = set()
+# gviz answers a rejected or throttled query with HTTP 200, Content-Type
+# text/csv and a ONE-LINE JSON error body. _parse_member_history_rows() skips
+# its first line as the header, so that body used to be swallowed whole: a live
+# Wave looked empty and was cached as missing for 60 s with no log line at all.
+GVIZ_ERROR_BODY_MARKERS = ('"status":"error"', '"errors":[')
+# One single-Wave read costs ~300 bytes and 2-5 s, so an explicit user action
+# can afford to repeat it rather than report a Wave that exists as missing.
+MEMBER_HISTORY_DIRECT_READ_ATTEMPTS = 3
+# Repeating a query Google just refused, with no pause, is how a throttled read
+# stays throttled. 3 attempts x ~5 s + pauses still fits the caller's budget.
+MEMBER_HISTORY_DIRECT_READ_RETRY_DELAY = 0.3
+
+
+def _member_history_csv_lines(url: str, timeout: int):
+    """Yield Member Data CSV lines, refusing a gviz error delivered as HTTP 200."""
+    stream = stream_gviz_lines(url, timeout=timeout)
+    first = next(stream, None)
+    if first is None:
+        raise ValueError("gviz returned an empty body")
+    head = first.strip()
+    if head.startswith("/*O_o*/"):
+        head = head[len("/*O_o*/"):].strip()
+    if head.startswith("{") or any(marker in head for marker in GVIZ_ERROR_BODY_MARKERS):
+        raise ValueError(f"gviz error response: {head[:200]}")
+    yield first
+    for line in stream:
+        yield line
+
+
+def _record_member_history_read_error(wave_key: str, message: str):
+    with member_history_lock:
+        if len(member_history_wave_read_error) > 512:
+            member_history_wave_read_error.clear()
+        member_history_wave_read_error[wave_key] = (time.time(), message)
+
+
+def member_history_unavailable_error(wave) -> HTTPException:
+    """The answer for "the Wave may well exist, Google just did not tell us".
+
+    503 and not 404 on purpose: the handheld retries a 503 and permanently
+    dead-letters a queued scan on a 404 (index.html, processQueue).
+    """
+    return HTTPException(status_code=503, detail=f"อ่านข้อมูล Wave [{wave}] จาก Member Data ไม่สำเร็จ กรุณาลองใหม่อีกครั้ง")
+
+
+def member_history_read_error_for_wave(wave) -> str:
+    """The recent read failure for this Wave, or '' when the read really worked."""
+    wave_key = str(wave).strip()
+    with member_history_lock:
+        entry = member_history_wave_read_error.get(wave_key)
+        if not entry:
+            return ""
+        recorded_at, message = entry
+        if time.time() - recorded_at > MEMBER_HISTORY_READ_ERROR_TTL_SECONDS:
+            member_history_wave_read_error.pop(wave_key, None)
+            return ""
+    return message
 
 
 def fetch_member_history_rows_for_wave(wave: str) -> list:
@@ -1900,17 +1989,24 @@ def fetch_member_history_rows_for_wave(wave: str) -> list:
         f"/gviz/tq?tqx=out:csv&gid={MEMBER_HISTORY_GID}&tq={urllib.parse.quote(query)}"
     )
     try:
-        found = _parse_member_history_rows(stream_gviz_lines(url, timeout=GVIZ_HTTP_TIMEOUT_SECONDS))
+        found = _parse_member_history_rows(
+            _member_history_csv_lines(url, GVIZ_HTTP_TIMEOUT_SECONDS)
+        )
     except Exception as exc:
+        # Never cache a miss here: the Wave may well exist and Google simply did
+        # not answer. Callers report "try again" instead of "not found".
+        _record_member_history_read_error(wave_key, str(exc))
         print(f"⚠️ Member Data single-Wave read failed for {wave_key}: {exc}")
         return []
 
     rows = [row for row in found.values() if str(row.get("wave") or "") == wave_key]
     if not rows:
+        # The query really did answer, and answered "no such Wave".
         with member_history_lock:
             if len(member_history_wave_miss) > 512:
                 member_history_wave_miss.clear()
             member_history_wave_miss[wave_key] = time.time()
+            member_history_wave_read_error.pop(wave_key, None)
         return []
 
     with member_history_lock:
@@ -1920,12 +2016,18 @@ def fetch_member_history_rows_for_wave(wave: str) -> list:
             for key, row in found.items():
                 data[key] = row
             by_wave[wave_key] = rows
+            # Survive the next full refresh, which rebuilds by_wave from the
+            # download alone (see _store_member_history).
+            if len(member_history_direct_waves) > 256:
+                member_history_direct_waves.clear()
+            member_history_direct_waves.add(wave_key)
             # build_member_history_items() memoises per (wave, generation), so the
             # generation must move or it would keep serving the empty list it just
             # cached for this Wave.
             member_history_cache["generation"] = int(member_history_cache.get("generation") or 0) + 1
             member_history_items_cache.clear()
         member_history_wave_miss.pop(wave_key, None)
+        member_history_wave_read_error.pop(wave_key, None)
     print(f"⚡ Member Data Wave {wave_key} read directly: {len(rows)} branches")
     return rows
 
@@ -2051,6 +2153,14 @@ def build_uat_wave_data(wave_no: str) -> dict:
                 "historical_label_count": _history_int(override.get("label_count")),
             })
     if not items:
+        # "Google did not answer" and "this Wave is not in the sheet" both land
+        # here, and they need different answers: the handheld retries a 503 and
+        # dead-letters a 404. Reporting a read failure as "not found" is what
+        # made a Wave that exists look missing to the operator.
+        read_error = member_history_read_error_for_wave(wave)
+        if read_error:
+            print(f"⚠️ Wave {wave} unavailable, Member Data read failed: {read_error}")
+            raise member_history_unavailable_error(wave)
         raise HTTPException(status_code=404, detail=f"ไม่พบ Wave [{wave}] ใน Member Data")
     return {
         "wave_no": f"{int(wave):010d}",
@@ -2454,8 +2564,8 @@ def get_booking_data_internal(booking_no: str, force_refresh: bool = False) -> d
             # that is not part of this Booking's real mapping. It must not
             # make confirmation of the newly selected Wave fail with the
             # unrelated old Wave number.
-            if wave not in native_waves and e.status_code == 404:
-                print(f"⚠️ Ignoring unavailable transferred Wave {wave} while loading Booking {booking_clean}")
+            if wave not in native_waves and e.status_code in (404, 503):
+                print(f"⚠️ Ignoring unavailable transferred Wave {wave} ({e.status_code}) while loading Booking {booking_clean}")
                 continue
             raise
         except Exception as e:
@@ -3042,6 +3152,117 @@ def _dashboard_reference_matches(row: dict, query: str) -> bool:
                for field in ("booking", "wave", "branch"))
 
 
+def _dashboard_correction_metrics(range_from, range_to, query: str) -> dict:
+    """Summarise real quantity corrections, excluding moves/splits/add-point rows.
+
+    A correction is counted only when an override differs from the branch's
+    last closed/original snapshot. This prevents newly added branches and
+    transfer/split operations from being reported as bad data entry.
+    """
+    empty = {"summary": {"reviewed_branch_count": 0, "corrected_branch_count": 0,
+                          "correct_branch_count": 0, "correction_rate_pct": 0},
+             "daily": [],
+             "definition": "แก้ไขยอด = ยอดหลังแก้ต่างจากยอดเดิม; ไม่รวมเพิ่มจุด/ย้ายสาขา/แบ่งบางส่วน"}
+    try:
+        overrides = read_uat_event_records("Document Overrides")
+        closes = read_uat_event_records("Branch Close Status")
+        moves = read_uat_event_records("Booking Branch Moves")
+        splits = read_uat_event_records("Booking Branch Splits")
+    except Exception as exc:
+        print(f"Dashboard corrections unavailable: {str(exc)[:160]}")
+        return empty
+
+    def norm(value):
+        return re.sub(r"\s+", "", str(value or "").strip().upper())
+
+    def wave(value):
+        digits = re.sub(r"\D", "", str(value or ""))
+        return str(int(digits)) if digits else ""
+
+    def branch_key(row, booking_field="Booking_No"):
+        return (wave(row.get("Wave_Number")), norm(row.get(booking_field)), norm(row.get("Branch_Code")))
+
+    excluded = set()
+    for row in moves:
+        key = branch_key(row)
+        if key[0] and key[2]:
+            excluded.add((key[0], key[2]))
+    for row in splits:
+        key = branch_key(row, "Source_Booking")
+        if key[0] and key[2]:
+            excluded.add((key[0], key[2]))
+
+    fields = ("M_Count", "Red_Count", "Blue_Count", "Green_Count", "Black_Count", "Total_Count", "Pallet_Count")
+    def values(row):
+        result = []
+        for field in fields:
+            try:
+                result.append(int(float(str(row.get(field) or 0).replace(",", ""))))
+            except (TypeError, ValueError):
+                result.append(0)
+        return tuple(result)
+
+    baseline = {}
+    reviewed_by_day = {}
+    reviewed_keys = set()
+    for row in closes:
+        key = branch_key(row)
+        if not key[0] or not key[2] or (key[0], key[2]) in excluded:
+            continue
+        baseline[key] = values(row)
+        created = _parse_event_datetime(row.get("Created_At"))
+        if created:
+            day = created.astimezone(datetime.timezone(datetime.timedelta(hours=7))).date()
+            if range_from <= day <= range_to and _dashboard_reference_matches(
+                    {"wave": key[0], "booking": key[1], "branch": key[2]}, query):
+                reviewed_keys.add(key)
+                reviewed_by_day[day.isoformat()] = reviewed_by_day.get(day.isoformat(), 0) + 1
+
+    corrected_by_day = {}
+    corrected_keys = set()
+    for row in overrides:
+        if norm(row.get("Action")) != "UPSERT":
+            continue
+        key = branch_key(row)
+        if not key[0] or not key[2] or (key[0], key[2]) in excluded:
+            continue
+        if not _dashboard_reference_matches({"wave": key[0], "booking": key[1], "branch": key[2]}, query):
+            continue
+        original = baseline.get(key) or baseline.get((key[0], "", key[2]))
+        if original is None or values(row) == original:
+            continue
+        created = _parse_event_datetime(row.get("Created_At"))
+        if not created:
+            continue
+        day = created.astimezone(datetime.timezone(datetime.timedelta(hours=7))).date()
+        if not (range_from <= day <= range_to):
+            continue
+        unique = (day.isoformat(), key[0], key[1], key[2])
+        if unique in corrected_keys:
+            continue
+        corrected_keys.add(unique)
+        corrected_by_day[day.isoformat()] = corrected_by_day.get(day.isoformat(), 0) + 1
+
+    date_keys = [(range_from + datetime.timedelta(days=i)).isoformat()
+                 for i in range((range_to - range_from).days + 1)]
+    daily = []
+    for date_key in date_keys:
+        reviewed = reviewed_by_day.get(date_key, 0)
+        corrected = corrected_by_day.get(date_key, 0)
+        daily.append({"date": date_key, "reviewed_branch_count": reviewed,
+                      "corrected_branch_count": corrected,
+                      "correct_branch_count": max(0, reviewed - corrected),
+                      "correction_rate_pct": round(corrected / reviewed * 100, 1) if reviewed else 0})
+    reviewed_total = len(reviewed_keys)
+    corrected_total = len(corrected_keys)
+    return {"summary": {"reviewed_branch_count": reviewed_total,
+                         "corrected_branch_count": corrected_total,
+                         "correct_branch_count": max(0, reviewed_total - corrected_total),
+                         "correction_rate_pct": round(corrected_total / reviewed_total * 100, 1) if reviewed_total else 0},
+            "daily": daily,
+            "definition": "แก้ไขยอด = ยอดหลังแก้ต่างจากยอดเดิม; ไม่รวมเพิ่มจุด/ย้ายสาขา/แบ่งบางส่วน"}
+
+
 @app.post("/api/usage-event")
 def record_usage_event(data: UsageEventData, background_tasks: BackgroundTasks):
     """Queue one lightweight UAT usage event; never block the user's document flow."""
@@ -3254,6 +3475,7 @@ def get_usage_dashboard(response: Response, days: int = 7, q: str = "", employee
         "peak_date": peak_day["date"] if peak_day and peak_day["total"] else None,
         "peak_total": peak_day["total"] if peak_day else 0,
     }
+    correction_metrics = _dashboard_correction_metrics(range_from, range_to, query)
 
     daily = []
     for key in date_keys:
@@ -3282,6 +3504,7 @@ def get_usage_dashboard(response: Response, days: int = 7, q: str = "", employee
         "event_counts": type_counts,
         "daily": daily,
         "operations": {"summary": operation_summary, "daily": operation_daily},
+        "corrections": correction_metrics,
         "filters": {
             "q": query,
             "employee": employee_filter,
@@ -3601,7 +3824,7 @@ def check_wave(wave_no: str, force: bool = False):
         try:
             raw_data = get_wave_data_internal(wave_no, force_refresh=force)
         except HTTPException as exc:
-            if exc.status_code != 404:
+            if exc.status_code not in (404, 503):
                 raise
             # A Wave can be added to Member Data after the Free instance has
             # warmed its 10-minute cache. Re-read once before reporting 404;
@@ -3733,11 +3956,30 @@ def get_wave_for_branch_move(wave_no: str) -> dict:
     try:
         return get_wave_data_internal(wave_clean, force_refresh=True)
     except HTTPException as exc:
-        if exc.status_code != 404:
+        if exc.status_code not in (404, 503):
             raise
-    with member_history_lock:
-        member_history_wave_miss.pop(wave_clean, None)
-    fetch_member_history_rows_for_wave(wave_clean)
+    # Re-read this one Wave while Google keeps failing. A read that genuinely
+    # answers "no rows" stops the loop immediately, so a mistyped Wave number
+    # still fails fast instead of costing three queries.
+    for attempt in range(MEMBER_HISTORY_DIRECT_READ_ATTEMPTS):
+        with member_history_lock:
+            member_history_wave_miss.pop(wave_clean, None)
+            member_history_wave_read_error.pop(wave_clean, None)
+        if fetch_member_history_rows_for_wave(wave_clean):
+            return get_wave_data_internal(wave_clean, force_refresh=False)
+        read_error = member_history_read_error_for_wave(wave_clean)
+        if not read_error:
+            # The query answered, and answered "no such Wave": repeating it would
+            # only spend another 5 s to hear the same thing.
+            break
+        if attempt + 1 < MEMBER_HISTORY_DIRECT_READ_ATTEMPTS:
+            print(f"⚠️ Retrying Member Data read for Wave {wave_clean} "
+                  f"(attempt {attempt + 1}): {read_error}")
+            time.sleep(MEMBER_HISTORY_DIRECT_READ_RETRY_DELAY)
+    if member_history_read_error_for_wave(wave_clean):
+        # Reading is what failed, so say so instead of spending a further read to
+        # be told the same thing by build_uat_wave_data().
+        raise member_history_unavailable_error(wave_clean)
     return get_wave_data_internal(wave_clean, force_refresh=False)
 
 
