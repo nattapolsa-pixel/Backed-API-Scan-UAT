@@ -60,7 +60,7 @@ if not os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
 # Google Sheets is the only data source. Credentials are loaded lazily by
 # get_sheets_session(), so a cold start never waits on an auth round-trip.
 APP_ENV = os.environ.get("APP_ENV", "uat").strip().lower()
-APP_VERSION = os.environ.get("APP_VERSION", "1.4.2-free").strip()
+APP_VERSION = os.environ.get("APP_VERSION", "1.8.4-free").strip()
 EMPLOYEE_LOOKUP_URL = "https://script.google.com/macros/s/AKfycbybmW6N7TxfsHqEa-Fx6ayy8M8xfjKGmTYO27izmbEoLJmQRrFD3i9c0XogP0fG6tlG/exec"
 
 # รายชื่อพนักงานสำหรับช่อง "เจ้าหน้าที่" บนใบคุมส่งสินค้า
@@ -3701,7 +3701,7 @@ def check_booking(booking_no: str, force: bool = False):
 def preview_booking_branch(wave_no: str, branch_code: str):
     wave_clean = str(int(str(wave_no).strip()))
     branch = str(branch_code or "").strip().upper()
-    data = apply_local_overlay(wave_clean, get_wave_data_internal(wave_clean, force_refresh=True))
+    data = apply_local_overlay(wave_clean, get_wave_for_branch_move(wave_clean))
     items = [item for item in data.get("lpn_list", []) if str(item.get("branch") or "").strip().upper() == branch]
     if not items:
         raise HTTPException(status_code=404, detail=f"ไม่พบสาขา {branch} ใน Wave {wave_clean}")
@@ -3720,10 +3720,31 @@ def preview_booking_branch(wave_no: str, branch_code: str):
         "closed_at": next((item.get("branch_closed_at") for item in items if item.get("branch_closed_at")), "")
     }
 
+
+def get_wave_for_branch_move(wave_no: str) -> dict:
+    """Load a move/split Wave, retrying a recent negative single-Wave lookup once.
+
+    Member Data is filled progressively. A Wave can therefore be absent on the
+    first query and appear seconds later, while the short negative cache still
+    remembers the old miss. Move/split is an explicit user action, so it should
+    bypass that one stale negative result without reloading the 140k-row sheet.
+    """
+    wave_clean = str(int(str(wave_no).strip()))
+    try:
+        return get_wave_data_internal(wave_clean, force_refresh=True)
+    except HTTPException as exc:
+        if exc.status_code != 404:
+            raise
+    with member_history_lock:
+        member_history_wave_miss.pop(wave_clean, None)
+    fetch_member_history_rows_for_wave(wave_clean)
+    return get_wave_data_internal(wave_clean, force_refresh=False)
+
+
 @app.get("/api/wave-branch-options")
 def get_wave_branch_options(wave_no: str):
     wave_clean = str(int(str(wave_no).strip()))
-    data = apply_local_overlay(wave_clean, get_wave_data_internal(wave_clean, force_refresh=True))
+    data = apply_local_overlay(wave_clean, get_wave_for_branch_move(wave_clean))
     assignments = get_booking_branch_assignments()
     grouped = {}
     for item in data.get("lpn_list", []):
@@ -3785,9 +3806,18 @@ def move_booking_branch(data: BookingBranchMoveData):
     queue_branch_totals_reconciliation([(wave_clean, branch)], delay_seconds=0.5)
     # ส่งมุมมองปลายทางที่อ่านหลังบันทึกกลับใน response เดียว ป้องกันหน้าเว็บ
     # ยิง GET ถัดไปเร็วเกินไปแล้วเห็นข้อมูลก่อนย้าย.
-    target_view = get_booking_data_internal(target, force_refresh=True)
+    target_view = None
+    refresh_warning = ""
+    try:
+        target_view = get_booking_data_internal(target, force_refresh=True)
+    except Exception as exc:
+        # The assignment above is already durable. A delayed/temporarily missing
+        # Member Data row must not turn that successful write into a false error.
+        refresh_warning = str(getattr(exc, "detail", exc))
+        print(f"⚠️ Branch move saved; target view refresh delayed: {refresh_warning}")
     return {"status": "success", "message": "ย้ายสาขาเรียบร้อย", "previous_booking": previous,
-            "target_booking": target, "preview": preview, "target_view": target_view}
+            "target_booking": target, "preview": preview, "target_view": target_view,
+            "refresh_pending": bool(refresh_warning)}
 
 @app.post("/api/split-booking-branch")
 def split_booking_branch(data: BookingBranchSplitData):
@@ -3832,8 +3862,17 @@ def split_booking_branch(data: BookingBranchSplitData):
         booking_waves_cache.pop(target, None)
     split_report_summaries = []
     booking_views = {}
+    refresh_warnings = []
     for booking in (source, target):
-        booking_view = get_booking_data_internal(booking, force_refresh=True)
+        try:
+            booking_view = get_booking_data_internal(booking, force_refresh=True)
+        except Exception as exc:
+            # The split row is already committed. Report success and let the
+            # normal document refresh retry instead of inviting a duplicate save.
+            warning = str(getattr(exc, "detail", exc))
+            refresh_warnings.append(f"{booking}: {warning}")
+            print(f"⚠️ Booking split saved; view refresh delayed for {booking}: {warning}")
+            continue
         booking_views[booking] = booking_view
         # A booking can contain the same branch in several waves. Build the
         # report from the exact Wave+Branch only, otherwise another wave's
@@ -3855,7 +3894,8 @@ def split_booking_branch(data: BookingBranchSplitData):
     queue_report_summary_snapshots(split_report_summaries, delay_seconds=0.0)
     return {"status": "success", "message": "แบ่งยอดเข้าสอง Booking เรียบร้อย",
             "source_booking": source, "target_booking": target, "allocated": requested,
-            "target_view": booking_views.get(target)}
+            "target_view": booking_views.get(target),
+            "refresh_pending": bool(refresh_warnings)}
 
 @app.post("/api/start-pallet")
 def start_pallet(data: PalletStartData):

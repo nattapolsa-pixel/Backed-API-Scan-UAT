@@ -35,6 +35,6 @@ services:
       - key: SCAN_DEMO_ONLY
         value: "true"
       - key: APP_VERSION
-        value: 1.4.2-free
+        value: 1.8.4-free
       - key: UAT_DATABASE_SPREADSHEET_ID
         value: 1RJcsrbWnGO7gMiq9bhBR4bA9Twh1NjqP6816dXOW9DI
