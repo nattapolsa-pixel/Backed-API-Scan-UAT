@@ -60,8 +60,72 @@ if not os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
 # Google Sheets is the only data source. Credentials are loaded lazily by
 # get_sheets_session(), so a cold start never waits on an auth round-trip.
 APP_ENV = os.environ.get("APP_ENV", "uat").strip().lower()
-APP_VERSION = os.environ.get("APP_VERSION", "1.4.1-free").strip()
+APP_VERSION = os.environ.get("APP_VERSION", "1.4.2-free").strip()
 EMPLOYEE_LOOKUP_URL = "https://script.google.com/macros/s/AKfycbybmW6N7TxfsHqEa-Fx6ayy8M8xfjKGmTYO27izmbEoLJmQRrFD3i9c0XogP0fG6tlG/exec"
+
+# รายชื่อพนักงานสำหรับช่อง "เจ้าหน้าที่" บนใบคุมส่งสินค้า
+# แท็บนี้มีบล็อกสรุปการมาทำงานอยู่ด้านบน แถว 25 เป็นหัวตาราง
+# (ลำดับ | รหัสพนักงาน | ชื่อ-นามสกุล (ไทย)) และรายชื่อจริงเริ่มแถว 26
+# คอลัมน์ B = รหัสพนักงาน, คอลัมน์ C = ชื่อ-นามสกุล
+#
+# อ่านผ่าน /export?format=csv ไม่ใช่ gviz: gviz ตัดแถวว่างทิ้ง (คืน 320 แถวจาก
+# 1,009) ทำให้เลขแถวไม่ตรงกับชีทและได้รายชื่อไม่ครบ (184 จาก 242 คน)
+STAFF_DIRECTORY_SPREADSHEET_ID = "1AWOeqhCqmBlSfGI5FWJVU4F77lDGNWBUH-TYpJeiYnI"
+STAFF_DIRECTORY_GID = "130637853"
+STAFF_DIRECTORY_FIRST_DATA_ROW = 26
+STAFF_DIRECTORY_CACHE_TTL_SECONDS = 30 * 60
+STAFF_DIRECTORY_ERROR_BACKOFF_SECONDS = 120
+staff_directory_cache = {"expires_at": 0.0, "data": {}}
+staff_directory_lock = Lock()
+
+
+def _staff_directory_key(value) -> str:
+    return re.sub(r"\s+", "", str(value or "")).upper()
+
+
+def load_staff_directory(force: bool = False) -> dict:
+    """{รหัสพนักงาน: ชื่อ-นามสกุล} from the roster tab, row 26 onward."""
+    now = time.time()
+    with staff_directory_lock:
+        if not force and staff_directory_cache["expires_at"] > now:
+            return staff_directory_cache["data"]
+
+    url = (
+        f"https://docs.google.com/spreadsheets/d/{STAFF_DIRECTORY_SPREADSHEET_ID}"
+        f"/export?format=csv&gid={STAFF_DIRECTORY_GID}"
+    )
+    try:
+        names = {}
+        reader = csv.reader(stream_gviz_lines(url, timeout=GVIZ_HTTP_TIMEOUT_SECONDS))
+        for index, row in enumerate(reader, start=1):
+            if index < STAFF_DIRECTORY_FIRST_DATA_ROW:
+                continue
+            if len(row) < 3:
+                continue
+            key = _staff_directory_key(row[1])
+            name = str(row[2] or "").strip()
+            # First occurrence wins: the tab has a few repeated ids.
+            if key and name and key not in names:
+                names[key] = name
+        if not names:
+            raise ValueError("staff directory returned no usable rows")
+        with staff_directory_lock:
+            staff_directory_cache["data"] = names
+            staff_directory_cache["expires_at"] = time.time() + STAFF_DIRECTORY_CACHE_TTL_SECONDS
+        print(f"✅ Staff directory loaded: {len(names)} names")
+        return names
+    except Exception as exc:
+        print(f"⚠️ Staff directory load failed, keeping previous names: {exc}")
+        with staff_directory_lock:
+            staff_directory_cache["expires_at"] = time.time() + STAFF_DIRECTORY_ERROR_BACKOFF_SECONDS
+            return staff_directory_cache["data"]
+
+
+def staff_display_name(emp_id: str) -> str:
+    try:
+        return load_staff_directory().get(_staff_directory_key(emp_id), "")
+    except Exception:
+        return ""
 SCAN_DEMO_ONLY = os.environ.get("SCAN_DEMO_ONLY", "true").strip().lower() in ("1", "true", "yes", "on")
 # Scan is held by default.  The Render flag can be enabled briefly for an
 # isolated presentation, without changing any document workflow.
@@ -2818,6 +2882,22 @@ def employee_lookup(emp_id: str, response: Response):
     clean_id = str(emp_id or "").strip()[:80]
     if not clean_id:
         raise HTTPException(status_code=400, detail="emp_id is required")
+
+    # แท็บรายชื่อพนักงานมาก่อน Apps Script สองเหตุผล:
+    #   1. ช่อง "เจ้าหน้าที่" บนใบคุมส่งสินค้าต้องเป็นชื่อ-นามสกุลจริงจากแท็บนี้
+    #      ค่าที่ Apps Script คืนมาบางรหัสเป็นคำว่า "พนักงาน" เฉย ๆ
+    #   2. Apps Script ล่มได้ (วัดเมื่อ 21 ก.ย.: ตอบ 503 ทุกรหัส และยิงตรงก็
+    #      timeout ที่ 45 วิ) ซึ่งเดิมทำให้ล็อกอินไม่ได้เลยทั้งที่รายชื่ออยู่ในแท็บ
+    # ยังเรียก Apps Script ต่อสำหรับรหัสที่ไม่มีในแท็บ จึงไม่มีใครล็อกอินได้น้อยลง
+    roster_name = staff_display_name(clean_id)
+    if roster_name:
+        return {
+            "success": True,
+            "emp_id": clean_id,
+            "emp_name": roster_name,
+            "emp_name_source": "staff_directory",
+        }
+
     url = EMPLOYEE_LOOKUP_URL + "?emp_id=" + urllib.parse.quote(clean_id, safe="")
     try:
         request = urllib.request.Request(url, headers={"User-Agent": "Pro-Scanner-UAT/1.4"})
