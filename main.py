@@ -60,7 +60,7 @@ if not os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
 # Google Sheets is the only data source. Credentials are loaded lazily by
 # get_sheets_session(), so a cold start never waits on an auth round-trip.
 APP_ENV = os.environ.get("APP_ENV", "uat").strip().lower()
-APP_VERSION = os.environ.get("APP_VERSION", "1.8.7-free").strip()
+APP_VERSION = os.environ.get("APP_VERSION", "1.8.8-free").strip()
 EMPLOYEE_LOOKUP_URL = "https://script.google.com/macros/s/AKfycbybmW6N7TxfsHqEa-Fx6ayy8M8xfjKGmTYO27izmbEoLJmQRrFD3i9c0XogP0fG6tlG/exec"
 
 # รายชื่อพนักงานสำหรับช่อง "เจ้าหน้าที่" บนใบคุมส่งสินค้า
@@ -1968,6 +1968,13 @@ MEMBER_HISTORY_DIRECT_READ_ATTEMPTS = 3
 # Repeating a query Google just refused, with no pause, is how a throttled read
 # stays throttled. 3 attempts x ~5 s + pauses still fits the caller's budget.
 MEMBER_HISTORY_DIRECT_READ_RETRY_DELAY = 0.3
+# by_wave เก็บสาขาของแต่ละ Wave เป็นก้อนเดียว เมื่อ Wave นั้นมีแถวแล้วจะไม่มีใคร
+# กลับไปดูอีกว่ามีสาขาเพิ่มเข้ามาภายหลังหรือไม่ สาขาที่ถูก Append ลง Member Data
+# หลังการโหลดเต็มครั้งล่าสุดจึงหายไปจากหน้าจอจนกว่าจะโหลดเต็มรอบใหม่ (นานได้ถึง
+# 10 นาที หรือ 6 ชั่วโมงถ้าฟื้นจาก snapshot) ระหว่างนั้นหน้างานเห็นยอดไม่ครบ
+# การอ่าน Wave เดียวมีค่าใช้จ่ายราว 300 ไบต์ จึงตรวจซ้ำให้เป็นระยะได้
+MEMBER_HISTORY_WAVE_REVALIDATE_SECONDS = 90
+member_history_wave_checked_at = {}
 
 
 def _member_history_csv_lines(url: str, timeout: int):
@@ -2089,6 +2096,52 @@ def fetch_member_history_rows_for_wave(wave: str) -> list:
     return rows
 
 
+def _revalidate_member_wave(wave_key: str):
+    """อ่าน Wave เดียวใหม่แล้วแทนที่แถวของ Wave นั้นในแคช"""
+    try:
+        with member_history_lock:
+            member_history_wave_miss.pop(wave_key, None)
+            member_history_wave_read_error.pop(wave_key, None)
+        fetch_member_history_rows_for_wave(wave_key)
+    except Exception as exc:
+        print(f"\u26a0\ufe0f Member Data wave {wave_key} revalidate failed: {exc}")
+
+
+def schedule_member_wave_revalidate(wave_key: str) -> bool:
+    """Re-read one Wave in the background, at most once per throttle window.
+
+    Serving the cached rows stays instant; the next read sees the complete Wave.
+    """
+    now = time.time()
+    with member_history_lock:
+        if now - float(member_history_wave_checked_at.get(wave_key) or 0) < MEMBER_HISTORY_WAVE_REVALIDATE_SECONDS:
+            return False
+        if len(member_history_wave_checked_at) > 512:
+            member_history_wave_checked_at.clear()
+        member_history_wave_checked_at[wave_key] = now
+    threading.Thread(target=_revalidate_member_wave, args=(wave_key,), daemon=True,
+                     name=f"member-wave-revalidate-{wave_key}").start()
+    return True
+
+
+def refresh_member_wave_now(wave_no) -> bool:
+    """Read one Wave straight from Member Data before answering this request.
+
+    This is what the refresh button must do. load_member_history(force=True) only
+    schedules the full download and hands back the rows it already had, so a Wave
+    that is present but missing a branch stayed wrong no matter how many times the
+    operator pressed refresh.
+    """
+    try:
+        wave_key = str(int(str(wave_no).strip()))
+    except (TypeError, ValueError):
+        return False
+    with member_history_lock:
+        member_history_wave_checked_at[wave_key] = time.time()
+    _revalidate_member_wave(wave_key)
+    return True
+
+
 def member_history_rows_for_wave(wave: str) -> list:
     """All Member Data rows for one Wave, via the index instead of a full scan."""
     load_member_history()
@@ -2096,6 +2149,9 @@ def member_history_rows_for_wave(wave: str) -> list:
     with member_history_lock:
         rows = list((member_history_cache.get("by_wave") or {}).get(wave_key) or [])
     if rows:
+        # แถวชุดนี้อาจไม่ครบ (มีสาขาเพิ่มเข้า Wave หลังโหลดเต็มครั้งล่าสุด)
+        # ตอบด้วยของที่มีทันทีแล้วอ่าน Wave นี้ใหม่เบื้องหลัง คำขอถัดไปจะได้ครบ
+        schedule_member_wave_revalidate(wave_key)
         return rows
     # Not in this worker's snapshot: read just this Wave rather than everything.
     return fetch_member_history_rows_for_wave(wave_key)
@@ -3965,6 +4021,10 @@ def clear_device_states(data: DeviceStateData):
 @app.get("/api/check-wave")
 def check_wave(wave_no: str, force: bool = False):
     try:
+        # ปุ่มรีเฟรชคือการบอกว่า "ยอดบนจอไม่ครบ" จึงอ่าน Wave นี้ตรงจากชีตก่อนตอบ
+        # (~300 ไบต์) ไม่ใช่รอโหลดเต็ม 144k แถวที่ทำงานอยู่เบื้องหลัง
+        if force:
+            refresh_member_wave_now(wave_no)
         # การค้นหาปกติใช้ cache ที่ warm ไว้ ส่วนปุ่มรีเฟรชส่ง force=true เมื่อต้องอ่าน
         # Google Sheets ใหม่จริง ๆ การบังคับ force ทุกครั้งทำให้โหลด Member Data 39k+ แถวซ้ำ
         try:
