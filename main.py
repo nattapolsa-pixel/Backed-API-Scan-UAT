@@ -60,7 +60,7 @@ if not os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
 # Google Sheets is the only data source. Credentials are loaded lazily by
 # get_sheets_session(), so a cold start never waits on an auth round-trip.
 APP_ENV = os.environ.get("APP_ENV", "uat").strip().lower()
-APP_VERSION = os.environ.get("APP_VERSION", "1.9.3-free").strip()
+APP_VERSION = os.environ.get("APP_VERSION", "1.9.4-free").strip()
 EMPLOYEE_LOOKUP_URL = "https://script.google.com/macros/s/AKfycbybmW6N7TxfsHqEa-Fx6ayy8M8xfjKGmTYO27izmbEoLJmQRrFD3i9c0XogP0fG6tlG/exec"
 
 # รายชื่อพนักงานสำหรับช่อง "เจ้าหน้าที่" บนใบคุมส่งสินค้า
@@ -178,7 +178,14 @@ branch_province_cache = {"expires_at": 0.0, "data": {}}
 branch_province_refresh_lock = Lock()
 branch_report_cache = {"expires_at": 0.0, "data": {}}
 branch_report_refresh_lock = Lock()
-wave_monitoring_pick_date_cache = {"expires_at": 0.0, "exact": {}, "waves": {}, "branches": {}}
+wave_monitoring_pick_date_cache = {
+    "expires_at": 0.0,
+    "loaded_at": 0.0,
+    "exact": {},
+    "waves": {},
+    "branches": {},
+    "bookings": {},
+}
 wave_monitoring_pick_date_lock = Lock()
 uat_report_test_row_cache = {"expires_at": 0.0, "existing_map": {}, "last_data_row": 1}
 SHEET_ROW_CACHE_TTL_SECONDS = 15 * 60  # Free: ลดการอ่าน Sheet ซ้ำและรักษา RAM ให้อยู่ในขอบเขต
@@ -875,6 +882,7 @@ def _load_wave_monitoring_pick_dates(force: bool = False) -> tuple:
     exact = {}
     wave_dates = {}
     expected_branches = {}
+    booking_by_branch = {}
     try:
         # The GViz query endpoint can inherit the sheet's active basic filter,
         # which previously hid older pick dates (for example 31/08/2026).
@@ -909,12 +917,17 @@ def _load_wave_monitoring_pick_dates(force: bool = False) -> tuple:
                     exact[(booking.replace("-", ""), wave)] = pick_date
                     if branch:
                         expected_branches.setdefault((booking, wave), set()).add(branch)
+                        # Wave_Monitoring is authoritative for the Booking of a
+                        # concrete Wave+Branch. This avoids the old "last row
+                        # wins" mistake when one Wave is shared by two Books.
+                        booking_by_branch[(wave, branch)] = booking
                 wave_dates.setdefault(wave, pick_date)
         with wave_monitoring_pick_date_lock:
             wave_monitoring_pick_date_cache.update({
                 "expires_at": time.time() + WAVE_MONITORING_CACHE_TTL_SECONDS,
                 "loaded_at": time.time(),
                 "exact": exact, "waves": wave_dates, "branches": expected_branches,
+                "bookings": booking_by_branch,
             })
     except Exception as exc:
         print(f"⚠️ Wave Monitoring pick-date read unavailable: {exc}")
@@ -925,6 +938,19 @@ def _load_wave_monitoring_pick_dates(force: bool = False) -> tuple:
                         copy.deepcopy(wave_monitoring_pick_date_cache["waves"]),
                         copy.deepcopy(wave_monitoring_pick_date_cache["branches"]))
     return exact, wave_dates, expected_branches
+
+
+def get_wave_monitoring_booking(wave_no: str, branch_code: str) -> str:
+    """Return the Booking attached to a Wave+Branch in Wave_Monitoring."""
+    waves = _wave_tokens(wave_no)
+    branch = str(branch_code or "").strip().upper()
+    if not waves or not branch:
+        return ""
+    load_wave_monitoring_pick_dates()
+    with wave_monitoring_pick_date_lock:
+        return str(wave_monitoring_pick_date_cache.get("bookings", {}).get(
+            (waves[0], branch), ""
+        ) or "").strip().upper()
 
 
 def get_wave_monitoring_pick_date(wave_no: str, booking_no: str = ""):
@@ -1068,6 +1094,17 @@ def delivery_business_dates(pick_date):
 
 
 
+def _uat_report_key(booking: str, wave: str, branch: str) -> tuple:
+    """Canonical identity for one Delivery report row."""
+    booking_key = re.sub(r"\s+", "", str(booking or "").upper())
+    wave_digits = re.sub(r"\D", "", str(wave or ""))
+    return (
+        booking_key,
+        str(int(wave_digits)) if wave_digits else "",
+        str(branch or "").strip().upper(),
+    )
+
+
 def write_uat_report_test_summaries(summaries: list):
     """Upsert direct report rows to the isolated UAT reconciliation Sheet.
 
@@ -1095,7 +1132,7 @@ def write_uat_report_test_summaries(summaries: list):
                 wave_digits = re.sub(r"\D", "", str(row[9] or ""))
                 branch = str(row[10] or "").strip().upper()
                 if wave_digits and branch:
-                    existing_map[(booking, str(int(wave_digits)), branch)] = index
+                    existing_map[_uat_report_key(booking, wave_digits, branch)] = index
                     last_data_row = max(last_data_row, index)
                 # Convert legacy dd/MM/yyyy text to date serials once, so
                 # Google Sheets sorts dates chronologically rather than as text.
@@ -1126,7 +1163,7 @@ def write_uat_report_test_summaries(summaries: list):
                 meta_cache[meta_key] = get_delivery_wave_meta(wave, summary_booking)
             meta = meta_cache[meta_key]
             booking = str(summary.get("booking") or meta.get("booking") or "").strip().upper()
-            key = (booking, wave, branch)
+            key = _uat_report_key(booking, wave, branch)
             target_row = existing_map.get(key)
             if not target_row:
                 if int(summary.get("total") or 0) <= 0:
@@ -1227,6 +1264,200 @@ def write_uat_report_test_summaries(summaries: list):
         uat_report_test_row_cache.update({"existing_map": {}, "last_data_row": 1, "expires_at": 0.0})
         dashboard_operations_cache.update({"expires_at": 0.0, "rows": []})
         print(f"⚡ UAT test Delivery report updated | {len(batch_data)} branches")
+
+
+UAT_REPORT_RECONCILE_INTERVAL_SECONDS = max(
+    5 * 60, int(os.environ.get("UAT_REPORT_RECONCILE_INTERVAL_SECONDS", "900"))
+)
+uat_report_reconcile_wakeup = threading.Event()
+uat_report_reconcile_started = False
+uat_report_reconcile_start_lock = Lock()
+uat_report_reconcile_state_lock = Lock()
+uat_report_reconcile_state = {
+    "last_started_at": 0.0,
+    "last_completed_at": 0.0,
+    "last_missing": 0,
+    "last_skipped": 0,
+    "last_error": "",
+}
+
+
+def _read_uat_report_keys(session) -> set:
+    """Read target identities only; avoid loading 20 columns for this check."""
+    rows = _sheet_values(session, UAT_REPORT_TEST_SPREADSHEET_ID,
+                         f"'{UAT_REPORT_TEST_SHEET_NAME}'!H:K")
+    keys = set()
+    for raw_row in rows[1:]:
+        row = list(raw_row) + [""] * max(0, 4 - len(raw_row))
+        key = _uat_report_key(row[0], row[2], row[3])
+        if key[1] and key[2]:
+            keys.add(key)
+    return keys
+
+
+def _member_history_report_summary(row: dict) -> dict:
+    """Convert one Member Data row to the report's five box fields."""
+    summary = {
+        "wave": row.get("wave"),
+        "branch": row.get("branch"),
+        "branch_name": row.get("branch_name"),
+        "bu": row.get("bu"),
+        "label_count": row.get("label_count"),
+        "m": row.get("m"),
+        "red": row.get("red"),
+        "blue": row.get("blue"),
+        "green": row.get("green"),
+        "black": row.get("black"),
+        "pallet": row.get("pallet"),
+    }
+    # Legacy rows may have only the old Total column. The document builder
+    # treats that total as M, so recovery must use the same rule.
+    component_total = sum(_history_int(summary.get(field)) for field in REPORT_BOX_FIELDS)
+    if component_total <= 0 and _history_int(row.get("total")) > 0:
+        summary["m"] = _history_int(row.get("total"))
+    return normalize_report_summary(summary)
+
+
+def _build_uat_delivery_report_candidates() -> list:
+    """Build missing-row candidates from Member Data + move/split events."""
+    history = load_member_history()
+    if not history:
+        return []
+    load_wave_monitoring_pick_dates()
+    assignments = get_booking_branch_assignments()
+    split_records = get_booking_branch_splits()
+    splits_by_pair = {}
+    for (split_wave, split_branch, _target), split in split_records.items():
+        active_value = str(split.get("Is_Active", True) or "").strip().lower()
+        if active_value in ("", "0", "false", "no", "off"):
+            continue
+        splits_by_pair.setdefault((str(split_wave), str(split_branch).strip().upper()), []).append(split)
+
+    candidates = []
+    for (wave, branch), raw in history.items():
+        summary = _member_history_report_summary(raw)
+        if int(summary.get("total") or 0) <= 0:
+            continue
+        native_booking = get_wave_monitoring_booking(wave, branch)
+        if not native_booking:
+            native_booking = str(get_sheet_meta_for_wave(wave).get("booking") or "").strip().upper()
+        assignment = assignments.get((str(wave), branch)) or {}
+        assigned_booking = str(assignment.get("Assigned_Booking") or "").strip().upper()
+        active_splits = splits_by_pair.get((str(wave), branch), [])
+
+        if active_splits:
+            source_booking = str(active_splits[0].get("Source_Booking") or native_booking).strip().upper()
+            allocated = {field: 0 for field in (*REPORT_BOX_FIELDS, "pallet")}
+            for split in active_splits:
+                target_booking = str(split.get("Target_Booking") or "").strip().upper()
+                if not target_booking:
+                    continue
+                target = copy.deepcopy(summary)
+                target.update({
+                    "booking": target_booking,
+                    "booking_split": True,
+                    "m": _history_int(split.get("M_Count")),
+                    "red": _history_int(split.get("Red_Count")),
+                    "blue": _history_int(split.get("Blue_Count")),
+                    "green": _history_int(split.get("Green_Count")),
+                    "black": _history_int(split.get("Black_Count")),
+                    "pallet": _history_int(split.get("Pallet_Count")),
+                })
+                target = normalize_report_summary(target)
+                if target.get("total", 0) > 0:
+                    candidates.append(target)
+                for field in (*REPORT_BOX_FIELDS, "pallet"):
+                    allocated[field] += int(target.get(field) or 0)
+            remaining = copy.deepcopy(summary)
+            remaining["booking"] = source_booking
+            for field in (*REPORT_BOX_FIELDS, "pallet"):
+                remaining[field] = max(0, int(summary.get(field) or 0) - allocated[field])
+            remaining = normalize_report_summary(remaining)
+            if remaining.get("total", 0) > 0:
+                candidates.append(remaining)
+            continue
+
+        summary["booking"] = assigned_booking or native_booking
+        summary = normalize_report_summary(summary)
+        if summary.get("booking") and summary.get("total", 0) > 0:
+            candidates.append(summary)
+    return candidates
+
+
+def reconcile_uat_delivery_report(force: bool = False) -> dict:
+    """Restore missing report rows without overwriting user corrections."""
+    now = time.time()
+    with uat_report_reconcile_state_lock:
+        if not force and now - float(uat_report_reconcile_state.get("last_started_at") or 0) < 30:
+            return {"status": "throttled"}
+        uat_report_reconcile_state["last_started_at"] = now
+    try:
+        session = get_sheets_session()
+        existing_keys = _read_uat_report_keys(session)
+        candidates = _build_uat_delivery_report_candidates()
+        missing = []
+        seen = set()
+        skipped = 0
+        for candidate in candidates:
+            candidate = normalize_report_summary(candidate)
+            key = _uat_report_key(candidate.get("booking"), candidate.get("wave"), candidate.get("branch"))
+            if not key[1] or not key[2] or key in existing_keys or key in seen:
+                continue
+            if not candidate.get("booking_split"):
+                candidate = normalize_report_summary(apply_document_override_to_summary(candidate))
+            if candidate.get("is_hidden") or int(candidate.get("total") or 0) <= 0:
+                skipped += 1
+                continue
+            seen.add(key)
+            missing.append(candidate)
+
+        if missing:
+            uat_report_test_row_cache.update({"existing_map": {}, "last_data_row": 1, "expires_at": 0.0})
+            for offset in range(0, len(missing), 400):
+                write_uat_report_test_summaries(missing[offset:offset + 400])
+        result = {"status": "completed", "candidates": len(candidates),
+                  "missing": len(missing), "skipped": skipped}
+        with uat_report_reconcile_state_lock:
+            uat_report_reconcile_state.update({
+                "last_completed_at": time.time(), "last_missing": len(missing),
+                "last_skipped": skipped, "last_error": "",
+            })
+        if missing:
+            print(f"♻️ UAT Delivery report repair | restored={len(missing)} skipped={skipped}")
+        return result
+    except Exception as exc:
+        with uat_report_reconcile_state_lock:
+            uat_report_reconcile_state.update({"last_completed_at": time.time(), "last_error": str(exc)[:300]})
+        print(f"⚠️ UAT Delivery report repair skipped: {exc}")
+        return {"status": "error", "error": str(exc)[:300]}
+
+
+def request_uat_report_reconcile(force: bool = False):
+    """Signal repair in the background; never delay document searches."""
+    now = time.time()
+    with uat_report_reconcile_state_lock:
+        last = float(uat_report_reconcile_state.get("last_started_at") or 0)
+        if not force and now - last < UAT_REPORT_RECONCILE_INTERVAL_SECONDS:
+            return
+    uat_report_reconcile_wakeup.set()
+
+
+def uat_report_reconcile_worker_loop():
+    while True:
+        uat_report_reconcile_wakeup.wait(timeout=UAT_REPORT_RECONCILE_INTERVAL_SECONDS)
+        uat_report_reconcile_wakeup.clear()
+        reconcile_uat_delivery_report()
+
+
+def ensure_uat_report_reconcile_started():
+    global uat_report_reconcile_started
+    with uat_report_reconcile_start_lock:
+        if uat_report_reconcile_started:
+            return
+        threading.Thread(target=uat_report_reconcile_worker_loop, daemon=True,
+                         name="uat-report-reconcile").start()
+        uat_report_reconcile_started = True
+        uat_report_reconcile_wakeup.set()
 
 
 def summarize_branch_for_member_data(wave_data: dict, branch: str) -> dict:
@@ -4025,6 +4256,7 @@ def clear_device_states(data: DeviceStateData):
 @app.get("/api/check-wave")
 def check_wave(wave_no: str, force: bool = False):
     try:
+        request_uat_report_reconcile()
         # ปุ่มรีเฟรชคือการบอกว่า "ยอดบนจอไม่ครบ" จึงอ่าน Wave นี้ตรงจากชีตก่อนตอบ
         # (~300 ไบต์) ไม่ใช่รอโหลดเต็ม 144k แถวที่ทำงานอยู่เบื้องหลัง
         if force:
@@ -4103,6 +4335,7 @@ def ensure_booking_source_complete(booking_no: str, booking_data: dict):
 @app.get("/api/check-booking")
 def check_booking(booking_no: str, force: bool = False):
     try:
+        request_uat_report_reconcile()
         try:
             booking_data = get_booking_data_internal(booking_no, force_refresh=force)
             ensure_booking_source_complete(booking_no, booking_data)
@@ -4826,6 +5059,7 @@ def _startup_warm_cache():
 async def startup_event():
     """Free plan: answer the health check immediately, then warm Sheet caches in background."""
     ensure_report_sync_worker_started()
+    ensure_uat_report_reconcile_started()
     threading.Thread(target=_startup_warm_cache, daemon=True, name="startup-warm").start()
 
 def run_pending_waves_refresh_in_background():
