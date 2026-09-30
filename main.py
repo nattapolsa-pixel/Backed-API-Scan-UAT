@@ -60,7 +60,7 @@ if not os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
 # Google Sheets is the only data source. Credentials are loaded lazily by
 # get_sheets_session(), so a cold start never waits on an auth round-trip.
 APP_ENV = os.environ.get("APP_ENV", "uat").strip().lower()
-APP_VERSION = os.environ.get("APP_VERSION", "1.9.5-free").strip()
+APP_VERSION = os.environ.get("APP_VERSION", "1.9.6-free").strip()
 EMPLOYEE_LOOKUP_URL = "https://script.google.com/macros/s/AKfycbybmW6N7TxfsHqEa-Fx6ayy8M8xfjKGmTYO27izmbEoLJmQRrFD3i9c0XogP0fG6tlG/exec"
 
 # รายชื่อพนักงานสำหรับช่อง "เจ้าหน้าที่" บนใบคุมส่งสินค้า
@@ -174,6 +174,10 @@ WAVE_MONITORING_SPREADSHEET_ID = "1TL-tj-BrvYM7i_wNHlA0x641_VOqfT9SLpmm2NZATOo"
 WAVE_MONITORING_SHEET_GID = "0"
 WAVE_MONITORING_CACHE_TTL_SECONDS = 5 * 60
 delivery_report_lock = Lock()
+# Manual document writes are queued and serialized.  Render Free can take a
+# while to update two Google Sheets; overlapping requests used to race and one
+# response could overwrite or clear the previous branch edit.
+document_summary_sync_lock = Lock()
 branch_province_cache = {"expires_at": 0.0, "data": {}}
 branch_province_refresh_lock = Lock()
 branch_report_cache = {"expires_at": 0.0, "data": {}}
@@ -3991,6 +3995,52 @@ def sync_document_summary_reports(summaries: list):
     if failures:
         raise RuntimeError(" | ".join(failures))
 
+
+def sync_document_summary_reports_background(base_summaries: list, affected_split_sources: list):
+    """Finish the two Google Sheet upserts after the save response is sent.
+
+    The document override event and in-memory overlay are the authoritative
+    parts of a manual save and are written before the response.  Delivery
+    report also performs a full read, metadata check, sort, and re-number;
+    doing all of that inside the request made the free Render instance exceed
+    the browser timeout and show a false ``Failed to fetch``.  A single worker
+    queue keeps writes ordered while allowing the operator to continue.
+    """
+    with document_summary_sync_lock:
+        report_summaries = copy.deepcopy(base_summaries or [])
+        for source_booking, split_wave, split_branch in dict.fromkeys(affected_split_sources or []):
+            if not source_booking:
+                continue
+            try:
+                source_view = get_booking_data_internal(source_booking, force_refresh=True)
+                source_items = [
+                    item for item in source_view.get("lpn_list", [])
+                    if str(item.get("branch") or "").strip().upper() == split_branch
+                    and re.sub(r"\D", "", str(item.get("wave_no") or ""))
+                    and str(int(re.sub(r"\D", "", str(item.get("wave_no") or "")))) == split_wave
+                ]
+                if not source_items:
+                    continue
+                source_summary = summarize_branch_for_member_data(
+                    {"wave_no": split_wave, "booking_no": source_booking, "lpn_list": source_items},
+                    split_branch,
+                )
+                source_summary.update({
+                    "booking": source_booking, "booking_split": True,
+                    "is_closed": any(item.get("branch_closed_at") for item in source_items),
+                    "allow_zero_update": True,
+                })
+                report_summaries.append(source_summary)
+            except Exception as exc:
+                # The target edit is already durable.  Reconciliation will
+                # retry the source side; do not turn a successful save into a
+                # browser error because one source refresh was slow.
+                print(f"⚠️ Split source report refresh pending | {source_booking}/{split_wave}/{split_branch}: {exc}")
+        try:
+            sync_document_summary_reports(report_summaries)
+        except Exception as exc:
+            print(f"🚨 Background document report sync pending: {exc}")
+
 @app.post("/api/document-summary")
 def save_document_summary(data: DocumentSummaryBatchData, background_tasks: BackgroundTasks):
     if not data.summaries or len(data.summaries) > 100:
@@ -4033,9 +4083,14 @@ def save_document_summary(data: DocumentSummaryBatchData, background_tasks: Back
             item["allow_zero_update"] = True
         # If this is the target side of a split, update the allocation record
         # itself. Otherwise refresh/print would rebuild the old split amount.
-        affected_split_sources = persist_target_booking_split_edits(
-            persistent_items, emp_id, data.reason or "MANUAL_TOTAL_SAVE"
-        )
+        # Normal edits/hide actions do not need to read the split-event Sheet.
+        # Avoiding that forced Google read removes the main source of the old
+        # 20–45 second save delay.  Only a real split target can affect the
+        # allocation ledger.
+        if any(item.get("booking_split") for item in persistent_items):
+            affected_split_sources = persist_target_booking_split_edits(
+                persistent_items, emp_id, data.reason or "MANUAL_TOTAL_SAVE"
+            )
         # Apply the edit to the live web overlay first. A temporary Google auth
         # outage must never make the UI snap back to the calculated old total.
         with document_overrides_lock:
@@ -4059,43 +4114,17 @@ def save_document_summary(data: DocumentSummaryBatchData, background_tasks: Back
             override_sheet_error = str(exc)
             print(f"🚨 Override Sheet pending; web overlay retained: {exc}")
     # รายงานใช้ยอดล่าสุดที่หน้าเอกสารแสดงเสมอ ไม่รอให้สาขาปิดจบก่อน
+    # The expensive Google Sheet read/sort is queued below, after the overlay
+    # has been accepted, so a slow free-tier request cannot fail the save.
     report_summaries = list(normalized)
-    # A target split edit also changes the source booking's remaining amount.
-    # Refresh that exact Wave+Branch so Delivery report stays balanced.
-    for source_booking, split_wave, split_branch in dict.fromkeys(affected_split_sources):
-        if not source_booking:
-            continue
-        source_view = get_booking_data_internal(source_booking, force_refresh=True)
-        source_items = [
-            item for item in source_view.get("lpn_list", [])
-            if str(item.get("branch") or "").strip().upper() == split_branch
-            and re.sub(r"\D", "", str(item.get("wave_no") or ""))
-            and str(int(re.sub(r"\D", "", str(item.get("wave_no") or "")))) == split_wave
-        ]
-        if not source_items:
-            continue
-        source_summary = summarize_branch_for_member_data(
-            {"wave_no": split_wave, "booking_no": source_booking, "lpn_list": source_items},
-            split_branch,
-        )
-        source_summary.update({
-            "booking": source_booking, "booking_split": True,
-            "is_closed": any(item.get("branch_closed_at") for item in source_items),
-            "allow_zero_update": True,
-        })
-        report_summaries.append(source_summary)
     if data.persist_overrides:
-        # A manual save is transactional from the user's perspective: do not
-        # say success until every totals Sheet has accepted the new values.
-        try:
-            sync_document_summary_reports(copy.deepcopy(report_summaries))
-        except Exception as exc:
-            print(f"🚨 Manual totals Sheet pending; web overlay retained: {exc}")
-            report_sync = "pending_google_credentials"
-            sheet_warning = str(exc)
-        else:
-            report_sync = "completed" if not override_sheet_error else "pending_google_credentials"
-            sheet_warning = override_sheet_error
+        background_tasks.add_task(
+            sync_document_summary_reports_background,
+            copy.deepcopy(report_summaries),
+            list(affected_split_sources),
+        )
+        report_sync = "queued"
+        sheet_warning = override_sheet_error
     else:
         # Opening or printing a document must be read-only.  The previous
         # background snapshot queued here could overwrite the current
