@@ -1,6 +1,7 @@
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Response
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Response, Request
+from fastapi.responses import JSONResponse
 from fastapi.middleware.gzip import GZipMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import List, Optional       # ✅ แก้ไข #1: เพิ่ม Optional
 import google.auth
 from google.oauth2 import service_account
@@ -21,6 +22,7 @@ import datetime
 import urllib.parse
 import urllib.request
 import threading
+import traceback
 from threading import Lock
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -38,15 +40,6 @@ ALLOWED_ORIGINS = [
     "http://127.0.0.1:5500",
     "https://pro-scanner-uat.onrender.com",
 ]
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
-    allow_origin_regex=r"https://[a-z0-9-]+\.github\.io",
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
 # Local development convenience only. On Render, credentials arrive through
 # GOOGLE_SERVICE_ACCOUNT_JSON. The file keeps its historical name; it is used
 # purely as a Google Sheets service account now.
@@ -131,6 +124,75 @@ SCAN_DEMO_ONLY = os.environ.get("SCAN_DEMO_ONLY", "true").strip().lower() in ("1
 # isolated presentation, without changing any document workflow.
 SCAN_FEATURE_ENABLED = os.environ.get("SCAN_FEATURE_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
 PROCESS_STARTED_AT = time.time()
+
+
+def _safe_debug_text(value, limit: int = 4000) -> str:
+    """Bound diagnostic text and redact common credentials and personal data."""
+    text = str(value or "").replace("\x00", "").strip()
+    text = re.sub(r"(?i)\bBearer\s+[^\s,;]+", "Bearer [redacted]", text)
+    text = re.sub(r"(?i)(password|secret|token|api[_-]?key|authorization)(\s*[:=]\s*)[^\s,;]+",
+                  r"\1\2[redacted]", text)
+    text = re.sub(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}", "[email]", text)
+    text = re.sub(r"\b(?:[A-Z]{1,8}[-_]?\d{5,}|[A-Z]{1,8}[-_]\d{4,}|\d{5,})\b",
+                  "[reference]", text, flags=re.IGNORECASE)
+    text = text[:limit]
+    if text.startswith(("=", "+", "-", "@")):
+        text = "'" + text
+    return text
+
+
+@app.middleware("http")
+async def request_diagnostics(request: Request, call_next):
+    """Correlate browser reports with structured server errors in Render logs."""
+    supplied_id = str(
+        request.headers.get("x-request-id") or request.query_params.get("_debug_request_id") or ""
+    ).strip()
+    request_id = supplied_id if re.fullmatch(r"[A-Za-z0-9._-]{1,80}", supplied_id) else str(uuid.uuid4())
+    request.state.request_id = request_id
+    started = time.perf_counter()
+    try:
+        response = await call_next(request)
+    except Exception:
+        print(json.dumps({
+            "event": "api_unhandled_exception",
+            "request_id": request_id,
+            "method": request.method,
+            "path": _safe_debug_text(request.url.path, 240),
+            "duration_ms": round((time.perf_counter() - started) * 1000),
+            "traceback": _safe_debug_text(traceback.format_exc(), 12000),
+        }, ensure_ascii=False), flush=True)
+        response = JSONResponse(
+            status_code=500,
+            content={"detail": "Internal Server Error", "request_id": request_id},
+            headers={"X-Request-ID": request_id, "X-API-Version": APP_VERSION},
+        )
+        return response
+
+    response.headers["X-Request-ID"] = request_id
+    response.headers["X-API-Version"] = APP_VERSION
+    if response.status_code >= 500:
+        print(json.dumps({
+            "event": "api_http_error",
+            "request_id": request_id,
+            "method": request.method,
+            "path": _safe_debug_text(request.url.path, 240),
+            "status": response.status_code,
+            "duration_ms": round((time.perf_counter() - started) * 1000),
+        }, ensure_ascii=False), flush=True)
+    return response
+
+
+# Keep CORS outside request_diagnostics so even generic 500 responses retain
+# the request ID headers that the browser needs to correlate the incident.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_origin_regex=r"https://[a-z0-9-]+\.github\.io",
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["X-Request-ID", "X-API-Version"],
+)
 
 
 # UAT Google Sheets migration. Production code lives in a separate worktree/branch.
@@ -238,7 +300,7 @@ def stream_gviz_lines(url: str, timeout: int = GVIZ_HTTP_TIMEOUT_SECONDS):
         for line in text:
             yield line
 
-# ฐานข้อมูลเหตุการณ์ของ UAT: ทุกอย่างที่หน้าเว็บเขียนกลับ เก็บเป็น event log 6 แท็บ
+# ฐานข้อมูลเหตุการณ์ของ UAT: ทุกอย่างที่หน้าเว็บเขียนกลับ เก็บเป็น event log
 # แถวถูก append เท่านั้น และการอ่านใช้แถวล่าสุดต่อ key (ดู read_uat_event_records)
 # ⚠️ เพิ่มคอลัมน์ได้เฉพาะต่อท้าย: การอ่านจับคู่ค่าตามลำดับ header ด้านล่างนี้
 UAT_DATABASE_SPREADSHEET_ID = os.environ.get(
@@ -267,6 +329,11 @@ UAT_EVENT_SHEETS = {
     "Usage Events": [
         "Event_ID", "Event_Type", "Emp_ID", "Emp_Name", "Wave_Number", "Booking_No",
         "Branch_Code", "Status", "Duration_Ms", "Detail", "Client_Time", "Created_At"
+    ],
+    "Debug Events": [
+        "Event_ID", "Event_Type", "App_Version", "API_Version", "Request_ID", "Ingest_Request_ID",
+        "Page_Path", "Endpoint", "HTTP_Method", "HTTP_Status", "Error_Name", "Error_Message",
+        "Stack", "Source_File", "Line", "Column", "User_Agent", "Client_Time", "Created_At"
     ],
     # Scan events in this deployment are deliberately isolated from the live
     # live Production data. This makes the demo scanner usable without ever
@@ -3154,6 +3221,24 @@ class UsageEventData(BaseModel):
     detail: Optional[str] = None
     client_time: Optional[str] = None
 
+class ClientDebugEvent(BaseModel):
+    event_id: str = Field(default="", max_length=80)
+    event_type: str = Field(..., max_length=40)
+    app_version: str = Field(default="", max_length=40)
+    api_version: str = Field(default="", max_length=40)
+    request_id: str = Field(default="", max_length=80)
+    page_path: str = Field(default="", max_length=300)
+    endpoint: str = Field(default="", max_length=300)
+    http_method: str = Field(default="", max_length=12)
+    http_status: Optional[int] = None
+    error_name: str = Field(default="", max_length=100)
+    message: str = Field(default="", max_length=600)
+    stack: str = Field(default="", max_length=4000)
+    source_file: str = Field(default="", max_length=300)
+    line: Optional[int] = None
+    column: Optional[int] = None
+    client_time: str = Field(default="", max_length=60)
+
 class CloseJobData(BaseModel):
     wave: str
     branch: str
@@ -3723,6 +3808,90 @@ def record_usage_event(data: UsageEventData, background_tasks: BackgroundTasks):
     }
     background_tasks.add_task(append_uat_event_rows, "Usage Events", [row])
     return {"status": "queued", "event_id": row["Event_ID"]}
+
+
+client_debug_rate_lock = Lock()
+client_debug_rate_buckets = {}
+CLIENT_DEBUG_RATE_LIMIT = 30
+CLIENT_DEBUG_RATE_WINDOW_SECONDS = 60
+CLIENT_DEBUG_EVENT_TYPES = {
+    "JS_ERROR", "UNHANDLED_REJECTION", "RESOURCE_ERROR", "API_ERROR", "NETWORK_ERROR"
+}
+
+
+def _allow_client_debug_event(client_key: str) -> bool:
+    now = time.time()
+    cutoff = now - CLIENT_DEBUG_RATE_WINDOW_SECONDS
+    with client_debug_rate_lock:
+        recent = [stamp for stamp in client_debug_rate_buckets.get(client_key, []) if stamp > cutoff]
+        if len(recent) >= CLIENT_DEBUG_RATE_LIMIT:
+            client_debug_rate_buckets[client_key] = recent
+            return False
+        recent.append(now)
+        client_debug_rate_buckets[client_key] = recent
+        if len(client_debug_rate_buckets) > 1024:
+            for key in [key for key, stamps in client_debug_rate_buckets.items()
+                        if not stamps or stamps[-1] <= cutoff]:
+                client_debug_rate_buckets.pop(key, None)
+        return True
+
+
+def _safe_debug_path(value, limit: int = 300) -> str:
+    path = str(value or "").split("?", 1)[0].split("#", 1)[0].strip()
+    if not path.startswith("/") or path.startswith("//"):
+        return ""
+    return _safe_debug_text(path, limit)
+
+
+@app.post("/api/client-error", status_code=202)
+def capture_client_error(data: ClientDebugEvent, request: Request):
+    """Persist a bounded, redacted browser diagnostic in the isolated UAT log."""
+    event_type = re.sub(r"[^A-Z_]", "", str(data.event_type or "").strip().upper())
+    if event_type not in CLIENT_DEBUG_EVENT_TYPES:
+        raise HTTPException(status_code=400, detail="unsupported diagnostic event")
+    client_key = request.client.host if request.client else "unknown"
+    if not _allow_client_debug_event(client_key):
+        raise HTTPException(status_code=429, detail="diagnostic rate limit reached")
+
+    def safe_int(value, maximum=999999):
+        try:
+            return max(0, min(int(value or 0), maximum))
+        except (TypeError, ValueError):
+            return 0
+
+    event_id = _safe_debug_text(data.event_id or uuid.uuid4(), 80)
+    row = {
+        "Event_ID": event_id,
+        "Event_Type": event_type,
+        "App_Version": _safe_debug_text(data.app_version or "unknown", 40),
+        "API_Version": _safe_debug_text(data.api_version or "", 40),
+        "Request_ID": _safe_debug_text(data.request_id or "", 80),
+        "Ingest_Request_ID": _safe_debug_text(getattr(request.state, "request_id", ""), 80),
+        "Page_Path": _safe_debug_path(data.page_path),
+        "Endpoint": _safe_debug_path(data.endpoint),
+        "HTTP_Method": _safe_debug_text(data.http_method or "", 12).upper(),
+        "HTTP_Status": safe_int(data.http_status, 599),
+        "Error_Name": _safe_debug_text(data.error_name or "", 100),
+        "Error_Message": _safe_debug_text(data.message or "", 600),
+        "Stack": _safe_debug_text(data.stack or "", 4000),
+        "Source_File": _safe_debug_path(data.source_file),
+        "Line": safe_int(data.line),
+        "Column": safe_int(data.column),
+        "User_Agent": _safe_debug_text(request.headers.get("user-agent", ""), 240),
+        "Client_Time": _safe_debug_text(data.client_time or "", 60),
+        "Created_At": _uat_now_iso(),
+    }
+    try:
+        append_uat_event_rows("Debug Events", [row])
+    except Exception as exc:
+        # The browser keeps this event in its local queue when the API returns 5xx.
+        print(json.dumps({
+            "event": "debug_event_persist_failed",
+            "request_id": getattr(request.state, "request_id", ""),
+            "error": _safe_debug_text(exc, 800),
+        }, ensure_ascii=False), flush=True)
+        raise HTTPException(status_code=503, detail="diagnostic storage unavailable")
+    return {"status": "stored", "event_id": event_id}
 
 
 @app.get("/api/dashboard")

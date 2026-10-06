@@ -29,8 +29,8 @@
 | `APP_ENV` | `uat` | แสดงบน `/api/health` |
 | `SCAN_FEATURE_ENABLED` | `false` | hold การสแกน → 423 (ต้องตรงกับ `SCAN_FEATURE_ENABLED` ใน `index.html`) |
 | `SCAN_DEMO_ONLY` | `true` | ถ้าเปิดสแกน จะแก้เฉพาะ memory ไม่เขียน Sheet |
-| `APP_VERSION` | `1.4.0-free` | ต้องตรงกับ `APP_VERSION` ใน `index.html` |
-| `UAT_DATABASE_SPREADSHEET_ID` | `1RJcs…` | ที่เก็บ event log 6 แท็บ |
+| `APP_VERSION` | `1.9.6-free` | เวอร์ชัน API; เวอร์ชันเว็บแยกกันและส่ง `app_version`/`api_version` คนละช่อง |
+| `UAT_DATABASE_SPREADSHEET_ID` | `1RJcs…` | ที่เก็บ event log 7 แท็บ รวม Debug Events |
 | `GOOGLE_SERVICE_ACCOUNT_JSON` | (secret) | สิทธิ์เขียน Sheets |
 
 `UAT_SHEETS_ONLY` ถูกถอดออกแล้ว — Sheets เป็นโหมดเดียวที่มี ตัวแปรนี้ไม่มีผลอะไรถ้ายังค้างอยู่ใน Render
