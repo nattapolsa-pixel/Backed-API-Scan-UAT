@@ -29,20 +29,24 @@
 | `APP_ENV` | `uat` | แสดงบน `/api/health` |
 | `SCAN_FEATURE_ENABLED` | `false` | hold การสแกน → 423 (ต้องตรงกับ `SCAN_FEATURE_ENABLED` ใน `index.html`) |
 | `SCAN_DEMO_ONLY` | `true` | ถ้าเปิดสแกน จะแก้เฉพาะ memory ไม่เขียน Sheet |
-| `APP_VERSION` | `1.9.6-free` | เวอร์ชัน API; เวอร์ชันเว็บแยกกันและส่ง `app_version`/`api_version` คนละช่อง |
+| `APP_VERSION` | `1.9.7-free` | เวอร์ชัน API; เวอร์ชันเว็บแยกกันและส่ง `app_version`/`api_version` คนละช่อง |
 | `UAT_DATABASE_SPREADSHEET_ID` | `1RJcs…` | ที่เก็บ event log 7 แท็บ รวม Debug Events |
 | `GOOGLE_SERVICE_ACCOUNT_JSON` | (secret) | สิทธิ์เขียน Sheets |
 
 `UAT_SHEETS_ONLY` ถูกถอดออกแล้ว — Sheets เป็นโหมดเดียวที่มี ตัวแปรนี้ไม่มีผลอะไรถ้ายังค้างอยู่ใน Render
+
+## Release notes
+
+- **API 1.9.7-free (2026-10-12):** synchronize the Blueprint start command with the Free service configuration. Keep one Gunicorn worker, cap worker connections at 200, and recycle it every 400–500 requests to reduce accumulated memory use. The Render plan remains Free.
 
 ## ประสิทธิภาพบน Free plan (0.1 CPU / 512 MB / 1 worker)
 
 สิ่งที่ทำไว้เพื่อให้เว็บไม่ค้าง:
 
 1. **stale-while-revalidate บน Member Data** — cache หมดอายุแล้วจะ *คืนข้อมูลเดิมทันที* และรีเฟรชเบื้องหลัง
-   ไม่มีผู้ใช้คนไหนต้องรอโหลด 39,000 แถวอีก (เดิมรอได้ถึง 45 วินาที)
+   ไม่มีผู้ใช้คนไหนต้องรอโหลด Member Data กว่า 100,000 แถว (เดิมรอได้ถึง 45 วินาที)
 2. **gzip บนทุกการอ่าน gviz** — `fetch_gviz_text()` ส่ง `Accept-Encoding: gzip` ลดขนาดโหลดหลายเท่า
-3. **index ตาม Wave** — เดิมค้นหา 1 Wave ต้องสแกนทั้ง 39,000 แถว, Booking ที่มี 5 Wave ทำ 5 รอบ
+3. **index ตาม Wave** — เดิมค้นหา 1 Wave ต้องสแกนทั้งชีต, Booking ที่มี 5 Wave ทำ 5 รอบ
 4. **memoise รายการต่อ Wave** — 1 request เคยสร้างรายการเดิมซ้ำหลายครั้ง ตอนนี้สร้างครั้งเดียว
 5. **snapshot บนดิสก์** (`/tmp`, gzip) — worker restart แล้วอ่านจากดิสก์ ไม่ต้องโหลดใหม่
 6. **เลิก deepcopy บนแถวที่เป็น string ล้วน** — ใช้ `dict()` ต่อแถว เร็วกว่าหลายเท่า

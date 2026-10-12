@@ -16,7 +16,8 @@ services:
     # --max-requests รีไซเคิล worker เป็นระยะ เพื่อคืน RAM ก่อนจะชน 512 MB
     # (Events ของ service เคยขึ้น "Ran out of memory" หลายรอบต่อวัน)
     # การรีไซเคิลถูกลงเพราะ Member Data ถูก snapshot ไว้บนดิสก์แล้ว worker ใหม่
-    # อ่านจากไฟล์ ไม่ต้องดาวน์โหลด 44k แถวซ้ำ
+    # อ่านจากไฟล์ ไม่ต้องดาวน์โหลดข้อมูลทั้งชีตซ้ำ
+    # Keep this Blueprint command in sync with the Free service: 1 worker, bounded connections, and periodic worker recycling.
     startCommand: gunicorn main:app -w 1 -k uvicorn.workers.UvicornWorker --worker-connections 200 --backlog 256 --bind 0.0.0.0:$PORT --timeout 120 --keep-alive 10 --graceful-timeout 20 --max-requests 400 --max-requests-jitter 100
     # ?deep=1 เท่านั้นที่ตรวจ Google credentials; health check ปกติตอบทันทีไม่แตะเครือข่าย
     healthCheckPath: /api/health
@@ -35,6 +36,6 @@ services:
       - key: SCAN_DEMO_ONLY
         value: "true"
       - key: APP_VERSION
-        value: 1.9.6-free
+        value: 1.9.7-free
       - key: UAT_DATABASE_SPREADSHEET_ID
         value: 1RJcsrbWnGO7gMiq9bhBR4bA9Twh1NjqP6816dXOW9DI
