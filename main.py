@@ -53,7 +53,7 @@ if not os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
 # Google Sheets is the only data source. Credentials are loaded lazily by
 # get_sheets_session(), so a cold start never waits on an auth round-trip.
 APP_ENV = os.environ.get("APP_ENV", "uat").strip().lower()
-APP_VERSION = os.environ.get("APP_VERSION", "1.9.7-free").strip()
+APP_VERSION = os.environ.get("APP_VERSION", "1.9.8-free").strip()
 EMPLOYEE_LOOKUP_URL = "https://script.google.com/macros/s/AKfycbybmW6N7TxfsHqEa-Fx6ayy8M8xfjKGmTYO27izmbEoLJmQRrFD3i9c0XogP0fG6tlG/exec"
 
 # รายชื่อพนักงานสำหรับช่อง "เจ้าหน้าที่" บนใบคุมส่งสินค้า
@@ -4586,16 +4586,18 @@ def preview_booking_branch(wave_no: str, branch_code: str):
 
 
 def get_wave_for_branch_move(wave_no: str) -> dict:
-    """Load a move/split Wave, retrying a recent negative single-Wave lookup once.
+    """Load a move/split Wave without forcing a full Member Data refresh.
 
     Member Data is filled progressively. A Wave can therefore be absent on the
     first query and appear seconds later, while the short negative cache still
     remembers the old miss. Move/split is an explicit user action, so it should
-    bypass that one stale negative result without reloading the 140k-row sheet.
+    bypass that one stale negative result without refreshing the entire sheet.
+    The normal Wave builder revalidates this Wave alone in the background; when
+    it is absent, the recovery path below queries only this Wave from Sheets.
     """
     wave_clean = str(int(str(wave_no).strip()))
     try:
-        return get_wave_data_internal(wave_clean, force_refresh=True)
+        return get_wave_data_internal(wave_clean, force_refresh=False)
     except HTTPException as exc:
         if exc.status_code not in (404, 503):
             raise
@@ -4744,11 +4746,15 @@ def split_booking_branch(data: BookingBranchSplitData):
         booking_waves_cache.pop(source, None)
         booking_waves_cache.pop(target, None)
     split_report_summaries = []
-    booking_views = {}
+    target_view = None
     refresh_warnings = []
     for booking in (source, target):
         try:
-            booking_view = get_booking_data_internal(booking, force_refresh=True)
+            # Splitting changes the event sheet, not Member Data. The selected
+            # Wave was already loaded for this action; use the warmed history
+            # cache and refreshed split records instead of scheduling another
+            # full Member Data refresh for each Booking.
+            booking_view = get_booking_data_internal(booking, force_refresh=False)
         except Exception as exc:
             # The split row is already committed. Report success and let the
             # normal document refresh retry instead of inviting a duplicate save.
@@ -4756,7 +4762,8 @@ def split_booking_branch(data: BookingBranchSplitData):
             refresh_warnings.append(f"{booking}: {warning}")
             print(f"⚠️ Booking split saved; view refresh delayed for {booking}: {warning}")
             continue
-        booking_views[booking] = booking_view
+        if booking == target:
+            target_view = booking_view
         # A booking can contain the same branch in several waves. Build the
         # report from the exact Wave+Branch only, otherwise another wave's
         # split summary can overwrite this row or make one side look missing.
@@ -4767,6 +4774,8 @@ def split_booking_branch(data: BookingBranchSplitData):
             and str(int(re.sub(r"\D", "", str(item.get("wave_no") or "")))) == wave_clean
         ]
         if not branch_view_items:
+            if booking == source:
+                del booking_view
             continue
         summary = summarize_branch_for_member_data(
             {"wave_no": wave_clean, "booking_no": booking, "lpn_list": branch_view_items}, branch
@@ -4774,10 +4783,15 @@ def split_booking_branch(data: BookingBranchSplitData):
         is_closed = any(item.get("branch_closed_at") for item in branch_view_items)
         summary.update({"booking": booking, "booking_split": True, "is_closed": is_closed})
         split_report_summaries.append(summary)
+        if booking == source:
+            # The source snapshot has been reduced to the exact branch summary;
+            # release its full Booking view before building the target view.
+            del branch_view_items
+            del booking_view
     queue_report_summary_snapshots(split_report_summaries, delay_seconds=0.0)
     return {"status": "success", "message": "แบ่งยอดเข้าสอง Booking เรียบร้อย",
             "source_booking": source, "target_booking": target, "allocated": requested,
-            "target_view": booking_views.get(target),
+            "target_view": target_view,
             "refresh_pending": bool(refresh_warnings)}
 
 @app.post("/api/start-pallet")
