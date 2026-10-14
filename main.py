@@ -53,7 +53,7 @@ if not os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
 # Google Sheets is the only data source. Credentials are loaded lazily by
 # get_sheets_session(), so a cold start never waits on an auth round-trip.
 APP_ENV = os.environ.get("APP_ENV", "uat").strip().lower()
-APP_VERSION = os.environ.get("APP_VERSION", "1.9.8-free").strip()
+APP_VERSION = os.environ.get("APP_VERSION", "1.9.9-free").strip()
 EMPLOYEE_LOOKUP_URL = "https://script.google.com/macros/s/AKfycbybmW6N7TxfsHqEa-Fx6ayy8M8xfjKGmTYO27izmbEoLJmQRrFD3i9c0XogP0fG6tlG/exec"
 
 # รายชื่อพนักงานสำหรับช่อง "เจ้าหน้าที่" บนใบคุมส่งสินค้า
@@ -253,7 +253,7 @@ wave_monitoring_pick_date_cache = {
     "bookings": {},
 }
 wave_monitoring_pick_date_lock = Lock()
-uat_report_test_row_cache = {"expires_at": 0.0, "existing_map": {}, "last_data_row": 1}
+uat_report_test_row_cache = {"expires_at": 0.0, "existing_map": {}, "last_data_row": 1, "sort_pending": False}
 SHEET_ROW_CACHE_TTL_SECONDS = 15 * 60  # Free: ลดการอ่าน Sheet ซ้ำและรักษา RAM ให้อยู่ในขอบเขต
 SHEETS_HTTP_TIMEOUT = (3, 45)
 GVIZ_HTTP_TIMEOUT_SECONDS = 20
@@ -1176,7 +1176,14 @@ def _uat_report_key(booking: str, wave: str, branch: str) -> tuple:
     )
 
 
-def write_uat_report_test_summaries(summaries: list):
+def _uat_event_is_active(value=True) -> bool:
+    if isinstance(value, bool):
+        return value
+    normalized = str(value if value is not None else "true").strip().lower()
+    return normalized not in ("", "0", "false", "no", "off", "inactive")
+
+
+def write_uat_report_test_summaries(summaries: list, sort_after_insert: bool = True):
     """Upsert direct report rows to the isolated UAT reconciliation Sheet.
 
     The test Sheet has the final 20 report columns, so this path intentionally
@@ -1188,13 +1195,16 @@ def write_uat_report_test_summaries(summaries: list):
     branch_map = load_branch_report_map()
     now_bkk = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=7)))
     with delivery_report_lock:
-        existing_date_updates = []
         now = time.time()
+        sort_pending = bool(uat_report_test_row_cache.get("sort_pending"))
         if uat_report_test_row_cache["existing_map"] and uat_report_test_row_cache["expires_at"] > now:
             existing_map = dict(uat_report_test_row_cache["existing_map"])
             last_data_row = int(uat_report_test_row_cache["last_data_row"] or 1)
         else:
-            existing = _sheet_values(session, UAT_REPORT_TEST_SPREADSHEET_ID, f"'{UAT_REPORT_TEST_SHEET_NAME}'!A:T")
+            # Read existing Booking+Wave+Branch keys. Never normalize every
+            # displayed date on each upsert; that rebuilt a 20k-row payload.
+            existing = _sheet_values(session, UAT_REPORT_TEST_SPREADSHEET_ID,
+                                     f"'{UAT_REPORT_TEST_SHEET_NAME}'!A:T")
             existing_map = {}
             last_data_row = 1
             for index, raw_row in enumerate(existing[1:], start=2):
@@ -1205,25 +1215,10 @@ def write_uat_report_test_summaries(summaries: list):
                 if wave_digits and branch:
                     existing_map[_uat_report_key(booking, wave_digits, branch)] = index
                     last_data_row = max(last_data_row, index)
-                # Convert legacy dd/MM/yyyy text to date serials once, so
-                # Google Sheets sorts dates chronologically rather than as text.
-                normalized_dates = []
-                changed_dates = False
-                for value in row[1:4]:
-                    value = str(value or "").strip()
-                    try:
-                        parsed = datetime.datetime.strptime(value, "%d/%m/%Y").date()
-                        normalized_dates.append(parsed.isoformat())
-                        changed_dates = True
-                    except ValueError:
-                        normalized_dates.append(value)
-                if changed_dates:
-                    existing_date_updates.append({
-                        "range": f"'{UAT_REPORT_TEST_SHEET_NAME}'!B{index}:D{index}", "values": [normalized_dates]
-                    })
 
-        batch_data = list(existing_date_updates)
+        batch_data = []
         current_append_row = last_data_row + 1
+        inserted_new_rows = False
         meta_cache = {}
         for summary in summaries:
             wave = str(int(str(summary["wave"]).strip()))
@@ -1236,24 +1231,42 @@ def write_uat_report_test_summaries(summaries: list):
             booking = str(summary.get("booking") or meta.get("booking") or "").strip().upper()
             key = _uat_report_key(booking, wave, branch)
             target_row = existing_map.get(key)
+            target_was_existing = bool(target_row)
             if not target_row:
                 if int(summary.get("total") or 0) <= 0:
                     continue
-                target_row = current_append_row
-                current_append_row += 1
-                existing_map[key] = target_row
             branch_meta = branch_map.get(branch, {})
             pick_date = meta.get("pick_date")
             # Never silently replace a missing planned pick date with today's
-            # date: that creates an incorrect operational report.
+            # date: that creates an incorrect operational report. Keep the
+            # Booking and quantity row visible, and preserve any existing date
+            # metadata instead of dropping the entire report record.
             if not pick_date:
-                print(f"UAT report skipped: planned pick date not found | {booking}/{wave}/{branch}")
+                print(f"⚠️ UAT report saved without planned date; Booking and quantities retained | {booking}/{wave}/{branch}")
+            if not target_was_existing:
+                target_row = current_append_row
+                current_append_row += 1
+                existing_map[key] = target_row
+                inserted_new_rows = True
+            box_values = [[
+                _history_int(summary.get("m")),
+                _history_int(summary.get("red")),
+                _history_int(summary.get("blue")),
+                _history_int(summary.get("green")),
+                _history_int(summary.get("black")),
+                _history_int(summary.get("total")),
+            ]]
+            if not pick_date and target_was_existing:
+                batch_data.append({
+                    "range": f"'{UAT_REPORT_TEST_SHEET_NAME}'!O{target_row}:T{target_row}",
+                    "values": box_values,
+                })
                 continue
-            order_date, delivery_date = delivery_business_dates(pick_date)
+            order_date, delivery_date = delivery_business_dates(pick_date) if pick_date else (None, None)
             row = [[
                 target_row - 1,
                 order_date.isoformat() if order_date else "",
-                pick_date.isoformat(),
+                pick_date.isoformat() if pick_date else "",
                 delivery_date.isoformat() if delivery_date else "",
                 str(meta.get("carrier") or "").strip(),
                 str(meta.get("sender") or "").strip(),
@@ -1265,76 +1278,82 @@ def write_uat_report_test_summaries(summaries: list):
                 clean_branch_display_name(summary.get("branch_name")),
                 branch_meta.get("province", ""),
                 branch_meta.get("region", ""),
-                _history_int(summary.get("m")),
-                _history_int(summary.get("red")),
-                _history_int(summary.get("blue")),
-                _history_int(summary.get("green")),
-                _history_int(summary.get("black")),
-                _history_int(summary.get("total")),
+                *box_values[0],
             ]]
             batch_data.append({"range": f"'{UAT_REPORT_TEST_SHEET_NAME}'!A{target_row}:T{target_row}", "values": row})
 
         if not batch_data:
             return
         base = f"https://sheets.googleapis.com/v4/spreadsheets/{UAT_REPORT_TEST_SPREADSHEET_ID}"
-        # Google Sheets starts new tabs with 1,000 rows. A historical backfill
-        # can exceed that limit, so extend the grid before writing A1 ranges
-        # beyond the current row count. Existing rows/formulas are untouched.
-        required_last_row = max(last_data_row, current_append_row - 1)
-        metadata_response = session.get(
-            base,
-            params={"fields": "sheets(properties(sheetId,title,gridProperties(rowCount)))"},
-            timeout=SHEETS_HTTP_TIMEOUT,
-        )
-        metadata_response.raise_for_status()
-        target_properties = next((
-            sheet.get("properties", {})
-            for sheet in metadata_response.json().get("sheets", [])
-            if int(sheet.get("properties", {}).get("sheetId", -1)) == UAT_REPORT_TEST_SHEET_ID
-        ), {})
-        current_row_count = int(target_properties.get("gridProperties", {}).get("rowCount", 0) or 0)
-        if required_last_row > current_row_count:
-            expand_response = session.post(f"{base}:batchUpdate", json={"requests": [{
-                "appendDimension": {
-                    "sheetId": UAT_REPORT_TEST_SHEET_ID,
-                    "dimension": "ROWS",
-                    "length": required_last_row - current_row_count,
-                }
-            }]}, timeout=SHEETS_HTTP_TIMEOUT)
-            expand_response.raise_for_status()
+        if inserted_new_rows:
+            # Google Sheets starts new tabs at 1,000 rows; extend before writing.
+            required_last_row = current_append_row - 1
+            metadata_response = session.get(
+                base,
+                params={"fields": "sheets(properties(sheetId,title,gridProperties(rowCount)))"},
+                timeout=SHEETS_HTTP_TIMEOUT,
+            )
+            metadata_response.raise_for_status()
+            target_properties = next((
+                sheet.get("properties", {})
+                for sheet in metadata_response.json().get("sheets", [])
+                if int(sheet.get("properties", {}).get("sheetId", -1)) == UAT_REPORT_TEST_SHEET_ID
+            ), {})
+            current_row_count = int(target_properties.get("gridProperties", {}).get("rowCount", 0) or 0)
+            if required_last_row > current_row_count:
+                expand_response = session.post(f"{base}:batchUpdate", json={"requests": [{
+                    "appendDimension": {
+                        "sheetId": UAT_REPORT_TEST_SHEET_ID,
+                        "dimension": "ROWS",
+                        "length": required_last_row - current_row_count,
+                    }
+                }]}, timeout=SHEETS_HTTP_TIMEOUT)
+                expand_response.raise_for_status()
+            # Remember an append even if this repair call is not the final batch.
+            uat_report_test_row_cache["sort_pending"] = True
         response = session.post(
             f"{base}/values:batchUpdate",
             json={"valueInputOption": "USER_ENTERED", "data": batch_data}, timeout=SHEETS_HTTP_TIMEOUT
         )
         response.raise_for_status()
-        final_row = max(last_data_row, current_append_row - 1)
-        # Format dates then sort data rows by pickup date (column C). The sort
-        # excludes headers and runs only in the isolated UAT test sheet.
-        sort_response = session.post(f"{base}:batchUpdate", json={"requests": [
-            {"repeatCell": {
-                "range": {"sheetId": UAT_REPORT_TEST_SHEET_ID, "startRowIndex": 1,
-                          "endRowIndex": final_row, "startColumnIndex": 1, "endColumnIndex": 4},
-                "cell": {"userEnteredFormat": {"numberFormat": {"type": "DATE", "pattern": "dd/MM/yyyy"}}},
-                "fields": "userEnteredFormat.numberFormat"
-            }},
-            {"sortRange": {
-                "range": {"sheetId": UAT_REPORT_TEST_SHEET_ID, "startRowIndex": 1,
-                          "endRowIndex": final_row, "startColumnIndex": 0, "endColumnIndex": 20},
-                "sortSpecs": [{"dimensionIndex": 2, "sortOrder": "ASCENDING"}]
-            }},
-        ]}, timeout=SHEETS_HTTP_TIMEOUT)
-        sort_response.raise_for_status()
-        # Re-number after sorting. Invalidate the row cache because positions
-        # have changed and must be read again before the next upsert.
-        sequence_values = [[row_no - 1] for row_no in range(2, final_row + 1)]
-        sequence_response = session.post(f"{base}/values:batchUpdate", json={
-            "valueInputOption": "RAW",
-            "data": [{"range": f"'{UAT_REPORT_TEST_SHEET_NAME}'!A2:A{final_row}", "values": sequence_values}],
-        }, timeout=SHEETS_HTTP_TIMEOUT)
-        sequence_response.raise_for_status()
-        uat_report_test_row_cache.update({"existing_map": {}, "last_data_row": 1, "expires_at": 0.0})
+        if sort_after_insert and (inserted_new_rows or sort_pending):
+            # Expand/sort/re-number only when adding keys. Updating existing
+            # split rows must not sort 21k report rows on every save.
+            final_row = max(last_data_row, current_append_row - 1)
+            sort_response = session.post(f"{base}:batchUpdate", json={"requests": [
+                {"repeatCell": {
+                    "range": {"sheetId": UAT_REPORT_TEST_SHEET_ID, "startRowIndex": 1,
+                              "endRowIndex": final_row, "startColumnIndex": 1, "endColumnIndex": 4},
+                    "cell": {"userEnteredFormat": {"numberFormat": {"type": "DATE", "pattern": "dd/MM/yyyy"}}},
+                    "fields": "userEnteredFormat.numberFormat"
+                }},
+                {"sortRange": {
+                    "range": {"sheetId": UAT_REPORT_TEST_SHEET_ID, "startRowIndex": 1,
+                              "endRowIndex": final_row, "startColumnIndex": 0, "endColumnIndex": 20},
+                    "sortSpecs": [{"dimensionIndex": 2, "sortOrder": "ASCENDING"}]
+                }},
+            ]}, timeout=SHEETS_HTTP_TIMEOUT)
+            sort_response.raise_for_status()
+            sequence_values = [[row_no - 1] for row_no in range(2, final_row + 1)]
+            sequence_response = session.post(f"{base}/values:batchUpdate", json={
+                "valueInputOption": "RAW",
+                "data": [{"range": f"'{UAT_REPORT_TEST_SHEET_NAME}'!A2:A{final_row}", "values": sequence_values}],
+            }, timeout=SHEETS_HTTP_TIMEOUT)
+            sequence_response.raise_for_status()
+            uat_report_test_row_cache.update({"existing_map": {}, "last_data_row": 1,
+                                              "expires_at": 0.0, "sort_pending": False})
+        else:
+            # Existing keys kept their row positions, or a repair batch is
+            # still appending unsorted rows. Keep the index warm until its
+            # final batch performs the single table sort.
+            uat_report_test_row_cache.update({
+                "existing_map": existing_map,
+                "last_data_row": current_append_row - 1 if inserted_new_rows else last_data_row,
+                "expires_at": time.time() + SHEET_ROW_CACHE_TTL_SECONDS,
+                "sort_pending": sort_pending or inserted_new_rows,
+            })
         dashboard_operations_cache.update({"expires_at": 0.0, "rows": []})
-        print(f"⚡ UAT test Delivery report updated | {len(batch_data)} branches")
+        print(f"⚡ UAT test Delivery report updated | {len(summaries)} branches")
 
 
 UAT_REPORT_RECONCILE_INTERVAL_SECONDS = max(
@@ -1399,16 +1418,17 @@ def _build_uat_delivery_report_candidates() -> list:
     split_records = get_booking_branch_splits()
     splits_by_pair = {}
     for (split_wave, split_branch, _target), split in split_records.items():
-        active_value = str(split.get("Is_Active", True) or "").strip().lower()
-        if active_value in ("", "0", "false", "no", "off"):
+        if not _uat_event_is_active(split.get("Is_Active", True)):
             continue
         splits_by_pair.setdefault((str(split_wave), str(split_branch).strip().upper()), []).append(split)
 
     candidates = []
-    for (wave, branch), raw in history.items():
-        summary = _member_history_report_summary(raw)
-        if int(summary.get("total") or 0) <= 0:
-            continue
+    all_pairs = set(history) | set(splits_by_pair)
+    for wave, branch in sorted(all_pairs):
+        raw = history.get((wave, branch))
+        summary = _member_history_report_summary(raw) if raw else normalize_report_summary({
+            "wave": wave, "branch": branch, "branch_name": branch, "bu": "Unknown",
+        })
         native_booking = get_wave_monitoring_booking(wave, branch)
         if not native_booking:
             native_booking = str(get_sheet_meta_for_wave(wave).get("booking") or "").strip().upper()
@@ -1441,13 +1461,18 @@ def _build_uat_delivery_report_candidates() -> list:
                     allocated[field] += int(target.get(field) or 0)
             remaining = copy.deepcopy(summary)
             remaining["booking"] = source_booking
+            remaining["booking_split"] = True
             for field in (*REPORT_BOX_FIELDS, "pallet"):
                 remaining[field] = max(0, int(summary.get(field) or 0) - allocated[field])
             remaining = normalize_report_summary(remaining)
-            if remaining.get("total", 0) > 0:
+            # Keep a zero source candidate too: if every box was allocated,
+            # reconciliation must clear an existing stale source row.
+            if raw is not None:
                 candidates.append(remaining)
             continue
 
+        if int(summary.get("total") or 0) <= 0:
+            continue
         summary["booking"] = assigned_booking or native_booking
         summary = normalize_report_summary(summary)
         if summary.get("booking") and summary.get("total", 0) > 0:
@@ -1456,45 +1481,63 @@ def _build_uat_delivery_report_candidates() -> list:
 
 
 def reconcile_uat_delivery_report(force: bool = False) -> dict:
-    """Restore missing report rows without overwriting user corrections."""
+    """Restore missing report rows and repair split rows from durable split events."""
     now = time.time()
     with uat_report_reconcile_state_lock:
-        if not force and now - float(uat_report_reconcile_state.get("last_started_at") or 0) < 30:
+        if not force and now - float(uat_report_reconcile_state.get("last_started_at") or 0) < UAT_REPORT_RECONCILE_INTERVAL_SECONDS:
             return {"status": "throttled"}
         uat_report_reconcile_state["last_started_at"] = now
     try:
         session = get_sheets_session()
         existing_keys = _read_uat_report_keys(session)
         candidates = _build_uat_delivery_report_candidates()
-        missing = []
+        upserts = []
+        missing_count = 0
+        repaired_split_count = 0
         seen = set()
         skipped = 0
         for candidate in candidates:
             candidate = normalize_report_summary(candidate)
             key = _uat_report_key(candidate.get("booking"), candidate.get("wave"), candidate.get("branch"))
-            if not key[1] or not key[2] or key in existing_keys or key in seen:
+            if not key[1] or not key[2] or key in seen:
+                continue
+            is_split_snapshot = bool(candidate.get("booking_split"))
+            if key in existing_keys and not is_split_snapshot:
                 continue
             if not candidate.get("booking_split"):
                 candidate = normalize_report_summary(apply_document_override_to_summary(candidate))
-            if candidate.get("is_hidden") or int(candidate.get("total") or 0) <= 0:
+            if candidate.get("is_hidden"):
+                skipped += 1
+                continue
+            if int(candidate.get("total") or 0) <= 0 and not (is_split_snapshot and key in existing_keys):
                 skipped += 1
                 continue
             seen.add(key)
-            missing.append(candidate)
+            upserts.append(candidate)
+            if key in existing_keys:
+                repaired_split_count += 1
+            else:
+                missing_count += 1
 
-        if missing:
+        if upserts:
             uat_report_test_row_cache.update({"existing_map": {}, "last_data_row": 1, "expires_at": 0.0})
-            for offset in range(0, len(missing), 400):
-                write_uat_report_test_summaries(missing[offset:offset + 400])
+            chunk_size = 400
+            for offset in range(0, len(upserts), chunk_size):
+                end = min(offset + chunk_size, len(upserts))
+                write_uat_report_test_summaries(
+                    upserts[offset:end], sort_after_insert=end == len(upserts)
+                )
         result = {"status": "completed", "candidates": len(candidates),
-                  "missing": len(missing), "skipped": skipped}
+                  "missing": missing_count, "repaired_splits": repaired_split_count,
+                  "upserts": len(upserts), "skipped": skipped}
         with uat_report_reconcile_state_lock:
             uat_report_reconcile_state.update({
-                "last_completed_at": time.time(), "last_missing": len(missing),
+                "last_completed_at": time.time(), "last_missing": missing_count,
+                "last_repaired_splits": repaired_split_count,
                 "last_skipped": skipped, "last_error": "",
             })
-        if missing:
-            print(f"♻️ UAT Delivery report repair | restored={len(missing)} skipped={skipped}")
+        if upserts:
+            print(f"♻️ UAT Delivery report repair | restored={missing_count} repaired_splits={repaired_split_count} skipped={skipped}")
         return result
     except Exception as exc:
         with uat_report_reconcile_state_lock:
@@ -1690,13 +1733,14 @@ def normalize_report_summary(raw: dict, wave: str = "", branch: str = "") -> dic
 
 
 
-def _report_sync_key(wave: str, branch: str, mode: str) -> tuple:
+def _report_sync_key(wave: str, branch: str, mode: str, booking: str = "") -> tuple:
     clean_wave = re.sub(r"\D", "", str(wave or ""))
-    return (str(int(clean_wave)) if clean_wave else "", str(branch or "").strip().upper(), mode)
+    booking_key = re.sub(r"\s+", "", str(booking or "").upper())
+    return (str(int(clean_wave)) if clean_wave else "", str(branch or "").strip().upper(), mode, booking_key)
 
 
 def queue_report_summary_snapshots(summaries: list, delay_seconds: float = REPORT_SYNC_FAST_DELAY_SECONDS):
-    """Queue exact totals already shown by the web; latest snapshot wins per Wave+Branch."""
+    """Queue exact report totals; split Booking rows remain separate for one Wave+Branch."""
     now = time.time()
     with report_sync_pending_lock:
         for raw in summaries or []:
@@ -1704,7 +1748,7 @@ def queue_report_summary_snapshots(summaries: list, delay_seconds: float = REPOR
             # Automatic zero snapshots are ignored; an intentional zero correction may clear an existing row.
             if summary.get("total", 0) <= 0 and not summary.get("allow_zero_update"):
                 continue
-            key = _report_sync_key(summary.get("wave"), summary.get("branch"), "snapshot")
+            key = _report_sync_key(summary.get("wave"), summary.get("branch"), "snapshot", summary.get("booking"))
             if not key[0] or not key[1]:
                 continue
             previous = report_sync_pending.get(key) or {}
@@ -1713,6 +1757,7 @@ def queue_report_summary_snapshots(summaries: list, delay_seconds: float = REPOR
                 "mode": "snapshot",
                 "wave": key[0],
                 "branch": key[1],
+                "booking": key[3],
                 "summary": summary,
                 "first_at": first_at,
                 "due_at": min(now + max(0.0, delay_seconds), first_at + REPORT_SYNC_MAX_DEBOUNCE_SECONDS),
@@ -1798,7 +1843,7 @@ def _requeue_failed_report_entries(entries: list):
             retry["attempts"] = attempts
             retry["first_at"] = now
             retry["due_at"] = now + min(60.0, 3.0 * (2 ** min(attempts, 4)))
-            key = _report_sync_key(retry["wave"], retry["branch"], retry["mode"])
+            key = _report_sync_key(retry["wave"], retry["branch"], retry["mode"], retry.get("booking", ""))
             # Never replace a newer change that arrived while this write was running.
             report_sync_pending.setdefault(key, retry)
     report_sync_wakeup.set()
@@ -2667,6 +2712,7 @@ booking_assignments_cache = {"data": {}, "expires_at": 0.0}
 booking_assignments_cache_lock = Lock()
 booking_splits_cache = {"data": {}, "expires_at": 0.0}
 booking_splits_cache_lock = Lock()
+booking_split_write_lock = Lock()
 booking_override_table_ready = False
 booking_override_table_lock = Lock()
 booking_split_table_ready = False
@@ -2999,7 +3045,8 @@ def get_booking_data_internal(booking_no: str, force_refresh: bool = False) -> d
             assignment = assignments.get((wave_key, branch))
             assigned_booking = str((assignment or {}).get("Assigned_Booking") or "").strip().upper()
             branch_splits = [split for (split_wave, split_branch, target), split in splits.items()
-                             if split_wave == wave_key and split_branch == branch and bool(split.get("Is_Active", True))]
+                             if split_wave == wave_key and split_branch == branch
+                             and _uat_event_is_active(split.get("Is_Active", True))]
             if assigned_booking:
                 if assigned_booking != booking_clean:
                     continue
@@ -3310,6 +3357,52 @@ def get_booking_branch_splits(force_refresh: bool = False) -> dict:
         except Exception as exc:
             print(f"BOOKING SPLIT READ ERROR: {exc}")
             return {key: dict(row) for key, row in booking_splits_cache["data"].items()}
+
+
+def _build_booking_split_report_summaries(wave: str, branch: str, source: str, target: str,
+                                          preview: dict, requested: dict, split_records: dict) -> list:
+    """Build both Booking rows from one Wave total and the latest active split events."""
+    split_columns = {"m": "M_Count", "red": "Red_Count", "blue": "Blue_Count",
+                     "green": "Green_Count", "black": "Black_Count", "pallet": "Pallet_Count"}
+    active = [
+        split for (split_wave, split_branch, _split_target), split in split_records.items()
+        if split_wave == wave and split_branch == branch
+        and _uat_event_is_active(split.get("Is_Active", True))
+    ]
+    allocated = {
+        field: sum(_history_int(split.get(column)) for split in active)
+        for field, column in split_columns.items()
+    }
+    available = preview.get("totals") or {}
+    source_totals = {
+        field: max(0, _history_int(available.get(field)) - allocated[field])
+        for field in split_columns
+    }
+    target_split = next((
+        split for (split_wave, split_branch, split_target), split in split_records.items()
+        if split_wave == wave and split_branch == branch and split_target == target
+        and _uat_event_is_active(split.get("Is_Active", True))
+    ), None)
+    target_totals = {
+        field: _history_int((target_split or {}).get(column, requested.get(field, 0)))
+        for field, column in split_columns.items()
+    }
+    common = {
+        "wave": wave,
+        "branch": branch,
+        "branch_name": str(preview.get("branch_name") or branch),
+        "bu": preview.get("bu"),
+        "label_count": _history_int(preview.get("lpn_total")),
+        "booking_split": True,
+        "is_closed": bool(preview.get("closed_at")),
+    }
+    source_summary = normalize_report_summary({
+        **common, "booking": source, **source_totals, "allow_zero_update": True,
+    })
+    target_summary = normalize_report_summary({
+        **common, "booking": target, **target_totals,
+    })
+    return [source_summary, target_summary]
 
 
 def persist_target_booking_split_edits(summaries: list, emp_id: str, reason: str = "") -> list:
@@ -4577,6 +4670,7 @@ def preview_booking_branch(wave_no: str, branch_code: str):
     return {
         "status": "success", "wave_no": wave_clean, "branch_code": branch,
         "branch_name": items[0].get("branch_name") or "Unknown",
+        "bu": summary.get("bu"), "label_count": summary.get("label_count", len(items)),
         "current_booking": current_booking, "lpn_total": len(items),
         "lpn_scanned": len(scanned), "box_qty": sum(int(item.get("qty") or 0) for item in scanned),
         "pallet_count": len({int(item.get("pallet_no") or 0) for item in scanned if int(item.get("pallet_no") or 0) > 0}),
@@ -4717,82 +4811,59 @@ def split_booking_branch(data: BookingBranchSplitData):
     source = str(preview.get("current_booking") or "").strip().upper()
     if source == target:
         raise HTTPException(status_code=409, detail=f"สาขา {branch} อยู่ใน Booking {target} แล้ว")
+    if not source:
+        raise HTTPException(status_code=409, detail=f"ไม่พบ Booking ต้นทางของสาขา {branch} ใน Wave {wave_clean}")
     requested = {field: max(0, int(getattr(data, field) or 0)) for field in
                  ("m", "red", "blue", "green", "black", "pallet")}
     if sum(requested[field] for field in ("m", "red", "blue", "green", "black")) <= 0:
         raise HTTPException(status_code=400, detail="กรุณาระบุยอดกล่องที่ต้องการแบ่งอย่างน้อย 1 กล่อง")
     available = preview.get("totals") or {}
-    existing_splits = [split for (split_wave, split_branch, split_target), split in get_booking_branch_splits().items()
-                       if split_wave == wave_clean and split_branch == branch and bool(split.get("Is_Active", True))
-                       and split_target != target]
     split_columns = {"m": "M_Count", "red": "Red_Count", "blue": "Blue_Count",
                      "green": "Green_Count", "black": "Black_Count", "pallet": "Pallet_Count"}
-    for field, value in requested.items():
-        remaining = max(0, int(available.get(field) or 0) - sum(int(split.get(split_columns[field]) or 0) for split in existing_splits))
-        if value > remaining:
-            raise HTTPException(status_code=409, detail=f"ยอด {field} ที่แบ่ง ({value}) มากกว่ายอดคงเหลือ ({remaining})")
-    get_booking_waves_mapping(target, force_refresh=True)
-    append_uat_event_rows("Booking Branch Splits", [{
-        "Event_ID": str(uuid.uuid4()), "Wave_Number": wave_clean, "Branch_Code": branch,
-        "Source_Booking": source, "Target_Booking": target,
-        "M_Count": requested["m"], "Red_Count": requested["red"], "Blue_Count": requested["blue"],
-        "Green_Count": requested["green"], "Black_Count": requested["black"],
-        "Pallet_Count": requested["pallet"], "Is_Active": True, "Reason": reason,
-        "Note": str(data.note or "").strip(), "Emp_ID": emp_id, "Created_At": _uat_now_iso(),
-    }])
-    with booking_splits_cache_lock:
-        booking_splits_cache["expires_at"] = 0.0
-    with booking_waves_cache_lock:
-        booking_waves_cache.pop(source, None)
-        booking_waves_cache.pop(target, None)
-    split_report_summaries = []
-    target_view = None
-    refresh_warnings = []
-    for booking in (source, target):
-        try:
-            # Splitting changes the event sheet, not Member Data. The selected
-            # Wave was already loaded for this action; use the warmed history
-            # cache and refreshed split records instead of scheduling another
-            # full Member Data refresh for each Booking.
-            booking_view = get_booking_data_internal(booking, force_refresh=False)
-        except Exception as exc:
-            # The split row is already committed. Report success and let the
-            # normal document refresh retry instead of inviting a duplicate save.
-            warning = str(getattr(exc, "detail", exc))
-            refresh_warnings.append(f"{booking}: {warning}")
-            print(f"⚠️ Booking split saved; view refresh delayed for {booking}: {warning}")
-            continue
-        if booking == target:
-            target_view = booking_view
-        # A booking can contain the same branch in several waves. Build the
-        # report from the exact Wave+Branch only, otherwise another wave's
-        # split summary can overwrite this row or make one side look missing.
-        branch_view_items = [
-            item for item in booking_view.get("lpn_list", [])
-            if str(item.get("branch") or "").strip().upper() == branch
-            and re.sub(r"\D", "", str(item.get("wave_no") or ""))
-            and str(int(re.sub(r"\D", "", str(item.get("wave_no") or "")))) == wave_clean
-        ]
-        if not branch_view_items:
-            if booking == source:
-                del booking_view
-            continue
-        summary = summarize_branch_for_member_data(
-            {"wave_no": wave_clean, "booking_no": booking, "lpn_list": branch_view_items}, branch
+    with booking_split_write_lock:
+        # Serialize validation and append so simultaneous allocations to two
+        # target Bookings cannot both spend the same remaining source quantity.
+        all_splits = get_booking_branch_splits(force_refresh=True)
+        existing_splits = [split for (split_wave, split_branch, split_target), split in all_splits.items()
+                           if split_wave == wave_clean and split_branch == branch
+                           and _uat_event_is_active(split.get("Is_Active", True))
+                           and split_target != target]
+        for field, value in requested.items():
+            remaining = max(0, _history_int(available.get(field)) - sum(
+                _history_int(split.get(split_columns[field])) for split in existing_splits
+            ))
+            if value > remaining:
+                raise HTTPException(status_code=409, detail=f"ยอด {field} ที่แบ่ง ({value}) มากกว่ายอดคงเหลือ ({remaining})")
+        get_booking_waves_mapping(target, force_refresh=True)
+        split_event = {
+            "Event_ID": str(uuid.uuid4()), "Wave_Number": wave_clean, "Branch_Code": branch,
+            "Source_Booking": source, "Target_Booking": target,
+            "M_Count": requested["m"], "Red_Count": requested["red"], "Blue_Count": requested["blue"],
+            "Green_Count": requested["green"], "Black_Count": requested["black"],
+            "Pallet_Count": requested["pallet"], "Is_Active": True, "Reason": reason,
+            "Note": str(data.note or "").strip(), "Emp_ID": emp_id, "Created_At": _uat_now_iso(),
+        }
+        append_uat_event_rows("Booking Branch Splits", [split_event])
+        updated_splits = {key: dict(row) for key, row in all_splits.items()}
+        updated_splits[(wave_clean, branch, target)] = split_event
+        with booking_splits_cache_lock:
+            booking_splits_cache.update({
+                "data": updated_splits,
+                "expires_at": time.time() + BOOKING_METADATA_CACHE_TTL_SECONDS,
+            })
+        with booking_waves_cache_lock:
+            booking_waves_cache.pop(source, None)
+            booking_waves_cache.pop(target, None)
+        split_report_summaries = _build_booking_split_report_summaries(
+            wave_clean, branch, source, target, preview, requested, updated_splits
         )
-        is_closed = any(item.get("branch_closed_at") for item in branch_view_items)
-        summary.update({"booking": booking, "booking_split": True, "is_closed": is_closed})
-        split_report_summaries.append(summary)
-        if booking == source:
-            # The source snapshot has been reduced to the exact branch summary;
-            # release its full Booking view before building the target view.
-            del branch_view_items
-            del booking_view
-    queue_report_summary_snapshots(split_report_summaries, delay_seconds=0.0)
+        # Queue both Booking rows before returning. No full Booking views or
+        # report-sheet sorts are done in this request; the web refreshes its
+        # target document separately after the durable event has been saved.
+        queue_report_summary_snapshots(split_report_summaries, delay_seconds=0.0)
     return {"status": "success", "message": "แบ่งยอดเข้าสอง Booking เรียบร้อย",
             "source_booking": source, "target_booking": target, "allocated": requested,
-            "target_view": target_view,
-            "refresh_pending": bool(refresh_warnings)}
+            "target_view": None, "refresh_pending": False}
 
 @app.post("/api/start-pallet")
 def start_pallet(data: PalletStartData):
