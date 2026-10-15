@@ -53,7 +53,7 @@ if not os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
 # Google Sheets is the only data source. Credentials are loaded lazily by
 # get_sheets_session(), so a cold start never waits on an auth round-trip.
 APP_ENV = os.environ.get("APP_ENV", "uat").strip().lower()
-APP_VERSION = os.environ.get("APP_VERSION", "1.9.11-free").strip()
+APP_VERSION = os.environ.get("APP_VERSION", "1.9.12-free").strip()
 EMPLOYEE_LOOKUP_URL = "https://script.google.com/macros/s/AKfycbybmW6N7TxfsHqEa-Fx6ayy8M8xfjKGmTYO27izmbEoLJmQRrFD3i9c0XogP0fG6tlG/exec"
 
 # รายชื่อพนักงานสำหรับช่อง "เจ้าหน้าที่" บนใบคุมส่งสินค้า
@@ -1473,6 +1473,94 @@ def write_uat_report_test_summaries(
         print(f"⚡ UAT test Delivery report updated | {len(batch_data)} rows; skipped_missing_dates={skipped_missing_dates}")
 
 
+def delete_uat_report_incomplete_date_rows(session=None) -> int:
+    """Remove UAT Delivery report rows missing any of the three required dates."""
+    session = session or get_sheets_session()
+    with delivery_report_lock:
+        rows = _sheet_values(session, UAT_REPORT_TEST_SPREADSHEET_ID,
+                             f"'{UAT_REPORT_TEST_SHEET_NAME}'!A:T")
+        incomplete_rows = []
+        empty_rows = []
+        last_data_row = 1
+        for row_number, raw_row in enumerate(rows[1:], start=2):
+            row = list(raw_row) + [""] * max(0, 20 - len(raw_row))
+            if not any(str(value or "").strip() for value in row):
+                empty_rows.append(row_number)
+                continue
+            last_data_row = row_number
+            if any(_parse_report_date(row[index]) is None for index in (1, 2, 3)):
+                incomplete_rows.append(row_number)
+
+        if not incomplete_rows:
+            return 0
+
+        # Compact only empty gaps inside the report data block so sorting and
+        # sequence renumbering cannot turn blank rows into numbered records.
+        removal_rows = sorted(set(incomplete_rows) | {
+            row_number for row_number in empty_rows if row_number < last_data_row
+        })
+
+        # Coalesce adjacent spreadsheet rows, then delete from bottom to top so
+        # row indices from the original read remain valid throughout the batch.
+        grouped_ranges = []
+        range_start = range_end = removal_rows[0]
+        for row_number in removal_rows[1:]:
+            if row_number == range_end + 1:
+                range_end = row_number
+                continue
+            grouped_ranges.append((range_start, range_end))
+            range_start = range_end = row_number
+        grouped_ranges.append((range_start, range_end))
+        grouped_ranges.reverse()
+
+        base = f"https://sheets.googleapis.com/v4/spreadsheets/{UAT_REPORT_TEST_SPREADSHEET_ID}"
+        for offset in range(0, len(grouped_ranges), 400):
+            requests = [{"deleteDimension": {
+                "range": {
+                    "sheetId": UAT_REPORT_TEST_SHEET_ID,
+                    "dimension": "ROWS",
+                    "startIndex": start_row - 1,
+                    "endIndex": end_row,
+                }
+            }} for start_row, end_row in grouped_ranges[offset:offset + 400]]
+            response = session.post(f"{base}:batchUpdate", json={"requests": requests},
+                                    timeout=SHEETS_HTTP_TIMEOUT)
+            response.raise_for_status()
+
+        final_row = max(1, last_data_row - len(removal_rows))
+        if final_row >= 2:
+            requests = [
+                {"repeatCell": {
+                    "range": {"sheetId": UAT_REPORT_TEST_SHEET_ID, "startRowIndex": 1,
+                              "endRowIndex": final_row, "startColumnIndex": 1, "endColumnIndex": 4},
+                    "cell": {"userEnteredFormat": {"numberFormat": {"type": "DATE", "pattern": "dd/MM/yyyy"}}},
+                    "fields": "userEnteredFormat.numberFormat",
+                }},
+                {"sortRange": {
+                    "range": {"sheetId": UAT_REPORT_TEST_SHEET_ID, "startRowIndex": 1,
+                              "endRowIndex": final_row, "startColumnIndex": 0, "endColumnIndex": 20},
+                    "sortSpecs": [{"dimensionIndex": 2, "sortOrder": "ASCENDING"}],
+                }},
+            ]
+            response = session.post(f"{base}:batchUpdate", json={"requests": requests},
+                                    timeout=SHEETS_HTTP_TIMEOUT)
+            response.raise_for_status()
+            response = session.post(f"{base}/values:batchUpdate", json={
+                "valueInputOption": "RAW",
+                "data": [{"range": f"'{UAT_REPORT_TEST_SHEET_NAME}'!A2:A{final_row}",
+                          "values": [[row_no - 1] for row_no in range(2, final_row + 1)]}],
+            }, timeout=SHEETS_HTTP_TIMEOUT)
+            response.raise_for_status()
+
+        uat_report_test_row_cache.update({
+            "existing_map": {}, "existing_dates": {}, "last_data_row": 1,
+            "expires_at": 0.0, "sort_pending": False,
+        })
+        dashboard_operations_cache.update({"expires_at": 0.0, "rows": []})
+        print(f"🧹 UAT Delivery report removed {len(incomplete_rows)} rows missing confirmed dates; compacted {len(removal_rows) - len(incomplete_rows)} empty rows")
+        return len(incomplete_rows)
+
+
 def delete_uat_report_test_summaries(keys: list) -> int:
     """Delete only exact Booking+Wave+Branch rows removed by floor operations."""
     wanted = {
@@ -1711,6 +1799,7 @@ def reconcile_uat_delivery_report(force: bool = False) -> dict:
         uat_report_reconcile_state["last_started_at"] = now
     try:
         session = get_sheets_session()
+        incomplete_dates_deleted = delete_uat_report_incomplete_date_rows(session)
         existing_keys = _read_uat_report_keys(session)
         wave_monitoring_rows = load_fresh_wave_monitoring_report_rows()
         candidates = _build_uat_delivery_report_candidates(wave_monitoring_rows)
@@ -1757,15 +1846,17 @@ def reconcile_uat_delivery_report(force: bool = False) -> dict:
         deleted_count = delete_uat_report_test_summaries(deletions) if deletions else 0
         result = {"status": "completed", "candidates": len(candidates),
                   "missing": missing_count, "repaired_splits": repaired_split_count,
-                  "upserts": len(upserts), "deleted": deleted_count, "skipped": skipped}
+                  "upserts": len(upserts), "deleted": deleted_count,
+                  "deleted_incomplete_dates": incomplete_dates_deleted,
+                  "skipped": skipped}
         with uat_report_reconcile_state_lock:
             uat_report_reconcile_state.update({
                 "last_completed_at": time.time(), "last_missing": missing_count,
                 "last_repaired_splits": repaired_split_count,
                 "last_skipped": skipped, "last_error": "",
             })
-        if upserts or deleted_count:
-            print(f"♻️ UAT Delivery report repair | restored={missing_count} repaired_splits={repaired_split_count} deleted={deleted_count} skipped={skipped}")
+        if upserts or deleted_count or incomplete_dates_deleted:
+            print(f"♻️ UAT Delivery report repair | restored={missing_count} repaired_splits={repaired_split_count} deleted={deleted_count} deleted_incomplete_dates={incomplete_dates_deleted} skipped={skipped}")
         return result
     except Exception as exc:
         with uat_report_reconcile_state_lock:
