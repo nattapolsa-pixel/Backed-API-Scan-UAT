@@ -29,7 +29,7 @@
 | `APP_ENV` | `uat` | แสดงบน `/api/health` |
 | `SCAN_FEATURE_ENABLED` | `false` | hold การสแกน → 423 (ต้องตรงกับ `SCAN_FEATURE_ENABLED` ใน `index.html`) |
 | `SCAN_DEMO_ONLY` | `true` | ถ้าเปิดสแกน จะแก้เฉพาะ memory ไม่เขียน Sheet |
-| `APP_VERSION` | `1.9.9-free` | เวอร์ชัน API; เวอร์ชันเว็บแยกกันและส่ง `app_version`/`api_version` คนละช่อง |
+| `APP_VERSION` | `1.9.10-free` | เวอร์ชัน API; เวอร์ชันเว็บแยกกันและส่ง `app_version`/`api_version` คนละช่อง |
 | `UAT_DATABASE_SPREADSHEET_ID` | `1RJcs…` | ที่เก็บ event log 7 แท็บ รวม Debug Events |
 | `GOOGLE_SERVICE_ACCOUNT_JSON` | (secret) | สิทธิ์เขียน Sheets |
 
@@ -37,6 +37,7 @@
 
 ## Release notes
 
+- **API 1.9.10-free (2026-10-15):** write Delivery report rows only for Wave+branch entries freshly confirmed by `Wave_Monitoring`, and require a planned pick date before deriving and writing all three report dates. Reconciliation no longer backfills old Waves from the full `Member Data` history or falls back to `Booking & Wave`; existing complete historical rows keep their dates when quantities are corrected.
 - **API 1.9.9-free (2026-10-14):** keep source and target Booking report snapshots separate, repair stale existing split rows from the UAT event log, and return from split requests without rebuilding two full Booking views. Avoid reformatting and sorting the entire Delivery Report on ordinary row updates; serialize split validation and writes so concurrent targets cannot over-allocate one Wave+branch.
 - **API 1.9.8-free (2026-10-14):** keep the Booking move/split flow from forcing full Member Data refreshes. Revalidate only the selected Wave, rebuild both Booking views from the warmed cache and latest split event, and retain only the target view in memory. This reduces request time and peak RAM for branch splits on the Free API.
 - **API 1.9.7-free (2026-10-12):** synchronize the Blueprint start command with the Free service configuration. Keep one Gunicorn worker, cap worker connections at 200, and recycle it every 400–500 requests to reduce accumulated memory use. The Render plan remains Free.

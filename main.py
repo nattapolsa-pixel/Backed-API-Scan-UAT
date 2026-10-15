@@ -53,7 +53,7 @@ if not os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
 # Google Sheets is the only data source. Credentials are loaded lazily by
 # get_sheets_session(), so a cold start never waits on an auth round-trip.
 APP_ENV = os.environ.get("APP_ENV", "uat").strip().lower()
-APP_VERSION = os.environ.get("APP_VERSION", "1.9.9-free").strip()
+APP_VERSION = os.environ.get("APP_VERSION", "1.9.10-free").strip()
 EMPLOYEE_LOOKUP_URL = "https://script.google.com/macros/s/AKfycbybmW6N7TxfsHqEa-Fx6ayy8M8xfjKGmTYO27izmbEoLJmQRrFD3i9c0XogP0fG6tlG/exec"
 
 # รายชื่อพนักงานสำหรับช่อง "เจ้าหน้าที่" บนใบคุมส่งสินค้า
@@ -251,9 +251,13 @@ wave_monitoring_pick_date_cache = {
     "waves": {},
     "branches": {},
     "bookings": {},
+    "report_rows": {},
 }
 wave_monitoring_pick_date_lock = Lock()
-uat_report_test_row_cache = {"expires_at": 0.0, "existing_map": {}, "last_data_row": 1, "sort_pending": False}
+uat_report_test_row_cache = {
+    "expires_at": 0.0, "existing_map": {}, "existing_dates": {},
+    "last_data_row": 1, "sort_pending": False,
+}
 SHEET_ROW_CACHE_TTL_SECONDS = 15 * 60  # Free: ลดการอ่าน Sheet ซ้ำและรักษา RAM ให้อยู่ในขอบเขต
 SHEETS_HTTP_TIMEOUT = (3, 45)
 GVIZ_HTTP_TIMEOUT_SECONDS = 20
@@ -954,6 +958,8 @@ def _load_wave_monitoring_pick_dates(force: bool = False) -> tuple:
     wave_dates = {}
     expected_branches = {}
     booking_by_branch = {}
+    report_rows = {}
+    invalid_report_pairs = set()
     try:
         # The GViz query endpoint can inherit the sheet's active basic filter,
         # which previously hid older pick dates (for example 31/08/2026).
@@ -980,9 +986,27 @@ def _load_wave_monitoring_pick_dates(force: bool = False) -> tuple:
             pick_date = _parse_pick_date(row[pick_date_index])
             booking = re.sub(r"\s+", "", str(row[booking_index] or "").upper())
             branch = str(row[branch_index] or "").strip().upper()
+            wave_tokens = _wave_tokens(row[wave_index])
+            if booking and booking not in INVALID_BRANCH_STRINGS and branch:
+                for wave in wave_tokens:
+                    pair = (wave, branch)
+                    if not pick_date:
+                        invalid_report_pairs.add(pair)
+                        report_rows.pop(pair, None)
+                        booking_by_branch.pop(pair, None)
+                        continue
+                    if pair in invalid_report_pairs:
+                        continue
+                    previous = report_rows.get(pair)
+                    if previous and (previous["booking"] != booking or previous["pick_date"] != pick_date):
+                        invalid_report_pairs.add(pair)
+                        report_rows.pop(pair, None)
+                        booking_by_branch.pop(pair, None)
+                        continue
+                    report_rows[pair] = {"booking": booking, "pick_date": pick_date}
             if not pick_date:
                 continue
-            for wave in _wave_tokens(row[wave_index]):
+            for wave in wave_tokens:
                 if booking:
                     exact[(booking, wave)] = pick_date
                     exact[(booking.replace("-", ""), wave)] = pick_date
@@ -991,7 +1015,8 @@ def _load_wave_monitoring_pick_dates(force: bool = False) -> tuple:
                         # Wave_Monitoring is authoritative for the Booking of a
                         # concrete Wave+Branch. This avoids the old "last row
                         # wins" mistake when one Wave is shared by two Books.
-                        booking_by_branch[(wave, branch)] = booking
+                        if (wave, branch) not in invalid_report_pairs:
+                            booking_by_branch[(wave, branch)] = booking
                 wave_dates.setdefault(wave, pick_date)
         with wave_monitoring_pick_date_lock:
             wave_monitoring_pick_date_cache.update({
@@ -999,6 +1024,7 @@ def _load_wave_monitoring_pick_dates(force: bool = False) -> tuple:
                 "loaded_at": time.time(),
                 "exact": exact, "waves": wave_dates, "branches": expected_branches,
                 "bookings": booking_by_branch,
+                "report_rows": report_rows,
             })
     except Exception as exc:
         print(f"⚠️ Wave Monitoring pick-date read unavailable: {exc}")
@@ -1009,6 +1035,22 @@ def _load_wave_monitoring_pick_dates(force: bool = False) -> tuple:
                         copy.deepcopy(wave_monitoring_pick_date_cache["waves"]),
                         copy.deepcopy(wave_monitoring_pick_date_cache["branches"]))
     return exact, wave_dates, expected_branches
+
+
+def load_fresh_wave_monitoring_report_rows() -> dict:
+    """Read current report-eligible Wave+branch rows from Wave_Monitoring.
+
+    Unlike ordinary operational lookups, report writes must not use a stale
+    Wave_Monitoring snapshot: that tab is replaced with new Waves. A failed
+    read therefore returns no permission to append a report row.
+    """
+    with wave_monitoring_refresh_lock:
+        requested_at = time.time()
+        _load_wave_monitoring_pick_dates(force=True)
+        with wave_monitoring_pick_date_lock:
+            if wave_monitoring_pick_date_cache.get("loaded_at", 0) < requested_at:
+                raise RuntimeError("Wave_Monitoring could not be freshly read; report inserts are paused")
+            return copy.deepcopy(wave_monitoring_pick_date_cache.get("report_rows") or {})
 
 
 def get_wave_monitoring_booking(wave_no: str, branch_code: str) -> str:
@@ -1183,7 +1225,40 @@ def _uat_event_is_active(value=True) -> bool:
     return normalized not in ("", "0", "false", "no", "off", "inactive")
 
 
-def write_uat_report_test_summaries(summaries: list, sort_after_insert: bool = True):
+def _uat_report_booking_is_current(booking: str, wave: str, branch: str, monitoring_row: dict) -> bool:
+    """Allow the monitored Booking or an explicitly recorded move/split target."""
+    requested = re.sub(r"\s+", "", str(booking or "").upper())
+    source = re.sub(r"\s+", "", str((monitoring_row or {}).get("booking") or "").upper())
+    if not requested or requested in INVALID_BRANCH_STRINGS or not source:
+        return False
+    if requested == source:
+        return True
+
+    for (raw_wave, raw_branch), assignment in get_booking_branch_assignments().items():
+        wave_digits = re.sub(r"\D", "", str(raw_wave or ""))
+        assigned = re.sub(r"\s+", "", str(assignment.get("Assigned_Booking") or "").upper())
+        if (wave_digits and str(int(wave_digits)) == wave
+                and str(raw_branch or "").strip().upper() == branch
+                and requested == assigned):
+            return True
+
+    for (raw_wave, raw_branch, _target), split in get_booking_branch_splits().items():
+        split_wave = re.sub(r"\D", "", str(raw_wave or ""))
+        split_branch = str(raw_branch or "").strip().upper()
+        split_source = re.sub(r"\s+", "", str(split.get("Source_Booking") or "").upper())
+        split_target = re.sub(r"\s+", "", str(split.get("Target_Booking") or "").upper())
+        if (split_wave and str(int(split_wave)) == wave and split_branch == branch
+                and _uat_event_is_active(split.get("Is_Active", True))
+                and split_source == source and split_target == requested):
+            return True
+    return False
+
+
+def write_uat_report_test_summaries(
+    summaries: list,
+    sort_after_insert: bool = True,
+    wave_monitoring_rows: Optional[dict] = None,
+):
     """Upsert direct report rows to the isolated UAT reconciliation Sheet.
 
     The test Sheet has the final 20 report columns, so this path intentionally
@@ -1193,12 +1268,20 @@ def write_uat_report_test_summaries(summaries: list, sort_after_insert: bool = T
         return
     session = get_sheets_session()
     branch_map = load_branch_report_map()
-    now_bkk = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=7)))
+    if wave_monitoring_rows is None:
+        try:
+            wave_monitoring_rows = load_fresh_wave_monitoring_report_rows()
+        except Exception as exc:
+            # Existing complete rows can still receive quantity edits, but a
+            # new row never relies on a stale Wave_Monitoring date snapshot.
+            wave_monitoring_rows = {}
+            print(f"⚠️ UAT report inserts paused: current Wave_Monitoring unavailable ({exc})")
     with delivery_report_lock:
         now = time.time()
         sort_pending = bool(uat_report_test_row_cache.get("sort_pending"))
         if uat_report_test_row_cache["existing_map"] and uat_report_test_row_cache["expires_at"] > now:
             existing_map = dict(uat_report_test_row_cache["existing_map"])
+            existing_dates = dict(uat_report_test_row_cache.get("existing_dates") or {})
             last_data_row = int(uat_report_test_row_cache["last_data_row"] or 1)
         else:
             # Read existing Booking+Wave+Branch keys. Never normalize every
@@ -1206,6 +1289,7 @@ def write_uat_report_test_summaries(summaries: list, sort_after_insert: bool = T
             existing = _sheet_values(session, UAT_REPORT_TEST_SPREADSHEET_ID,
                                      f"'{UAT_REPORT_TEST_SHEET_NAME}'!A:T")
             existing_map = {}
+            existing_dates = {}
             last_data_row = 1
             for index, raw_row in enumerate(existing[1:], start=2):
                 row = list(raw_row) + [""] * max(0, 20 - len(raw_row))
@@ -1213,36 +1297,60 @@ def write_uat_report_test_summaries(summaries: list, sort_after_insert: bool = T
                 wave_digits = re.sub(r"\D", "", str(row[9] or ""))
                 branch = str(row[10] or "").strip().upper()
                 if wave_digits and branch:
-                    existing_map[_uat_report_key(booking, wave_digits, branch)] = index
+                    key = _uat_report_key(booking, wave_digits, branch)
+                    existing_map[key] = index
+                    existing_dates[key] = tuple(str(value or "").strip() for value in row[1:4])
                     last_data_row = max(last_data_row, index)
 
         batch_data = []
         current_append_row = last_data_row + 1
         inserted_new_rows = False
         meta_cache = {}
+        skipped_missing_dates = 0
         for summary in summaries:
             wave = str(int(str(summary["wave"]).strip()))
             branch = str(summary["branch"] or "").strip().upper()
             summary_booking = str(summary.get("booking") or "").strip().upper()
-            meta_key = (wave, summary_booking)
-            if meta_key not in meta_cache:
-                meta_cache[meta_key] = get_delivery_wave_meta(wave, summary_booking)
-            meta = meta_cache[meta_key]
-            booking = str(summary.get("booking") or meta.get("booking") or "").strip().upper()
+            monitoring_row = wave_monitoring_rows.get((wave, branch))
+            booking = summary_booking or str((monitoring_row or {}).get("booking") or "").strip().upper()
+            if not booking or booking in INVALID_BRANCH_STRINGS:
+                skipped_missing_dates += 1
+                continue
+            if monitoring_row and not _uat_report_booking_is_current(booking, wave, branch, monitoring_row):
+                # A current Wave's date cannot be borrowed by an unrelated or
+                # stale Booking that happens to reuse its Wave/branch key.
+                monitoring_row = None
             key = _uat_report_key(booking, wave, branch)
             target_row = existing_map.get(key)
             target_was_existing = bool(target_row)
             if not target_row:
                 if int(summary.get("total") or 0) <= 0:
                     continue
+                planned_pick_date = (monitoring_row or {}).get("pick_date")
+                planned_order_date, planned_delivery_date = delivery_business_dates(planned_pick_date)
+                if not (planned_pick_date and planned_order_date and planned_delivery_date):
+                    skipped_missing_dates += 1
+                    continue
+            else:
+                dates = existing_dates.get(key, ())
+                if len(dates) < 3 or any(not value for value in dates):
+                    # Incomplete rows are removed by the UAT cleanup. Never
+                    # revive them with an undated quantity update.
+                    skipped_missing_dates += 1
+                    continue
             branch_meta = branch_map.get(branch, {})
-            pick_date = meta.get("pick_date")
-            # Never silently replace a missing planned pick date with today's
-            # date: that creates an incorrect operational report. Keep the
-            # Booking and quantity row visible, and preserve any existing date
-            # metadata instead of dropping the entire report record.
-            if not pick_date:
-                print(f"⚠️ UAT report saved without planned date; Booking and quantities retained | {booking}/{wave}/{branch}")
+            monitored_pick_date = (monitoring_row or {}).get("pick_date")
+            if monitored_pick_date:
+                meta_key = (wave, booking)
+                if meta_key not in meta_cache:
+                    meta_cache[meta_key] = get_delivery_wave_meta(wave, booking)
+                meta = dict(meta_cache[meta_key])
+                # Wave_Monitoring alone authorizes report dates. Ignore stale
+                # dates from Booking & Wave when the Wave is no longer there.
+                meta["pick_date"] = monitored_pick_date
+            else:
+                meta = {}
+            pick_date = monitored_pick_date
             if not target_was_existing:
                 target_row = current_append_row
                 current_append_row += 1
@@ -1256,18 +1364,23 @@ def write_uat_report_test_summaries(summaries: list, sort_after_insert: bool = T
                 _history_int(summary.get("black")),
                 _history_int(summary.get("total")),
             ]]
-            if not pick_date and target_was_existing:
+            if target_was_existing and not monitored_pick_date:
+                # Wave_Monitoring is replaced over time. Preserve dates and
+                # descriptive fields of complete history, changing amounts only.
                 batch_data.append({
                     "range": f"'{UAT_REPORT_TEST_SHEET_NAME}'!O{target_row}:T{target_row}",
                     "values": box_values,
                 })
                 continue
-            order_date, delivery_date = delivery_business_dates(pick_date) if pick_date else (None, None)
+            order_date, delivery_date = delivery_business_dates(pick_date)
+            if not (order_date and delivery_date):
+                skipped_missing_dates += 1
+                continue
             row = [[
                 target_row - 1,
-                order_date.isoformat() if order_date else "",
-                pick_date.isoformat() if pick_date else "",
-                delivery_date.isoformat() if delivery_date else "",
+                order_date.isoformat(),
+                pick_date.isoformat(),
+                delivery_date.isoformat(),
                 str(meta.get("carrier") or "").strip(),
                 str(meta.get("sender") or "").strip(),
                 str(meta.get("plate") or "").strip(),
@@ -1281,8 +1394,11 @@ def write_uat_report_test_summaries(summaries: list, sort_after_insert: bool = T
                 *box_values[0],
             ]]
             batch_data.append({"range": f"'{UAT_REPORT_TEST_SHEET_NAME}'!A{target_row}:T{target_row}", "values": row})
+            existing_dates[key] = (order_date.isoformat(), pick_date.isoformat(), delivery_date.isoformat())
 
         if not batch_data:
+            if skipped_missing_dates:
+                print(f"⚠️ UAT report skipped rows without three confirmed dates | {skipped_missing_dates}")
             return
         base = f"https://sheets.googleapis.com/v4/spreadsheets/{UAT_REPORT_TEST_SPREADSHEET_ID}"
         if inserted_new_rows:
@@ -1340,7 +1456,7 @@ def write_uat_report_test_summaries(summaries: list, sort_after_insert: bool = T
                 "data": [{"range": f"'{UAT_REPORT_TEST_SHEET_NAME}'!A2:A{final_row}", "values": sequence_values}],
             }, timeout=SHEETS_HTTP_TIMEOUT)
             sequence_response.raise_for_status()
-            uat_report_test_row_cache.update({"existing_map": {}, "last_data_row": 1,
+            uat_report_test_row_cache.update({"existing_map": {}, "existing_dates": {}, "last_data_row": 1,
                                               "expires_at": 0.0, "sort_pending": False})
         else:
             # Existing keys kept their row positions, or a repair batch is
@@ -1348,12 +1464,13 @@ def write_uat_report_test_summaries(summaries: list, sort_after_insert: bool = T
             # final batch performs the single table sort.
             uat_report_test_row_cache.update({
                 "existing_map": existing_map,
+                "existing_dates": existing_dates,
                 "last_data_row": current_append_row - 1 if inserted_new_rows else last_data_row,
                 "expires_at": time.time() + SHEET_ROW_CACHE_TTL_SECONDS,
                 "sort_pending": sort_pending or inserted_new_rows,
             })
         dashboard_operations_cache.update({"expires_at": 0.0, "rows": []})
-        print(f"⚡ UAT test Delivery report updated | {len(summaries)} branches")
+        print(f"⚡ UAT test Delivery report updated | {len(batch_data)} rows; skipped_missing_dates={skipped_missing_dates}")
 
 
 UAT_REPORT_RECONCILE_INTERVAL_SECONDS = max(
@@ -1373,13 +1490,15 @@ uat_report_reconcile_state = {
 
 
 def _read_uat_report_keys(session) -> set:
-    """Read target identities only; avoid loading 20 columns for this check."""
+    """Read dated identities only; incomplete rows must not block restoration."""
     rows = _sheet_values(session, UAT_REPORT_TEST_SPREADSHEET_ID,
-                         f"'{UAT_REPORT_TEST_SHEET_NAME}'!H:K")
+                         f"'{UAT_REPORT_TEST_SHEET_NAME}'!B:K")
     keys = set()
     for raw_row in rows[1:]:
-        row = list(raw_row) + [""] * max(0, 4 - len(raw_row))
-        key = _uat_report_key(row[0], row[2], row[3])
+        row = list(raw_row) + [""] * max(0, 10 - len(raw_row))
+        if any(not str(value or "").strip() for value in row[:3]):
+            continue
+        key = _uat_report_key(row[6], row[8], row[9])
         if key[1] and key[2]:
             keys.add(key)
     return keys
@@ -1408,33 +1527,49 @@ def _member_history_report_summary(row: dict) -> dict:
     return normalize_report_summary(summary)
 
 
-def _build_uat_delivery_report_candidates() -> list:
-    """Build missing-row candidates from Member Data + move/split events."""
+def _build_uat_delivery_report_candidates(wave_monitoring_rows: Optional[dict] = None) -> list:
+    """Build candidates only for dated Wave+branches still in Wave_Monitoring."""
     history = load_member_history()
     if not history:
         return []
-    load_wave_monitoring_pick_dates()
-    assignments = get_booking_branch_assignments()
+    if wave_monitoring_rows is None:
+        wave_monitoring_rows = load_fresh_wave_monitoring_report_rows()
+    assignments = {}
+    for (move_wave, move_branch), move in get_booking_branch_assignments().items():
+        wave_digits = re.sub(r"\D", "", str(move_wave or ""))
+        branch = str(move_branch or "").strip().upper()
+        if wave_digits and branch:
+            assignments[(str(int(wave_digits)), branch)] = move
     split_records = get_booking_branch_splits()
     splits_by_pair = {}
     for (split_wave, split_branch, _target), split in split_records.items():
         if not _uat_event_is_active(split.get("Is_Active", True)):
             continue
-        splits_by_pair.setdefault((str(split_wave), str(split_branch).strip().upper()), []).append(split)
+        wave_digits = re.sub(r"\D", "", str(split_wave or ""))
+        wave = str(int(wave_digits)) if wave_digits else ""
+        branch = str(split_branch).strip().upper()
+        if wave and branch:
+            splits_by_pair.setdefault((wave, branch), []).append(split)
 
     candidates = []
-    all_pairs = set(history) | set(splits_by_pair)
+    all_pairs = (set(history) | set(splits_by_pair)) & set(wave_monitoring_rows)
     for wave, branch in sorted(all_pairs):
+        monitoring_row = wave_monitoring_rows[(wave, branch)]
+        native_booking = str(monitoring_row.get("booking") or "").strip().upper()
+        if not native_booking:
+            continue
         raw = history.get((wave, branch))
         summary = _member_history_report_summary(raw) if raw else normalize_report_summary({
             "wave": wave, "branch": branch, "branch_name": branch, "bu": "Unknown",
         })
-        native_booking = get_wave_monitoring_booking(wave, branch)
-        if not native_booking:
-            native_booking = str(get_sheet_meta_for_wave(wave).get("booking") or "").strip().upper()
-        assignment = assignments.get((str(wave), branch)) or {}
+        assignment = assignments.get((wave, branch)) or {}
         assigned_booking = str(assignment.get("Assigned_Booking") or "").strip().upper()
-        active_splits = splits_by_pair.get((str(wave), branch), [])
+        active_splits = [
+            split for split in splits_by_pair.get((str(wave), branch), [])
+            if not str(split.get("Source_Booking") or "").strip()
+            or re.sub(r"\s+", "", str(split.get("Source_Booking") or "").upper())
+            == re.sub(r"\s+", "", native_booking)
+        ]
 
         if active_splits:
             source_booking = str(active_splits[0].get("Source_Booking") or native_booking).strip().upper()
@@ -1490,7 +1625,8 @@ def reconcile_uat_delivery_report(force: bool = False) -> dict:
     try:
         session = get_sheets_session()
         existing_keys = _read_uat_report_keys(session)
-        candidates = _build_uat_delivery_report_candidates()
+        wave_monitoring_rows = load_fresh_wave_monitoring_report_rows()
+        candidates = _build_uat_delivery_report_candidates(wave_monitoring_rows)
         upserts = []
         missing_count = 0
         repaired_split_count = 0
@@ -1520,12 +1656,14 @@ def reconcile_uat_delivery_report(force: bool = False) -> dict:
                 missing_count += 1
 
         if upserts:
-            uat_report_test_row_cache.update({"existing_map": {}, "last_data_row": 1, "expires_at": 0.0})
+            uat_report_test_row_cache.update({"existing_map": {}, "existing_dates": {},
+                                              "last_data_row": 1, "expires_at": 0.0})
             chunk_size = 400
             for offset in range(0, len(upserts), chunk_size):
                 end = min(offset + chunk_size, len(upserts))
                 write_uat_report_test_summaries(
-                    upserts[offset:end], sort_after_insert=end == len(upserts)
+                    upserts[offset:end], sort_after_insert=end == len(upserts),
+                    wave_monitoring_rows=wave_monitoring_rows,
                 )
         result = {"status": "completed", "candidates": len(candidates),
                   "missing": missing_count, "repaired_splits": repaired_split_count,
