@@ -23,7 +23,7 @@ import urllib.parse
 import urllib.request
 import threading
 import traceback
-from threading import Lock
+from threading import Lock, RLock
 from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI()
@@ -53,7 +53,7 @@ if not os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
 # Google Sheets is the only data source. Credentials are loaded lazily by
 # get_sheets_session(), so a cold start never waits on an auth round-trip.
 APP_ENV = os.environ.get("APP_ENV", "uat").strip().lower()
-APP_VERSION = os.environ.get("APP_VERSION", "1.9.10-free").strip()
+APP_VERSION = os.environ.get("APP_VERSION", "1.9.11-free").strip()
 EMPLOYEE_LOOKUP_URL = "https://script.google.com/macros/s/AKfycbybmW6N7TxfsHqEa-Fx6ayy8M8xfjKGmTYO27izmbEoLJmQRrFD3i9c0XogP0fG6tlG/exec"
 
 # รายชื่อพนักงานสำหรับช่อง "เจ้าหน้าที่" บนใบคุมส่งสินค้า
@@ -235,7 +235,7 @@ BRANCH_MASTER_SHEET_NAME = "ข้อมูลสาขา"
 WAVE_MONITORING_SPREADSHEET_ID = "1TL-tj-BrvYM7i_wNHlA0x641_VOqfT9SLpmm2NZATOo"
 WAVE_MONITORING_SHEET_GID = "0"
 WAVE_MONITORING_CACHE_TTL_SECONDS = 5 * 60
-delivery_report_lock = Lock()
+delivery_report_lock = RLock()
 # Manual document writes are queued and serialized.  Render Free can take a
 # while to update two Google Sheets; overlapping requests used to race and one
 # response could overwrite or clear the previous branch edit.
@@ -1473,6 +1473,90 @@ def write_uat_report_test_summaries(
         print(f"⚡ UAT test Delivery report updated | {len(batch_data)} rows; skipped_missing_dates={skipped_missing_dates}")
 
 
+def delete_uat_report_test_summaries(keys: list) -> int:
+    """Delete only exact Booking+Wave+Branch rows removed by floor operations."""
+    wanted = {
+        _uat_report_key(item.get("booking"), item.get("wave"), item.get("branch"))
+        for item in keys or [] if isinstance(item, dict)
+    }
+    # A blank Booking would make a hide ambiguous when one Wave is split across
+    # multiple Bookings. Never broaden a delete to every row for that Wave.
+    wanted = {key for key in wanted if key[0] and key[1] and key[2]}
+    if not wanted:
+        return 0
+
+    session = get_sheets_session()
+    with delivery_report_lock:
+        rows = _sheet_values(session, UAT_REPORT_TEST_SPREADSHEET_ID,
+                             f"'{UAT_REPORT_TEST_SHEET_NAME}'!A:T")
+        matching_rows = []
+        last_data_row = 1
+        for row_number, raw_row in enumerate(rows[1:], start=2):
+            row = list(raw_row) + [""] * max(0, 20 - len(raw_row))
+            if any(str(value or "").strip() for value in row):
+                last_data_row = row_number
+            key = _uat_report_key(row[7], row[9], row[10])
+            if key in wanted:
+                matching_rows.append(row_number)
+        if not matching_rows:
+            return 0
+
+        base = f"https://sheets.googleapis.com/v4/spreadsheets/{UAT_REPORT_TEST_SPREADSHEET_ID}"
+        requests = [{"deleteDimension": {
+            "range": {
+                "sheetId": UAT_REPORT_TEST_SHEET_ID,
+                "dimension": "ROWS",
+                "startIndex": row_number - 1,
+                "endIndex": row_number,
+            }
+        }} for row_number in sorted(matching_rows, reverse=True)]
+        final_row = max(1, last_data_row - len(matching_rows))
+        if final_row >= 2:
+            requests.extend([
+                {"repeatCell": {
+                    "range": {"sheetId": UAT_REPORT_TEST_SHEET_ID, "startRowIndex": 1,
+                              "endRowIndex": final_row, "startColumnIndex": 1, "endColumnIndex": 4},
+                    "cell": {"userEnteredFormat": {"numberFormat": {"type": "DATE", "pattern": "dd/MM/yyyy"}}},
+                    "fields": "userEnteredFormat.numberFormat",
+                }},
+                {"sortRange": {
+                    "range": {"sheetId": UAT_REPORT_TEST_SHEET_ID, "startRowIndex": 1,
+                              "endRowIndex": final_row, "startColumnIndex": 0, "endColumnIndex": 20},
+                    "sortSpecs": [{"dimensionIndex": 2, "sortOrder": "ASCENDING"}],
+                }},
+            ])
+        response = session.post(f"{base}:batchUpdate", json={"requests": requests}, timeout=SHEETS_HTTP_TIMEOUT)
+        response.raise_for_status()
+        if final_row >= 2:
+            sequence_response = session.post(f"{base}/values:batchUpdate", json={
+                "valueInputOption": "RAW",
+                "data": [{"range": f"'{UAT_REPORT_TEST_SHEET_NAME}'!A2:A{final_row}",
+                          "values": [[row_no - 1] for row_no in range(2, final_row + 1)]}],
+            }, timeout=SHEETS_HTTP_TIMEOUT)
+            sequence_response.raise_for_status()
+        uat_report_test_row_cache.update({
+            "existing_map": {}, "existing_dates": {}, "last_data_row": 1,
+            "expires_at": 0.0, "sort_pending": False,
+        })
+        dashboard_operations_cache.update({"expires_at": 0.0, "rows": []})
+        print(f"🧹 UAT Delivery report removed {len(matching_rows)} obsolete rows")
+        return len(matching_rows)
+
+
+def sync_uat_delivery_report_summaries(summaries: list):
+    """Upsert visible rows and remove explicitly hidden Booking rows in UAT report."""
+    normalized = [normalize_report_summary(summary) for summary in summaries or []]
+    hidden = [summary for summary in normalized if summary.get("is_hidden")]
+    visible = [summary for summary in normalized
+               if not summary.get("is_hidden")
+               and (summary.get("total", 0) > 0 or summary.get("allow_zero_update"))]
+    with delivery_report_lock:
+        if hidden:
+            delete_uat_report_test_summaries(hidden)
+        if visible:
+            write_uat_report_test_summaries(visible)
+
+
 UAT_REPORT_RECONCILE_INTERVAL_SECONDS = max(
     5 * 60, int(os.environ.get("UAT_REPORT_RECONCILE_INTERVAL_SECONDS", "900"))
 )
@@ -1571,7 +1655,9 @@ def _build_uat_delivery_report_candidates(wave_monitoring_rows: Optional[dict] =
             == re.sub(r"\s+", "", native_booking)
         ]
 
-        if active_splits:
+        # A later explicit full move supersedes the old split allocations for
+        # report reconstruction, just as it does in the Booking document.
+        if active_splits and not assigned_booking:
             source_booking = str(active_splits[0].get("Source_Booking") or native_booking).strip().upper()
             allocated = {field: 0 for field in (*REPORT_BOX_FIELDS, "pallet")}
             for split in active_splits:
@@ -1603,6 +1689,7 @@ def _build_uat_delivery_report_candidates(wave_monitoring_rows: Optional[dict] =
             # Keep a zero source candidate too: if every box was allocated,
             # reconciliation must clear an existing stale source row.
             if raw is not None:
+                remaining["is_hidden"] = remaining.get("total", 0) <= 0
                 candidates.append(remaining)
             continue
 
@@ -1628,6 +1715,7 @@ def reconcile_uat_delivery_report(force: bool = False) -> dict:
         wave_monitoring_rows = load_fresh_wave_monitoring_report_rows()
         candidates = _build_uat_delivery_report_candidates(wave_monitoring_rows)
         upserts = []
+        deletions = []
         missing_count = 0
         repaired_split_count = 0
         seen = set()
@@ -1638,17 +1726,18 @@ def reconcile_uat_delivery_report(force: bool = False) -> dict:
             if not key[1] or not key[2] or key in seen:
                 continue
             is_split_snapshot = bool(candidate.get("booking_split"))
-            if key in existing_keys and not is_split_snapshot:
-                continue
             if not candidate.get("booking_split"):
                 candidate = normalize_report_summary(apply_document_override_to_summary(candidate))
+            if key in existing_keys and not is_split_snapshot and not candidate.get("is_hidden"):
+                continue
+            seen.add(key)
             if candidate.get("is_hidden"):
+                deletions.append({"booking": key[0], "wave": key[1], "branch": key[2]})
                 skipped += 1
                 continue
             if int(candidate.get("total") or 0) <= 0 and not (is_split_snapshot and key in existing_keys):
                 skipped += 1
                 continue
-            seen.add(key)
             upserts.append(candidate)
             if key in existing_keys:
                 repaired_split_count += 1
@@ -1665,17 +1754,18 @@ def reconcile_uat_delivery_report(force: bool = False) -> dict:
                     upserts[offset:end], sort_after_insert=end == len(upserts),
                     wave_monitoring_rows=wave_monitoring_rows,
                 )
+        deleted_count = delete_uat_report_test_summaries(deletions) if deletions else 0
         result = {"status": "completed", "candidates": len(candidates),
                   "missing": missing_count, "repaired_splits": repaired_split_count,
-                  "upserts": len(upserts), "skipped": skipped}
+                  "upserts": len(upserts), "deleted": deleted_count, "skipped": skipped}
         with uat_report_reconcile_state_lock:
             uat_report_reconcile_state.update({
                 "last_completed_at": time.time(), "last_missing": missing_count,
                 "last_repaired_splits": repaired_split_count,
                 "last_skipped": skipped, "last_error": "",
             })
-        if upserts:
-            print(f"♻️ UAT Delivery report repair | restored={missing_count} repaired_splits={repaired_split_count} skipped={skipped}")
+        if upserts or deleted_count:
+            print(f"♻️ UAT Delivery report repair | restored={missing_count} repaired_splits={repaired_split_count} deleted={deleted_count} skipped={skipped}")
         return result
     except Exception as exc:
         with uat_report_reconcile_state_lock:
@@ -1904,6 +1994,34 @@ def queue_report_summary_snapshots(summaries: list, delay_seconds: float = REPOR
     report_sync_wakeup.set()
 
 
+def queue_delivery_report_snapshots(summaries: list, delay_seconds: float = 0.0):
+    """Queue a verified document-open snapshot for Delivery report only."""
+    now = time.time()
+    with report_sync_pending_lock:
+        for raw in summaries or []:
+            summary = normalize_report_summary(raw)
+            if (summary.get("total", 0) <= 0 and not summary.get("allow_zero_update")
+                    and not summary.get("is_hidden")):
+                continue
+            key = _report_sync_key(summary.get("wave"), summary.get("branch"),
+                                   "report_snapshot", summary.get("booking"))
+            if not key[0] or not key[1]:
+                continue
+            previous = report_sync_pending.get(key) or {}
+            first_at = float(previous.get("first_at") or now)
+            report_sync_pending[key] = {
+                "mode": "report_snapshot",
+                "wave": key[0],
+                "branch": key[1],
+                "booking": key[3],
+                "summary": summary,
+                "first_at": first_at,
+                "due_at": min(now + max(0.0, delay_seconds), first_at + REPORT_SYNC_MAX_DEBOUNCE_SECONDS),
+                "attempts": int(previous.get("attempts") or 0),
+            }
+    report_sync_wakeup.set()
+
+
 def queue_branch_totals_reconciliation(wave_branch_pairs, delay_seconds: float = REPORT_SYNC_RECONCILE_DELAY_SECONDS):
     """Queue a server-side recalculation from the Sheets sources."""
     now = time.time()
@@ -1944,6 +2062,8 @@ def queue_wave_totals_reconciliation(waves, delay_seconds: float = REPORT_SYNC_R
 def _build_reconciled_summaries(entries: list) -> list:
     summaries = []
     entries_by_wave = {}
+    assignments = get_booking_branch_assignments()
+    split_records = get_booking_branch_splits()
     for entry in entries:
         entries_by_wave.setdefault(entry["wave"], []).append(entry)
     for wave, wave_entries in entries_by_wave.items():
@@ -1964,10 +2084,58 @@ def _build_reconciled_summaries(entries: list) -> list:
             # Google Sheets เป็นรายงานงานที่ปิดจบแล้วเท่านั้น ห้ามสร้างแถว 0/ยอดระหว่างทำงาน
             if not any(item.get("branch_closed_at") for item in branch_items):
                 continue
-            # ยอดคำนวณจาก Sheet คือแหล่งจริง แล้วให้ยอดที่ผู้ใช้แก้เองชนะท้ายสุด
-            summary = normalize_report_summary(summarize_branch_for_member_data(fresh, branch), wave, branch)
-            summary = normalize_report_summary(apply_document_override_to_summary(summary), wave, branch)
-            if summary.get("total", 0) > 0 or summary.get("allow_zero_update"):
+            base = normalize_report_summary(summarize_branch_for_member_data(fresh, branch), wave, branch)
+            assignment = assignments.get((wave, branch)) or {}
+            assigned_booking = str(assignment.get("Assigned_Booking") or "").strip().upper()
+            if assigned_booking:
+                base["booking"] = assigned_booking
+                summary = normalize_report_summary(apply_document_override_to_summary(base), wave, branch)
+                if summary.get("total", 0) > 0 or summary.get("allow_zero_update") or summary.get("is_hidden"):
+                    summaries.append(summary)
+                continue
+
+            active_splits = [split for (split_wave, split_branch, _target), split in split_records.items()
+                             if split_wave == wave and split_branch == branch
+                             and _uat_event_is_active(split.get("Is_Active", True))]
+            if active_splits:
+                preview = {
+                    "totals": {field: int(base.get(field) or 0) for field in (*REPORT_BOX_FIELDS, "pallet")},
+                    "branch_name": base.get("branch_name") or branch,
+                    "bu": base.get("bu"),
+                    "lpn_total": base.get("label_count", len(branch_items)),
+                    "closed_at": next((item.get("branch_closed_at") for item in branch_items
+                                        if item.get("branch_closed_at")), ""),
+                }
+                source_booking = str(active_splits[0].get("Source_Booking") or base.get("booking") or "").strip().upper()
+                target_bookings = sorted({str(split.get("Target_Booking") or "").strip().upper()
+                                          for split in active_splits
+                                          if str(split.get("Target_Booking") or "").strip()})
+                report_rows_by_key = {}
+                for target_booking in target_bookings:
+                    split = next((item for item in active_splits
+                                  if str(item.get("Target_Booking") or "").strip().upper() == target_booking), {})
+                    requested = {
+                        field: _history_int(split.get({"m": "M_Count", "red": "Red_Count", "blue": "Blue_Count",
+                                                       "green": "Green_Count", "black": "Black_Count", "pallet": "Pallet_Count"}[field]))
+                        for field in (*REPORT_BOX_FIELDS, "pallet")
+                    }
+                    for summary in _build_booking_split_report_summaries(
+                            wave, branch, source_booking, target_booking, preview, requested, split_records):
+                        summary = normalize_report_summary(
+                            apply_document_override_to_summary(summary), wave, branch
+                        )
+                        if summary.get("booking") == source_booking and summary.get("total", 0) <= 0:
+                            summary["is_hidden"] = True
+                        if (summary.get("total", 0) > 0 or summary.get("allow_zero_update")
+                                or summary.get("is_hidden")):
+                            key = _uat_report_key(summary.get("booking"), wave, branch)
+                            report_rows_by_key[key] = summary
+                summaries.extend(report_rows_by_key.values())
+                continue
+
+            # Use the latest assignment where present; otherwise keep the Wave's native Booking.
+            summary = normalize_report_summary(apply_document_override_to_summary(base), wave, branch)
+            if summary.get("total", 0) > 0 or summary.get("allow_zero_update") or summary.get("is_hidden"):
                 summaries.append(summary)
     return summaries
 
@@ -2004,13 +2172,18 @@ def report_sync_worker_loop():
         try:
             snapshots = [copy.deepcopy(entry["summary"]) for entry in due_entries
                          if entry["mode"] == "snapshot" and entry.get("summary")]
-            reconciles = [entry for entry in due_entries if entry["mode"] != "snapshot"]
+            report_snapshots = [copy.deepcopy(entry["summary"]) for entry in due_entries
+                                if entry["mode"] == "report_snapshot" and entry.get("summary")]
+            reconciles = [entry for entry in due_entries
+                          if entry["mode"] in ("reconcile", "reconcile_wave")]
             # Snapshot gives users a fast update; reconciliation re-reads the Sheet after.
             if snapshots:
                 sync_document_summary_reports(snapshots)
+            if report_snapshots:
+                sync_uat_delivery_report_summaries(report_snapshots)
             if reconciles:
                 sync_document_summary_reports(_build_reconciled_summaries(reconciles))
-            print(f"✅ REPORT SYNC | snapshots={len(snapshots)} reconciles={len(reconciles)}")
+            print(f"✅ REPORT SYNC | snapshots={len(snapshots)} report_only={len(report_snapshots)} reconciles={len(reconciles)}")
         except Exception as exc:
             print(f"🚨 REPORT SYNC RETRY | entries={len(due_entries)} | {exc}")
             _requeue_failed_report_entries(due_entries)
@@ -3386,6 +3559,8 @@ class DocumentSummaryBatchData(BaseModel):
     # False = snapshot ยอดอัตโนมัติจากหน้าจอ (ใช้ซิงก์รายงานเท่านั้น)
     # True = ผู้ใช้แก้ยอด/ซ่อนสาขาเอง จึงค่อยบันทึกเป็น override ถาวร
     persist_overrides: bool = False
+    # Explicit opt-in after a verified document open; this touches only Delivery report.
+    sync_report: bool = False
     reason: Optional[str] = None
 
 class ResetDocumentOverridesData(BaseModel):
@@ -3536,6 +3711,7 @@ def _build_booking_split_report_summaries(wave: str, branch: str, source: str, t
     }
     source_summary = normalize_report_summary({
         **common, "booking": source, **source_totals, "allow_zero_update": True,
+        "is_hidden": sum(source_totals[field] for field in REPORT_BOX_FIELDS) <= 0,
     })
     target_summary = normalize_report_summary({
         **common, "booking": target, **target_totals,
@@ -4368,28 +4544,31 @@ def get_usage_dashboard(response: Response, days: int = 7, q: str = "", employee
     return payload
 
 def sync_document_summary_reports(summaries: list):
-    """Write the given totals to both writable Sheets; the legacy workbook stays read-only.
+    """Write visible totals and delete explicitly hidden rows from UAT report.
 
     Automatic zero snapshots are dropped here so a branch that has not been
     counted yet never creates a zero row. An intentional zero correction carries
     allow_zero_update and is allowed through, but only to clear an existing row.
     """
     normalized = [normalize_report_summary(summary) for summary in summaries or []]
-    normalized = [summary for summary in normalized
-                  if not summary.get("is_hidden")
-                  and (summary.get("total", 0) > 0 or summary.get("allow_zero_update"))]
-    if not normalized:
+    report_rows = [summary for summary in normalized
+                   if summary.get("is_hidden")
+                   or summary.get("total", 0) > 0
+                   or summary.get("allow_zero_update")]
+    visible = [summary for summary in report_rows if not summary.get("is_hidden")]
+    if not report_rows:
         return
     # Member Data ไม่มีคอลัมน์ Booking จึงเก็บได้แค่ 1 แถวต่อ Wave+Branch
     # ส่วนรายงานรองรับแยก Booking และรับยอดที่แบ่งได้
-    member_summaries = [summary for summary in normalized if not summary.get("booking_split")]
+    member_summaries = [summary for summary in visible if not summary.get("booking_split")]
     failures = []
     try:
-        write_member_history_summaries(member_summaries)
+        if member_summaries:
+            write_member_history_summaries(member_summaries)
     except Exception as exc:
         failures.append(f"Member Data: {exc}")
     try:
-        write_uat_report_test_summaries(normalized)
+        sync_uat_delivery_report_summaries(report_rows)
     except Exception as exc:
         failures.append(f"UAT Delivery report: {exc}")
     if failures:
@@ -4430,6 +4609,9 @@ def sync_document_summary_reports_background(base_summaries: list, affected_spli
                     "is_closed": any(item.get("branch_closed_at") for item in source_items),
                     "allow_zero_update": True,
                 })
+                source_summary["is_hidden"] = sum(
+                    _history_int(source_summary.get(field)) for field in REPORT_BOX_FIELDS
+                ) <= 0
                 report_summaries.append(source_summary)
             except Exception as exc:
                 # The target edit is already durable.  Reconciliation will
@@ -4525,12 +4707,14 @@ def save_document_summary(data: DocumentSummaryBatchData, background_tasks: Back
         )
         report_sync = "queued"
         sheet_warning = override_sheet_error
+    elif data.sync_report:
+        queue_delivery_report_snapshots(report_summaries, delay_seconds=0.0)
+        report_sync = "queued"
     else:
-        # Opening or printing a document must be read-only.  The previous
-        # background snapshot queued here could overwrite the current
-        # Member Data/report row even when the user never saved an edit.
-        # Explicit saves (persist_overrides=True) still use the write path
-        # above; only the automatic open/print snapshot is skipped.
+        # By default, opening or printing remains read-only. The frontend opts
+        # in only after a verified shipping-document open; that path queues
+        # Delivery report alone and never writes Member Data. Shortage/print
+        # snapshots do not set sync_report.
         report_sync = "read_only_snapshot_skipped" if report_summaries else "waiting_for_branch_close"
     return {
         "status": "success",
@@ -4920,6 +5104,36 @@ def move_booking_branch(data: BookingBranchMoveData):
     with booking_waves_cache_lock:
         booking_waves_cache.pop(previous, None)
         booking_waves_cache.pop(target, None)
+    totals = preview.get("totals") or {}
+    moved_summary = {
+        "wave": wave_clean,
+        "branch": branch,
+        "branch_name": preview.get("branch_name") or branch,
+        "bu": preview.get("bu"),
+        "label_count": preview.get("label_count", preview.get("lpn_total", 0)),
+        "m": totals.get("m", 0),
+        "red": totals.get("red", 0),
+        "blue": totals.get("blue", 0),
+        "green": totals.get("green", 0),
+        "black": totals.get("black", 0),
+        "pallet": totals.get("pallet", 0),
+        "is_closed": bool(preview.get("closed_at")),
+    }
+    obsolete_bookings = {previous} if previous else set()
+    for (split_wave, split_branch, split_target), split in get_booking_branch_splits().items():
+        if (split_wave == wave_clean and split_branch == branch
+                and _uat_event_is_active(split.get("Is_Active", True))):
+            obsolete_bookings.add(str(split.get("Source_Booking") or "").strip().upper())
+            obsolete_bookings.add(str(split_target or "").strip().upper())
+    old_booking_summaries = [
+        {**moved_summary, "booking": old_booking, "is_hidden": True}
+        for old_booking in sorted(obsolete_bookings - {"", target})
+    ]
+    if old_booking_summaries:
+        queue_delivery_report_snapshots(old_booking_summaries, delay_seconds=0.0)
+    queue_delivery_report_snapshots([{
+        **moved_summary, "booking": target,
+    }], delay_seconds=0.0)
     queue_branch_totals_reconciliation([(wave_clean, branch)], delay_seconds=0.5)
     # ส่งมุมมองปลายทางที่อ่านหลังบันทึกกลับใน response เดียว ป้องกันหน้าเว็บ
     # ยิง GET ถัดไปเร็วเกินไปแล้วเห็นข้อมูลก่อนย้าย.

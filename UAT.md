@@ -13,6 +13,7 @@
 
 เขียนกลับได้เฉพาะ **Member Data**, **UAT database** และ **สำเนารายงาน UAT**
 `Delivery report` ตัวจริงเป็น lookup อ่านอย่างเดียว ไม่มี code path ไหนเขียนถึงอีกแล้ว
+การเปิดเอกสารใบคุมส่งและการซ่อน/ย้าย/แบ่งสาขาเขียนเฉพาะสำเนา `Delivery report` สำหรับ UAT
 
 ## ข้อจำกัดรอบ UAT
 
@@ -29,7 +30,7 @@
 | `APP_ENV` | `uat` | แสดงบน `/api/health` |
 | `SCAN_FEATURE_ENABLED` | `false` | hold การสแกน → 423 (ต้องตรงกับ `SCAN_FEATURE_ENABLED` ใน `index.html`) |
 | `SCAN_DEMO_ONLY` | `true` | ถ้าเปิดสแกน จะแก้เฉพาะ memory ไม่เขียน Sheet |
-| `APP_VERSION` | `1.9.10-free` | เวอร์ชัน API; เวอร์ชันเว็บแยกกันและส่ง `app_version`/`api_version` คนละช่อง |
+| `APP_VERSION` | `1.9.11-free` | เวอร์ชัน API; เวอร์ชันเว็บแยกกันและส่ง `app_version`/`api_version` คนละช่อง |
 | `UAT_DATABASE_SPREADSHEET_ID` | `1RJcs…` | ที่เก็บ event log 7 แท็บ รวม Debug Events |
 | `GOOGLE_SERVICE_ACCOUNT_JSON` | (secret) | สิทธิ์เขียน Sheets |
 
@@ -37,6 +38,8 @@
 
 ## Release notes
 
+- **Frontend 1.9.9-free (2026-10-15):** after verified opening of the shipping document, queue a Delivery report-only snapshot; the shortage/excess document remains read-only.
+- **API 1.9.11-free (2026-10-15):** sync verified shipping-document snapshots directly to the UAT Delivery report without writing on document open to Member Data; hiding or moving a branch removes its old Booking row, and moving queues the new Booking row. Preserve these removals through reconciliation when a split allocates the source total to zero.
 - **API 1.9.10-free (2026-10-15):** write Delivery report rows only for Wave+branch entries freshly confirmed by `Wave_Monitoring`, and require a planned pick date before deriving and writing all three report dates. Reconciliation no longer backfills old Waves from the full `Member Data` history or falls back to `Booking & Wave`; existing complete historical rows keep their dates when quantities are corrected.
 - **API 1.9.9-free (2026-10-14):** keep source and target Booking report snapshots separate, repair stale existing split rows from the UAT event log, and return from split requests without rebuilding two full Booking views. Avoid reformatting and sorting the entire Delivery Report on ordinary row updates; serialize split validation and writes so concurrent targets cannot over-allocate one Wave+branch.
 - **API 1.9.8-free (2026-10-14):** keep the Booking move/split flow from forcing full Member Data refreshes. Revalidate only the selected Wave, rebuild both Booking views from the warmed cache and latest split event, and retain only the target view in memory. This reduces request time and peak RAM for branch splits on the Free API.
