@@ -30,7 +30,7 @@
 | `APP_ENV` | `uat` | แสดงบน `/api/health` |
 | `SCAN_FEATURE_ENABLED` | `false` | hold การสแกน → 423 (ต้องตรงกับ `SCAN_FEATURE_ENABLED` ใน `index.html`) |
 | `SCAN_DEMO_ONLY` | `true` | ถ้าเปิดสแกน จะแก้เฉพาะ memory ไม่เขียน Sheet |
-| `APP_VERSION` | `1.9.18-free` | เวอร์ชัน API; เวอร์ชันเว็บแยกกันและส่ง `app_version`/`api_version` คนละช่อง |
+| `APP_VERSION` | `1.9.19-free` | เวอร์ชัน API; เวอร์ชันเว็บแยกกันและส่ง `app_version`/`api_version` คนละช่อง |
 | `UAT_DATABASE_SPREADSHEET_ID` | `1RJcs…` | ที่เก็บ event log รวม Debug Events และยอดจริงแยก Booking |
 | `GOOGLE_SERVICE_ACCOUNT_JSON` | (secret) | สิทธิ์เขียน Sheets |
 
@@ -38,6 +38,7 @@
 
 ## Release notes
 
+- **Frontend 1.9.19-free / API 1.9.19-free (2026-11-03):** reject Member Data refreshes and snapshots that contain fewer than 1,000 branch rows, preserving the last known-good cache. Re-read only Waves with missing monitored branches and return a retryable error instead of a successful partial Booking. After adding a branch, reuse the updated API cache rather than forcing a full Member Data reload; show separately when the save succeeded but the document refresh did not.
 - **Frontend 1.9.18-free / API 1.9.18-free (2026-11-03):** require the operator to enter one Wave number and branch code; search only that exact Wave and accept it only when all three report dates are current and complete. Keep the open document Booking as the destination, recalculate any managed source remainder on each add, and sync affected Booking rows plus their combined total to Member Data and UAT Delivery Report. Amounts above the inspected total remain allowed with a warning; other actual-quantity saves keep their allocation limits.
 - **Frontend 1.9.14-free (2026-11-03):** allow the add-branch panel when the current Booking was resolved from a Wave lookup.
 - **Frontend 1.9.13-free / API 1.9.13-free (2026-11-02):** add branches by code and record actual quantities per Booking; cap additions by the remaining source quantity per box type, aggregate actual Booking quantities into Member Data, and sync each Booking's actual row to the UAT Delivery report.

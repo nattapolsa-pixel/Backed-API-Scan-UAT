@@ -53,7 +53,7 @@ if not os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
 # Google Sheets is the only data source. Credentials are loaded lazily by
 # get_sheets_session(), so a cold start never waits on an auth round-trip.
 APP_ENV = os.environ.get("APP_ENV", "uat").strip().lower()
-APP_VERSION = os.environ.get("APP_VERSION", "1.9.18-free").strip()
+APP_VERSION = os.environ.get("APP_VERSION", "1.9.19-free").strip()
 EMPLOYEE_LOOKUP_URL = "https://script.google.com/macros/s/AKfycbybmW6N7TxfsHqEa-Fx6ayy8M8xfjKGmTYO27izmbEoLJmQRrFD3i9c0XogP0fG6tlG/exec"
 
 # รายชื่อพนักงานสำหรับช่อง "เจ้าหน้าที่" บนใบคุมส่งสินค้า
@@ -201,6 +201,9 @@ app.add_middleware(
 MEMBER_HISTORY_SPREADSHEET_ID = "1MO3lu1GssPZZvaruwQ5trUB045dzh4HUHdH35mbyOtc"
 MEMBER_HISTORY_GID = "1628470483"
 MEMBER_HISTORY_CACHE_TTL_SECONDS = 10 * 60
+# This source contains the full outbound history (over 16k rows in the current
+# UAT source). A tiny but valid CSV response must never replace the full cache.
+MEMBER_HISTORY_MIN_VALID_ROWS = 1000
 # The sheet is ~39k rows: the download is the slowest thing this service does,
 # so an expired cache is served stale while one background thread refreshes it.
 MEMBER_HISTORY_HTTP_TIMEOUT = 45
@@ -2597,6 +2600,10 @@ def _load_member_history_snapshot():
                 if field in row:
                     row[field] = share(row[field])
             history[(wave, branch)] = row
+        if len(history) < MEMBER_HISTORY_MIN_VALID_ROWS:
+            raise ValueError(
+                f"snapshot has only {len(history)} rows; expected at least {MEMBER_HISTORY_MIN_VALID_ROWS}"
+            )
         if history:
             print(f"⚡ Member Data restored from local snapshot: {len(history)} rows ({int(age)}s old)")
         return history, age
@@ -2649,8 +2656,11 @@ def _refresh_member_history(requested_at=None, must_download: bool = False) -> d
                 history = _parse_member_history_rows(
                     stream_gviz_lines(url, timeout=MEMBER_HISTORY_HTTP_TIMEOUT)
                 )
-                if not history:
-                    raise ValueError("Member Data returned no usable rows")
+                if len(history) < MEMBER_HISTORY_MIN_VALID_ROWS:
+                    raise ValueError(
+                        f"Member Data response was incomplete ({len(history)} rows; "
+                        f"expected at least {MEMBER_HISTORY_MIN_VALID_ROWS}); keeping the last known-good cache"
+                    )
                 _store_member_history(history, MEMBER_HISTORY_CACHE_TTL_SECONDS)
                 _save_member_history_snapshot(history)
                 print(f"✅ Member Data loaded: {len(history)} branch summaries in {time.time() - started:.1f}s")
@@ -5477,9 +5487,10 @@ def check_wave(wave_no: str, force: bool = False):
 
 # 🚀 [API 1.5] โหลดข้อมูล Booking
 def ensure_booking_source_complete(booking_no: str, booking_data: dict):
-    """Report progressive Member Data snapshots that are missing planned branches."""
+    """Return planned branches missing from this Booking's complete data view."""
     booking = re.sub(r"\s+", "", str(booking_no or "").upper())
     _, _, expected_map = load_wave_monitoring_pick_dates(force=False)
+    actual_records = get_booking_branch_actuals()
     missing = []
     for raw_wave in booking_data.get("waves") or []:
         digits = re.sub(r"\D", "", str(raw_wave or ""))
@@ -5497,6 +5508,11 @@ def ensure_booking_source_complete(booking_no: str, booking_data: dict):
         # Saved manual corrections are complete, durable branch records even
         # while the large Member Data import is delayed.
         actual.update(get_document_overrides_for_wave(wave, booking).keys())
+        actual.update(
+            actual_branch
+            for (actual_wave, actual_branch, actual_booking) in actual_records
+            if actual_wave == wave and actual_booking == booking
+        )
         absent = sorted(expected - actual)
         if absent:
             missing.append({"wave": wave, "missing": absent, "expected": len(expected), "actual": len(actual)})
@@ -5506,6 +5522,28 @@ def ensure_booking_source_complete(booking_no: str, booking_data: dict):
             for item in missing
         )
         print(f"⚠️ UAT Booking [{booking}] info: {details}")
+    return missing
+
+
+def load_complete_booking(booking_no: str, force_refresh: bool = False) -> dict:
+    """Retry only missing Waves once, then fail closed instead of serving a partial Booking."""
+    booking_data = get_booking_data_internal(booking_no, force_refresh=force_refresh)
+    missing = ensure_booking_source_complete(booking_no, booking_data)
+    if missing:
+        for wave in dict.fromkeys(item["wave"] for item in missing):
+            refresh_member_wave_now(wave)
+        booking_data = get_booking_data_internal(booking_no, force_refresh=False)
+        missing = ensure_booking_source_complete(booking_no, booking_data)
+    if missing:
+        details = "; ".join(
+            f"Wave {item['wave']} ขาด {','.join(item['missing'][:8])}"
+            for item in missing
+        )
+        raise HTTPException(
+            status_code=503,
+            detail=f"ข้อมูล Booking {booking_no} ยังมาไม่ครบ ({details}) กรุณาลองเปิดเอกสารใหม่อีกครั้ง",
+        )
+    return booking_data
 
 
 
@@ -5514,9 +5552,7 @@ def check_booking(booking_no: str, force: bool = False):
     try:
         request_uat_report_reconcile()
         try:
-            booking_data = get_booking_data_internal(booking_no, force_refresh=force)
-            ensure_booking_source_complete(booking_no, booking_data)
-            return booking_data
+            return load_complete_booking(booking_no, force_refresh=force)
         except HTTPException as first_error:
             if first_error.status_code not in (404, 409):
                 raise
@@ -5524,9 +5560,7 @@ def check_booking(booking_no: str, force: bool = False):
             # snapshot before declaring a multi-Wave Booking incomplete.
             time.sleep(1.0)
             try:
-                booking_data = get_booking_data_internal(booking_no, force_refresh=True)
-                ensure_booking_source_complete(booking_no, booking_data)
-                return booking_data
+                return load_complete_booking(booking_no, force_refresh=True)
             except HTTPException as retry_error:
                 if retry_error.status_code in (404, 409):
                     raise HTTPException(
