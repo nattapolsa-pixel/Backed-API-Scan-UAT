@@ -30,7 +30,7 @@
 | `APP_ENV` | `uat` | แสดงบน `/api/health` |
 | `SCAN_FEATURE_ENABLED` | `false` | hold การสแกน → 423 (ต้องตรงกับ `SCAN_FEATURE_ENABLED` ใน `index.html`) |
 | `SCAN_DEMO_ONLY` | `true` | ถ้าเปิดสแกน จะแก้เฉพาะ memory ไม่เขียน Sheet |
-| `APP_VERSION` | `1.9.16-free` | เวอร์ชัน API; เวอร์ชันเว็บแยกกันและส่ง `app_version`/`api_version` คนละช่อง |
+| `APP_VERSION` | `1.9.17-free` | เวอร์ชัน API; เวอร์ชันเว็บแยกกันและส่ง `app_version`/`api_version` คนละช่อง |
 | `UAT_DATABASE_SPREADSHEET_ID` | `1RJcs…` | ที่เก็บ event log รวม Debug Events และยอดจริงแยก Booking |
 | `GOOGLE_SERVICE_ACCOUNT_JSON` | (secret) | สิทธิ์เขียน Sheets |
 
@@ -38,7 +38,7 @@
 
 ## Release notes
 
-- **Frontend 1.9.16-free / API 1.9.16-free (2026-11-03):** look up a branch code across all current `Wave_Monitoring` rows with complete dates, keeping the open document Booking as the destination and auto-selecting its current Wave first when available. If no per-Booking actual exists yet, allocate the entered actual from the source Booking's remaining inspected baseline, then sync both Booking rows and the resulting total to Member Data and UAT Delivery Report. Amounts above the inspected total remain allowed with a warning; other actual-quantity saves keep their allocation limits.
+- **Frontend 1.9.17-free / API 1.9.17-free (2026-11-03):** look up a branch code across all current `Wave_Monitoring` rows with complete dates, keeping the open document Booking as the destination and auto-selecting its current Wave first when available. Until an explicit source actual is recorded, recalculate the source Booking's remaining inspected amount on each add, then sync all affected Booking rows and their combined total to Member Data and UAT Delivery Report. Amounts above the inspected total remain allowed with a warning; other actual-quantity saves keep their allocation limits.
 - **Frontend 1.9.14-free (2026-11-03):** allow the add-branch panel when the current Booking was resolved from a Wave lookup.
 - **Frontend 1.9.13-free / API 1.9.13-free (2026-11-02):** add branches by code and record actual quantities per Booking; cap additions by the remaining source quantity per box type, aggregate actual Booking quantities into Member Data, and sync each Booking's actual row to the UAT Delivery report.
 - **Frontend 1.9.9-free (2026-10-15):** after verified opening of the shipping document, queue a Delivery report-only snapshot; the shortage/excess document remains read-only.

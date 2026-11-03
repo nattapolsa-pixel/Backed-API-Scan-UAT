@@ -53,7 +53,7 @@ if not os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
 # Google Sheets is the only data source. Credentials are loaded lazily by
 # get_sheets_session(), so a cold start never waits on an auth round-trip.
 APP_ENV = os.environ.get("APP_ENV", "uat").strip().lower()
-APP_VERSION = os.environ.get("APP_VERSION", "1.9.16-free").strip()
+APP_VERSION = os.environ.get("APP_VERSION", "1.9.17-free").strip()
 EMPLOYEE_LOOKUP_URL = "https://script.google.com/macros/s/AKfycbybmW6N7TxfsHqEa-Fx6ayy8M8xfjKGmTYO27izmbEoLJmQRrFD3i9c0XogP0fG6tlG/exec"
 
 # รายชื่อพนักงานสำหรับช่อง "เจ้าหน้าที่" บนใบคุมส่งสินค้า
@@ -5671,10 +5671,16 @@ def lookup_booking_branch_actual(branch_code: str, target_booking: str, wave_no:
         context = _actual_pair_context(wave, branch, target, monitoring_rows, actuals, history)
         source_key = _booking_actual_key(wave, branch, context["source_booking"])[2]
         target_record = context["records"].get(target)
+        source_record = context["records"].get(source_key)
+        source_balance_managed = bool(
+            source_record
+            and str(source_record.get("Reason") or "").strip() == "AUTO_INIT_SOURCE_BASELINE"
+        )
         can_add = bool(source_key and source_key != target and not target_record)
         allocated_other = {
             field: sum(_history_int(row.get(ACTUAL_VALUE_COLUMNS[field]))
-                       for booking_key, row in context["records"].items() if booking_key != target)
+                       for booking_key, row in context["records"].items()
+                       if booking_key != target and not (source_balance_managed and booking_key == source_key))
             for field in ACTUAL_FIELDS
         }
         member_row = context["member_row"]
@@ -5738,11 +5744,15 @@ def add_booking_branch_actual(data: BookingBranchActualData, background_tasks: B
         "is_hidden": False, "allow_zero_update": True,
     }
     actual_summaries = []
-    if source_key not in context["records"]:
-        # The source has no explicit actual yet, so treat the inspected amount
-        # as still assigned there and move this Booking's entered actual out of
-        # that residual. This preserves the combined Report total when a branch
-        # is split across Bookings; only a true excess remains an overage.
+    source_record = context["records"].get(source_key)
+    source_balance_managed = bool(
+        source_record
+        and str(source_record.get("Reason") or "").strip() == "AUTO_INIT_SOURCE_BASELINE"
+    )
+    if source_record is None or source_balance_managed:
+        # Until staff records an explicit actual for the source Booking, keep
+        # its row as the unassigned inspected remainder. Recalculate that
+        # remainder for every later Booking add so allocations never double.
         already_allocated = {
             field: sum(
                 _history_int(row.get(ACTUAL_VALUE_COLUMNS[field]))
