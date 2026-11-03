@@ -53,7 +53,7 @@ if not os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
 # Google Sheets is the only data source. Credentials are loaded lazily by
 # get_sheets_session(), so a cold start never waits on an auth round-trip.
 APP_ENV = os.environ.get("APP_ENV", "uat").strip().lower()
-APP_VERSION = os.environ.get("APP_VERSION", "1.9.21-free").strip()
+APP_VERSION = os.environ.get("APP_VERSION", "1.9.22-free").strip()
 EMPLOYEE_LOOKUP_URL = "https://script.google.com/macros/s/AKfycbybmW6N7TxfsHqEa-Fx6ayy8M8xfjKGmTYO27izmbEoLJmQRrFD3i9c0XogP0fG6tlG/exec"
 
 # รายชื่อพนักงานสำหรับช่อง "เจ้าหน้าที่" บนใบคุมส่งสินค้า
@@ -967,7 +967,11 @@ def _load_wave_monitoring_pick_dates(force: bool = False) -> tuple:
     exact = {}
     wave_dates = {}
     expected_branches = {}
+    # Keep the source Booking association even when a report date is missing.
+    # Member Data decides whether a Wave/branch exists; Wave_Monitoring is only
+    # used to identify its original Booking and to authorize dated Report rows.
     booking_by_branch = {}
+    booking_conflicts = set()
     report_rows = {}
     invalid_report_pairs = set()
     try:
@@ -1000,10 +1004,16 @@ def _load_wave_monitoring_pick_dates(force: bool = False) -> tuple:
             if booking and booking not in INVALID_BRANCH_STRINGS and branch:
                 for wave in wave_tokens:
                     pair = (wave, branch)
+                    if pair not in booking_conflicts:
+                        previous_booking = booking_by_branch.get(pair)
+                        if previous_booking and previous_booking != booking:
+                            booking_conflicts.add(pair)
+                            booking_by_branch.pop(pair, None)
+                        else:
+                            booking_by_branch[pair] = booking
                     if not pick_date:
                         invalid_report_pairs.add(pair)
                         report_rows.pop(pair, None)
-                        booking_by_branch.pop(pair, None)
                         continue
                     if pair in invalid_report_pairs:
                         continue
@@ -1025,8 +1035,6 @@ def _load_wave_monitoring_pick_dates(force: bool = False) -> tuple:
                         # Wave_Monitoring is authoritative for the Booking of a
                         # concrete Wave+Branch. This avoids the old "last row
                         # wins" mistake when one Wave is shared by two Books.
-                        if (wave, branch) not in invalid_report_pairs:
-                            booking_by_branch[(wave, branch)] = booking
                 wave_dates.setdefault(wave, pick_date)
         with wave_monitoring_pick_date_lock:
             wave_monitoring_pick_date_cache.update({
@@ -5819,7 +5827,7 @@ def get_wave_branch_options(wave_no: str):
 
 @app.get("/api/booking-branch-lookup")
 def lookup_booking_branch_actual(branch_code: str, target_booking: str, wave_no: str):
-    """Find one branch in the operator-selected current dated Wave."""
+    """Find one branch in Member Data; monitoring supplies Booking/date metadata only."""
     branch = str(branch_code or "").strip().upper()
     target = re.sub(r"\s+", "", str(target_booking or "").strip().upper())
     wave_digits = re.sub(r"\D", "", str(wave_no or ""))
@@ -5830,51 +5838,58 @@ def lookup_booking_branch_actual(branch_code: str, target_booking: str, wave_no:
     if branch in INVALID_BRANCH_STRINGS:
         raise HTTPException(status_code=400, detail="รหัสสาขาไม่ถูกต้อง")
     requested_wave = str(int(wave_digits))
+    history = load_member_history()
+    member_row = history.get((requested_wave, branch))
+    if not member_row:
+        # A targeted refresh avoids rejecting a branch that was added to
+        # Member Data after the full snapshot was loaded.
+        refresh_member_wave_now(requested_wave)
+        history = load_member_history()
+        member_row = history.get((requested_wave, branch))
+    if not member_row:
+        raise HTTPException(status_code=404, detail=f"ไม่พบสาขา {branch} ใน Wave {requested_wave} ของ Member Data")
     try:
         monitoring_rows = load_fresh_wave_monitoring_report_rows()
     except Exception as exc:
-        raise HTTPException(status_code=503, detail=f"อ่าน Wave_Monitoring ล่าสุดไม่ได้: {str(exc)[:180]}")
+        # The source lookup is Member Data. If monitoring is unavailable, keep
+        # the option visible but do not claim Report dates are ready.
+        print(f"⚠️ Wave_Monitoring metadata unavailable during Member Data branch lookup: {exc}")
+        monitoring_rows = {}
     actuals = get_booking_branch_actuals(force_refresh=True)
-    history = load_member_history()
-    options = []
-    for (wave, monitored_branch), monitor in monitoring_rows.items():
-        if wave != requested_wave or monitored_branch != branch:
-            continue
-        context = _actual_pair_context(wave, branch, target, monitoring_rows, actuals, history)
-        source_key = _booking_actual_key(wave, branch, context["source_booking"])[2]
-        target_record = context["records"].get(target)
-        source_record = context["records"].get(source_key)
-        source_balance_managed = bool(
-            source_record
-            and str(source_record.get("Reason") or "").strip() == "AUTO_INIT_SOURCE_BASELINE"
-        )
-        can_add = bool(source_key and source_key != target and not target_record)
-        allocated_other = {
-            field: sum(_history_int(row.get(ACTUAL_VALUE_COLUMNS[field]))
-                       for booking_key, row in context["records"].items()
-                       if booking_key != target and not (source_balance_managed and booking_key == source_key))
-            for field in ACTUAL_FIELDS
-        }
-        member_row = context["member_row"]
-        options.append({
-            "wave_no": wave,
-            "branch_code": branch,
-            "branch_name": str(member_row.get("branch_name") or branch),
-            "bu": member_data_bu(member_row.get("bu")),
-            "label_count": _history_int(member_row.get("label_count")),
-            "target_already_has_branch": bool(target_record),
-            "is_target_source": source_key == target,
-            "source_booking_available": bool(source_key),
-            "can_add": can_add,
-            "baseline": context["baseline"],
-            "available": context["available"],
-            "allocated": allocated_other,
-            "existing_actual": ({field: _history_int(target_record.get(ACTUAL_VALUE_COLUMNS[field]))
-                                  for field in ACTUAL_FIELDS} if target_record else None),
-            "pick_date": monitor.get("pick_date").isoformat() if hasattr(monitor.get("pick_date"), "isoformat") else str(monitor.get("pick_date") or ""),
-        })
-    if not options:
-        raise HTTPException(status_code=404, detail=f"ไม่พบสาขา {branch} ใน Wave {requested_wave} ที่มีวันที่ครบใน Wave_Monitoring ปัจจุบัน")
+    monitor = monitoring_rows.get((requested_wave, branch)) or {}
+    context = _actual_pair_context(requested_wave, branch, target, monitoring_rows, actuals, history)
+    source_key = _booking_actual_key(requested_wave, branch, context["source_booking"])[2]
+    target_record = context["records"].get(target)
+    source_record = context["records"].get(source_key)
+    source_balance_managed = bool(
+        source_record
+        and str(source_record.get("Reason") or "").strip() == "AUTO_INIT_SOURCE_BASELINE"
+    )
+    can_add = bool(source_key and source_key != target and not target_record)
+    allocated_other = {
+        field: sum(_history_int(row.get(ACTUAL_VALUE_COLUMNS[field]))
+                   for booking_key, row in context["records"].items()
+                   if booking_key != target and not (source_balance_managed and booking_key == source_key))
+        for field in ACTUAL_FIELDS
+    }
+    options = [{
+        "wave_no": requested_wave,
+        "branch_code": branch,
+        "branch_name": str(member_row.get("branch_name") or branch),
+        "bu": member_data_bu(member_row.get("bu")),
+        "label_count": _history_int(member_row.get("label_count")),
+        "target_already_has_branch": bool(target_record),
+        "is_target_source": source_key == target,
+        "source_booking_available": bool(source_key),
+        "can_add": can_add,
+        "baseline": context["baseline"],
+        "available": context["available"],
+        "allocated": allocated_other,
+        "existing_actual": ({field: _history_int(target_record.get(ACTUAL_VALUE_COLUMNS[field]))
+                              for field in ACTUAL_FIELDS} if target_record else None),
+        "pick_date": monitor.get("pick_date").isoformat() if hasattr(monitor.get("pick_date"), "isoformat") else str(monitor.get("pick_date") or ""),
+        "report_dates_ready": bool(monitor),
+    }]
     return {"status": "success", "target_booking": target, "wave_no": requested_wave,
             "branch_code": branch, "branches": options}
 
@@ -5885,15 +5900,21 @@ def add_booking_branch_actual(data: BookingBranchActualData, background_tasks: B
     wave, branch, _ = _booking_actual_key(data.wave_no, data.branch_code, target)
     if not target or not wave or not branch or branch in INVALID_BRANCH_STRINGS:
         raise HTTPException(status_code=400, detail="ข้อมูล Booking, Wave หรือสาขาไม่ถูกต้อง")
+    history = load_member_history()
+    if (wave, branch) not in history:
+        refresh_member_wave_now(wave)
+        history = load_member_history()
+    member_row = history.get((wave, branch))
+    if not member_row:
+        raise HTTPException(status_code=404, detail=f"ไม่พบสาขา {branch} ใน Wave {wave} ของ Member Data")
     try:
         monitoring_rows = load_fresh_wave_monitoring_report_rows()
     except Exception as exc:
-        raise HTTPException(status_code=503, detail=f"อ่าน Wave_Monitoring ล่าสุดไม่ได้: {str(exc)[:180]}")
+        print(f"⚠️ Wave_Monitoring unavailable during Member Data branch add: {exc}")
+        monitoring_rows = {}
     monitoring_row = monitoring_rows.get((wave, branch))
-    if not monitoring_row:
-        raise HTTPException(status_code=409, detail="Wave/สาขานี้ไม่อยู่ใน Wave_Monitoring ปัจจุบัน จึงยังเพิ่มเข้ารายงานไม่ได้")
     actuals = get_booking_branch_actuals(force_refresh=True)
-    context = _actual_pair_context(wave, branch, target, monitoring_rows, actuals, load_member_history())
+    context = _actual_pair_context(wave, branch, target, monitoring_rows, actuals, history)
     source = context["source_booking"]
     if not source:
         raise HTTPException(status_code=409, detail="ข้อมูลยอดตรวจตั้งต้นของสาขานี้ยังไม่พร้อม จึงยังบันทึกยอดจริงไม่ได้")
@@ -5967,7 +5988,8 @@ def add_booking_branch_actual(data: BookingBranchActualData, background_tasks: B
     background_tasks.add_task(sync_booking_actual_pairs, pairs)
     return {"status": "success", "wave_no": wave, "branch_code": branch,
             "target_booking": target, "allocated": requested,
-            "warnings": summary.get("_actual_overages", {}), "report_sync": "queued"}
+            "warnings": summary.get("_actual_overages", {}),
+            "report_sync": "queued" if monitoring_row else "waiting_for_complete_dates"}
 
 
 @app.post("/api/move-booking-branch")
