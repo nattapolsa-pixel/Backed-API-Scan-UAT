@@ -53,7 +53,7 @@ if not os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
 # Google Sheets is the only data source. Credentials are loaded lazily by
 # get_sheets_session(), so a cold start never waits on an auth round-trip.
 APP_ENV = os.environ.get("APP_ENV", "uat").strip().lower()
-APP_VERSION = os.environ.get("APP_VERSION", "1.9.22-free").strip()
+APP_VERSION = os.environ.get("APP_VERSION", "1.9.23-free").strip()
 EMPLOYEE_LOOKUP_URL = "https://script.google.com/macros/s/AKfycbybmW6N7TxfsHqEa-Fx6ayy8M8xfjKGmTYO27izmbEoLJmQRrFD3i9c0XogP0fG6tlG/exec"
 
 # รายชื่อพนักงานสำหรับช่อง "เจ้าหน้าที่" บนใบคุมส่งสินค้า
@@ -5865,7 +5865,9 @@ def lookup_booking_branch_actual(branch_code: str, target_booking: str, wave_no:
         source_record
         and str(source_record.get("Reason") or "").strip() == "AUTO_INIT_SOURCE_BASELINE"
     )
-    can_add = bool(source_key and source_key != target and not target_record)
+    # If Member Data has the branch but no source Booking can be resolved, the
+    # operator's explicit target Booking is still enough to record its actual.
+    can_add = bool(source_key != target and not target_record)
     allocated_other = {
         field: sum(_history_int(row.get(ACTUAL_VALUE_COLUMNS[field]))
                    for booking_key, row in context["records"].items()
@@ -5916,10 +5918,8 @@ def add_booking_branch_actual(data: BookingBranchActualData, background_tasks: B
     actuals = get_booking_branch_actuals(force_refresh=True)
     context = _actual_pair_context(wave, branch, target, monitoring_rows, actuals, history)
     source = context["source_booking"]
-    if not source:
-        raise HTTPException(status_code=409, detail="ข้อมูลยอดตรวจตั้งต้นของสาขานี้ยังไม่พร้อม จึงยังบันทึกยอดจริงไม่ได้")
-    source_key = _booking_actual_key(wave, branch, source)[2]
-    if source_key == target:
+    source_key = _booking_actual_key(wave, branch, source)[2] if source else ""
+    if source_key and source_key == target:
         raise HTTPException(status_code=409, detail=f"สาขา {branch} อยู่ใน Booking {data.target_booking} แล้ว ให้แก้ยอดที่แถวเดิม")
     if target in context["records"]:
         raise HTTPException(status_code=409, detail=f"สาขา {branch} มีอยู่ใน Booking นี้แล้ว ให้แก้ยอดที่แถวเดิม")
@@ -5935,13 +5935,15 @@ def add_booking_branch_actual(data: BookingBranchActualData, background_tasks: B
         **requested, "total": sum(requested[field] for field in REPORT_BOX_FIELDS),
         "is_hidden": False, "allow_zero_update": True,
     }
+    if not source:
+        summary["reason"] = "ADD_BOOKING_BRANCH_SOURCE_UNAVAILABLE"
     actual_summaries = []
-    source_record = context["records"].get(source_key)
+    source_record = context["records"].get(source_key) if source_key else None
     source_balance_managed = bool(
         source_record
         and str(source_record.get("Reason") or "").strip() == "AUTO_INIT_SOURCE_BASELINE"
     )
-    if source_record is None or source_balance_managed:
+    if source and (source_record is None or source_balance_managed):
         # Until staff records an explicit actual for the source Booking, keep
         # its row as the unassigned inspected remainder. Recalculate that
         # remainder for every later Booking add so allocations never double.
@@ -5989,6 +5991,7 @@ def add_booking_branch_actual(data: BookingBranchActualData, background_tasks: B
     return {"status": "success", "wave_no": wave, "branch_code": branch,
             "target_booking": target, "allocated": requested,
             "warnings": summary.get("_actual_overages", {}),
+            "source_booking_missing": not bool(source),
             "report_sync": "queued" if monitoring_row else "waiting_for_complete_dates"}
 
 
