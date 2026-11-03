@@ -53,7 +53,7 @@ if not os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
 # Google Sheets is the only data source. Credentials are loaded lazily by
 # get_sheets_session(), so a cold start never waits on an auth round-trip.
 APP_ENV = os.environ.get("APP_ENV", "uat").strip().lower()
-APP_VERSION = os.environ.get("APP_VERSION", "1.9.15-free").strip()
+APP_VERSION = os.environ.get("APP_VERSION", "1.9.16-free").strip()
 EMPLOYEE_LOOKUP_URL = "https://script.google.com/macros/s/AKfycbybmW6N7TxfsHqEa-Fx6ayy8M8xfjKGmTYO27izmbEoLJmQRrFD3i9c0XogP0fG6tlG/exec"
 
 # รายชื่อพนักงานสำหรับช่อง "เจ้าหน้าที่" บนใบคุมส่งสินค้า
@@ -4088,7 +4088,8 @@ def persist_booking_branch_actuals(summaries: list, emp_id: str, reason: str = "
                 **{ACTUAL_BASELINE_COLUMNS[field]: context["baseline"][field] for field in ACTUAL_FIELDS},
                 **{ACTUAL_VALUE_COLUMNS[field]: requested[field] for field in ACTUAL_FIELDS},
                 "Is_Hidden": 1 if is_hidden else 0,
-                "Emp_ID": str(emp_id or "").strip(), "Reason": str(reason or "").strip(),
+                "Emp_ID": str(emp_id or "").strip(),
+                "Reason": str(summary.get("reason") or reason or "").strip(),
                 "Created_At": now_iso,
             }
             events.append(event)
@@ -5645,7 +5646,7 @@ def get_wave_branch_options(wave_no: str):
 
 @app.get("/api/booking-branch-lookup")
 def lookup_booking_branch_actual(branch_code: str, target_booking: str, wave_no: str = ""):
-    """Find current, dated Wave rows for an inline branch add; this route is read-only."""
+    """Find current, dated Wave rows by branch code; target Booking stays implicit in the open document."""
     branch = str(branch_code or "").strip().upper()
     target = re.sub(r"\s+", "", str(target_booking or "").strip().upper())
     if not branch or not target:
@@ -5657,8 +5658,6 @@ def lookup_booking_branch_actual(branch_code: str, target_booking: str, wave_no:
         digits = re.sub(r"\D", "", item)
         if digits:
             requested_waves.add(str(int(digits)))
-    if not requested_waves:
-        raise HTTPException(status_code=400, detail="ไม่พบ Wave ของเอกสารปัจจุบัน กรุณาเปิดเอกสารใหม่แล้วลองอีกครั้ง")
     try:
         monitoring_rows = load_fresh_wave_monitoring_report_rows()
     except Exception as exc:
@@ -5667,13 +5666,12 @@ def lookup_booking_branch_actual(branch_code: str, target_booking: str, wave_no:
     history = load_member_history()
     options = []
     for (wave, monitored_branch), monitor in monitoring_rows.items():
-        if monitored_branch != branch or wave not in requested_waves:
+        if monitored_branch != branch:
             continue
         context = _actual_pair_context(wave, branch, target, monitoring_rows, actuals, history)
         source_key = _booking_actual_key(wave, branch, context["source_booking"])[2]
         target_record = context["records"].get(target)
-        source_record_ready = bool(source_key and source_key in context["records"])
-        can_add = bool(source_record_ready and source_key != target and not target_record)
+        can_add = bool(source_key and source_key != target and not target_record)
         allocated_other = {
             field: sum(_history_int(row.get(ACTUAL_VALUE_COLUMNS[field]))
                        for booking_key, row in context["records"].items() if booking_key != target)
@@ -5688,7 +5686,8 @@ def lookup_booking_branch_actual(branch_code: str, target_booking: str, wave_no:
             "label_count": _history_int(member_row.get("label_count")),
             "target_already_has_branch": bool(target_record),
             "is_target_source": source_key == target,
-            "source_record_ready": source_record_ready,
+            "current_document_wave": wave in requested_waves,
+            "source_booking_available": bool(source_key),
             "can_add": can_add,
             "baseline": context["baseline"],
             "available": context["available"],
@@ -5697,7 +5696,7 @@ def lookup_booking_branch_actual(branch_code: str, target_booking: str, wave_no:
                                   for field in ACTUAL_FIELDS} if target_record else None),
             "pick_date": monitor.get("pick_date").isoformat() if hasattr(monitor.get("pick_date"), "isoformat") else str(monitor.get("pick_date") or ""),
         })
-    options.sort(key=lambda item: item["wave_no"])
+    options.sort(key=lambda item: (not item["current_document_wave"], item["wave_no"]))
     if not options:
         raise HTTPException(status_code=404, detail=f"ไม่พบสาขา {branch} ใน Wave_Monitoring ปัจจุบันที่มีวันที่ครบ")
     return {"status": "success", "target_booking": target, "branch_code": branch, "branches": options}
@@ -5729,8 +5728,6 @@ def add_booking_branch_actual(data: BookingBranchActualData, background_tasks: B
     requested = {field: _history_int(getattr(data, field)) for field in ACTUAL_FIELDS}
     if sum(requested[field] for field in REPORT_BOX_FIELDS) <= 0:
         raise HTTPException(status_code=400, detail="กรุณาใส่ยอดกล่องที่จะนำไปอย่างน้อย 1 กล่อง")
-    if source_key not in context["records"]:
-        raise HTTPException(status_code=409, detail="ข้อมูลยอดตรวจตั้งต้นของสาขานี้ยังไม่พร้อม จึงยังบันทึกยอดจริงไม่ได้")
     member_row = context["member_row"]
     summary = {
         "wave": wave, "booking": target, "branch": branch,
@@ -5740,8 +5737,38 @@ def add_booking_branch_actual(data: BookingBranchActualData, background_tasks: B
         **requested, "total": sum(requested[field] for field in REPORT_BOX_FIELDS),
         "is_hidden": False, "allow_zero_update": True,
     }
+    actual_summaries = []
+    if source_key not in context["records"]:
+        # The source has no explicit actual yet, so treat the inspected amount
+        # as still assigned there and move this Booking's entered actual out of
+        # that residual. This preserves the combined Report total when a branch
+        # is split across Bookings; only a true excess remains an overage.
+        already_allocated = {
+            field: sum(
+                _history_int(row.get(ACTUAL_VALUE_COLUMNS[field]))
+                for booking_key, row in context["records"].items()
+                if booking_key not in (source_key, target)
+            )
+            for field in ACTUAL_FIELDS
+        }
+        source_remaining = {
+            field: max(0, context["baseline"][field] - already_allocated[field] - requested[field])
+            for field in ACTUAL_FIELDS
+        }
+        actual_summaries.append({
+            "wave": wave, "booking": source, "branch": branch,
+            "branch_name": str(member_row.get("branch_name") or branch),
+            "bu": member_data_bu(member_row.get("bu")),
+            "label_count": _history_int(member_row.get("label_count")),
+            **source_remaining,
+            "total": sum(source_remaining[field] for field in REPORT_BOX_FIELDS),
+            "is_hidden": sum(source_remaining[field] for field in REPORT_BOX_FIELDS) <= 0,
+            "allow_zero_update": True,
+            "reason": "AUTO_INIT_SOURCE_BASELINE",
+        })
+    actual_summaries.append(summary)
     pairs = persist_booking_branch_actuals(
-        [summary], str(data.emp_id or "").strip(), "ADD_BOOKING_BRANCH", allow_overage=True
+        actual_summaries, str(data.emp_id or "").strip(), "ADD_BOOKING_BRANCH", allow_overage=True
     )
     now_iso = _uat_now_iso()
     with document_overrides_lock:
