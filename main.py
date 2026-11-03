@@ -53,7 +53,7 @@ if not os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
 # Google Sheets is the only data source. Credentials are loaded lazily by
 # get_sheets_session(), so a cold start never waits on an auth round-trip.
 APP_ENV = os.environ.get("APP_ENV", "uat").strip().lower()
-APP_VERSION = os.environ.get("APP_VERSION", "1.9.12-free").strip()
+APP_VERSION = os.environ.get("APP_VERSION", "1.9.13-free").strip()
 EMPLOYEE_LOOKUP_URL = "https://script.google.com/macros/s/AKfycbybmW6N7TxfsHqEa-Fx6ayy8M8xfjKGmTYO27izmbEoLJmQRrFD3i9c0XogP0fG6tlG/exec"
 
 # รายชื่อพนักงานสำหรับช่อง "เจ้าหน้าที่" บนใบคุมส่งสินค้า
@@ -324,6 +324,13 @@ UAT_EVENT_SHEETS = {
         "Event_ID", "Wave_Number", "Branch_Code", "Source_Booking", "Target_Booking",
         "M_Count", "Red_Count", "Blue_Count", "Green_Count", "Black_Count", "Pallet_Count",
         "Is_Active", "Reason", "Note", "Emp_ID", "Created_At"
+    ],
+    "Booking Branch Actuals": [
+        "Event_ID", "Wave_Number", "Branch_Code", "Source_Booking", "Booking_No",
+        "Branch_Name", "BU", "Label_Count",
+        "Baseline_M", "Baseline_Red", "Baseline_Blue", "Baseline_Green", "Baseline_Black", "Baseline_Pallet",
+        "Actual_M", "Actual_Red", "Actual_Blue", "Actual_Green", "Actual_Black", "Actual_Pallet",
+        "Is_Hidden", "Emp_ID", "Reason", "Created_At"
     ],
     "Branch Close Status": [
         "Event_ID", "Wave_Number", "Booking_No", "Branch_Code", "Branch_Name", "Status",
@@ -1251,6 +1258,9 @@ def _uat_report_booking_is_current(booking: str, wave: str, branch: str, monitor
                 and _uat_event_is_active(split.get("Is_Active", True))
                 and split_source == source and split_target == requested):
             return True
+    actual_key = _booking_actual_key(wave, branch, booking)
+    if actual_key in get_booking_branch_actuals():
+        return True
     return False
 
 
@@ -1713,6 +1723,10 @@ def _build_uat_delivery_report_candidates(wave_monitoring_rows: Optional[dict] =
         if wave_digits and branch:
             assignments[(str(int(wave_digits)), branch)] = move
     split_records = get_booking_branch_splits()
+    actual_records = get_booking_branch_actuals()
+    actuals_by_pair = {}
+    for (actual_wave, actual_branch, _actual_booking), actual in actual_records.items():
+        actuals_by_pair.setdefault((actual_wave, actual_branch), []).append(actual)
     splits_by_pair = {}
     for (split_wave, split_branch, _target), split in split_records.items():
         if not _uat_event_is_active(split.get("Is_Active", True)):
@@ -1724,7 +1738,7 @@ def _build_uat_delivery_report_candidates(wave_monitoring_rows: Optional[dict] =
             splits_by_pair.setdefault((wave, branch), []).append(split)
 
     candidates = []
-    all_pairs = (set(history) | set(splits_by_pair)) & set(wave_monitoring_rows)
+    all_pairs = (set(history) | set(splits_by_pair) | set(actuals_by_pair)) & set(wave_monitoring_rows)
     for wave, branch in sorted(all_pairs):
         monitoring_row = wave_monitoring_rows[(wave, branch)]
         native_booking = str(monitoring_row.get("booking") or "").strip().upper()
@@ -1734,6 +1748,25 @@ def _build_uat_delivery_report_candidates(wave_monitoring_rows: Optional[dict] =
         summary = _member_history_report_summary(raw) if raw else normalize_report_summary({
             "wave": wave, "branch": branch, "branch_name": branch, "bu": "Unknown",
         })
+        actual_pair = actuals_by_pair.get((wave, branch)) or []
+        if actual_pair:
+            for actual in actual_pair:
+                candidate = copy.deepcopy(summary)
+                candidate.update({
+                    "booking": str(actual.get("Booking_No") or "").strip().upper(),
+                    "booking_actual": True,
+                    "branch_name": str(actual.get("Branch_Name") or summary.get("branch_name") or branch),
+                    "bu": member_data_bu(actual.get("BU") or summary.get("bu")),
+                    "label_count": _history_int(actual.get("Label_Count") or summary.get("label_count")),
+                    **{field: _history_int(actual.get(ACTUAL_VALUE_COLUMNS[field])) for field in ACTUAL_FIELDS},
+                    "is_hidden": str(actual.get("Is_Hidden") or "").strip().lower() in ("1", "true", "yes"),
+                    "allow_zero_update": True,
+                })
+                candidate["total"] = sum(candidate[field] for field in REPORT_BOX_FIELDS)
+                if candidate["total"] <= 0:
+                    candidate["is_hidden"] = True
+                candidates.append(normalize_report_summary(candidate))
+            continue
         assignment = assignments.get((wave, branch)) or {}
         assigned_booking = str(assignment.get("Assigned_Booking") or "").strip().upper()
         active_splits = [
@@ -1802,9 +1835,25 @@ def reconcile_uat_delivery_report(force: bool = False) -> dict:
         incomplete_dates_deleted = delete_uat_report_incomplete_date_rows(session)
         existing_keys = _read_uat_report_keys(session)
         wave_monitoring_rows = load_fresh_wave_monitoring_report_rows()
+        actual_records = get_booking_branch_actuals(force_refresh=True)
+        actual_all_pairs = list(dict.fromkeys((key[0], key[1]) for key in actual_records))
+        try:
+            reconcile_booking_actual_member_data(actual_all_pairs, actual_records)
+        except Exception as exc:
+            print(f"⚠️ Member Data actual-allocation repair pending: {str(exc)[:180]}")
         candidates = _build_uat_delivery_report_candidates(wave_monitoring_rows)
         upserts = []
         deletions = []
+        actual_pairs = {(key[0], key[1]) for key in actual_records if (key[0], key[1]) in wave_monitoring_rows}
+        expected_actual_keys = {
+            _uat_report_key(key[2], key[0], key[1])
+            for key in actual_records if (key[0], key[1]) in actual_pairs
+        }
+        # Once an explicit actual-allocation ledger exists, stale rows under any
+        # former Booking for that Wave+branch must not survive reconciliation.
+        for existing_key in existing_keys:
+            if (existing_key[1], existing_key[2]) in actual_pairs and existing_key not in expected_actual_keys:
+                deletions.append({"booking": existing_key[0], "wave": existing_key[1], "branch": existing_key[2]})
         missing_count = 0
         repaired_split_count = 0
         seen = set()
@@ -1843,7 +1892,11 @@ def reconcile_uat_delivery_report(force: bool = False) -> dict:
                     upserts[offset:end], sort_after_insert=end == len(upserts),
                     wave_monitoring_rows=wave_monitoring_rows,
                 )
-        deleted_count = delete_uat_report_test_summaries(deletions) if deletions else 0
+        unique_deletions = list({
+            _uat_report_key(item.get("booking"), item.get("wave"), item.get("branch")): item
+            for item in deletions
+        }.values())
+        deleted_count = delete_uat_report_test_summaries(unique_deletions) if unique_deletions else 0
         result = {"status": "completed", "candidates": len(candidates),
                   "missing": missing_count, "repaired_splits": repaired_split_count,
                   "upserts": len(upserts), "deleted": deleted_count,
@@ -2155,6 +2208,10 @@ def _build_reconciled_summaries(entries: list) -> list:
     entries_by_wave = {}
     assignments = get_booking_branch_assignments()
     split_records = get_booking_branch_splits()
+    actual_records = get_booking_branch_actuals()
+    actuals_by_pair = {}
+    for (actual_wave, actual_branch, _actual_booking), actual in actual_records.items():
+        actuals_by_pair.setdefault((actual_wave, actual_branch), []).append(actual)
     for entry in entries:
         entries_by_wave.setdefault(entry["wave"], []).append(entry)
     for wave, wave_entries in entries_by_wave.items():
@@ -2176,6 +2233,22 @@ def _build_reconciled_summaries(entries: list) -> list:
             if not any(item.get("branch_closed_at") for item in branch_items):
                 continue
             base = normalize_report_summary(summarize_branch_for_member_data(fresh, branch), wave, branch)
+            pair_actuals = actuals_by_pair.get((wave, branch)) or []
+            if pair_actuals:
+                for actual in pair_actuals:
+                    actual_summary = copy.deepcopy(base)
+                    actual_summary.update({
+                        "booking": str(actual.get("Booking_No") or "").strip().upper(),
+                        "booking_actual": True,
+                        **{field: _history_int(actual.get(ACTUAL_VALUE_COLUMNS[field])) for field in ACTUAL_FIELDS},
+                        "is_hidden": str(actual.get("Is_Hidden") or "").strip().lower() in ("1", "true", "yes"),
+                        "allow_zero_update": True,
+                    })
+                    actual_summary["total"] = sum(actual_summary[field] for field in REPORT_BOX_FIELDS)
+                    if actual_summary["total"] <= 0:
+                        actual_summary["is_hidden"] = True
+                    summaries.append(normalize_report_summary(actual_summary, wave, branch))
+                continue
             assignment = assignments.get((wave, branch)) or {}
             assigned_booking = str(assignment.get("Assigned_Booking") or "").strip().upper()
             if assigned_booking:
@@ -3115,6 +3188,9 @@ booking_assignments_cache_lock = Lock()
 booking_splits_cache = {"data": {}, "expires_at": 0.0}
 booking_splits_cache_lock = Lock()
 booking_split_write_lock = Lock()
+booking_actuals_cache = {"data": {}, "expires_at": 0.0}
+booking_actuals_cache_lock = Lock()
+booking_actual_write_lock = Lock()
 booking_override_table_ready = False
 booking_override_table_lock = Lock()
 booking_split_table_ready = False
@@ -3396,12 +3472,15 @@ def get_booking_data_internal(booking_no: str, force_refresh: bool = False) -> d
         wave_force_refresh = False
     assignments = get_booking_branch_assignments(force_refresh=force_refresh)
     splits = get_booking_branch_splits(force_refresh=force_refresh)
+    actuals = get_booking_branch_actuals(force_refresh=force_refresh)
     override_waves = [wave for (wave, branch), move in assignments.items()
                       if str(move.get("Assigned_Booking") or "").strip().upper() == booking_clean]
     split_waves = [wave for (wave, branch, target), split in splits.items()
                    if target == booking_clean or str(split.get("Source_Booking") or "").strip().upper() == booking_clean]
+    actual_waves = [key[0] for key, actual in actuals.items()
+                    if key[2] == re.sub(r"\s+", "", booking_clean)]
     waves = list(dict.fromkeys(
-        str(int(re.sub(r"\D", "", str(wave)))) for wave in (list(mapping["waves"]) + override_waves + split_waves)
+        str(int(re.sub(r"\D", "", str(wave)))) for wave in (list(mapping["waves"]) + override_waves + split_waves + actual_waves)
         if re.sub(r"\D", "", str(wave or ""))
     ))
     license_plate = mapping["license_plate"]
@@ -3446,6 +3525,61 @@ def get_booking_data_internal(booking_no: str, force_refresh: bool = False) -> d
         for branch, branch_items in items_by_branch.items():
             assignment = assignments.get((wave_key, branch))
             assigned_booking = str((assignment or {}).get("Assigned_Booking") or "").strip().upper()
+            actual_pair = {
+                actual_key[2]: actual_row for actual_key, actual_row in actuals.items()
+                if actual_key[0] == wave_key and actual_key[1] == branch
+            }
+            if actual_pair:
+                source_booking = str(next(iter(actual_pair.values())).get("Source_Booking") or native_booking).strip().upper()
+                source_key = re.sub(r"\s+", "", source_booking)
+                current_record = actual_pair.get(re.sub(r"\s+", "", booking_clean))
+                baseline_row = next(iter(actual_pair.values()))
+                if current_record:
+                    actual_totals = {
+                        field: _history_int(current_record.get(ACTUAL_VALUE_COLUMNS[field]))
+                        for field in ACTUAL_FIELDS
+                    }
+                    hidden = str(current_record.get("Is_Hidden") or "").strip().lower() in ("1", "true", "yes")
+                elif re.sub(r"\s+", "", booking_clean) == source_key:
+                    actual_totals = {
+                        field: max(0, _history_int(baseline_row.get(ACTUAL_BASELINE_COLUMNS[field])) - sum(
+                            _history_int(row.get(ACTUAL_VALUE_COLUMNS[field]))
+                            for actual_booking, row in actual_pair.items() if actual_booking != source_key
+                        ))
+                        for field in ACTUAL_FIELDS
+                    }
+                    hidden = False
+                else:
+                    continue
+                actual_summary = {
+                    **actual_totals,
+                    "total": sum(actual_totals[field] for field in REPORT_BOX_FIELDS),
+                    "is_hidden": hidden,
+                    "source_booking": source_booking,
+                    "booking": booking_clean,
+                }
+                if re.sub(r"\s+", "", booking_clean) == source_key and branch_items:
+                    for item_index, original_item in enumerate(branch_items):
+                        item = copy.deepcopy(original_item)
+                        if item_index == 0:
+                            item["booking_actual_summary"] = actual_summary
+                        lpn_list.append(item)
+                else:
+                    source_item = copy.deepcopy(branch_items[0]) if branch_items else {}
+                    source_item.update({
+                        "lpn": f"ยอดขนจริงจาก {source_booking}", "zone": "TRANSFER", "status": "Scanned",
+                        "qty": actual_summary["total"], "total_qty": actual_summary["total"],
+                        "scan_type": "BOOKING_ACTUAL", "color": "None", "historical_summary": True,
+                        "booking_actual_summary": actual_summary,
+                    })
+                    source_item.setdefault("branch", branch)
+                    source_item.setdefault("branch_name", str(baseline_row.get("Branch_Name") or branch))
+                    source_item.setdefault("owner", str(baseline_row.get("BU") or "Unknown"))
+                    source_item["wave_no"] = wave_key
+                    lpn_list.append(source_item)
+                wave_has_items = True
+                continue
+
             branch_splits = [split for (split_wave, split_branch, target), split in splits.items()
                              if split_wave == wave_key and split_branch == branch
                              and _uat_event_is_active(split.get("Is_Active", True))]
@@ -3527,6 +3661,22 @@ def get_booking_data_internal(booking_no: str, force_refresh: bool = False) -> d
         clean_w = re.sub(r"\D", "", str(wave_no_inc))
         if clean_w:
             combined_overrides.update(get_document_overrides_for_wave(clean_w, booking_clean))
+    normalized_booking = re.sub(r"\s+", "", booking_clean)
+    included_wave_keys = {
+        str(int(digits)) for wave_value in waves_included
+        if (digits := re.sub(r"\D", "", str(wave_value or "")))
+    }
+    for (actual_wave, actual_branch, actual_booking), actual in actuals.items():
+        if actual_booking != normalized_booking or actual_wave not in included_wave_keys:
+            continue
+        combined_overrides[actual_branch] = {
+            **{field: _history_int(actual.get(ACTUAL_VALUE_COLUMNS[field])) for field in ACTUAL_FIELDS},
+            "total": sum(_history_int(actual.get(ACTUAL_VALUE_COLUMNS[field])) for field in REPORT_BOX_FIELDS),
+            "is_hidden": str(actual.get("Is_Hidden") or "").strip().lower() in ("1", "true", "yes"),
+            "booking": booking_clean,
+            "branch_name": str(actual.get("Branch_Name") or actual_branch),
+            "bu": member_data_bu(actual.get("BU")),
+        }
 
     return {
         "booking_no": booking_no,
@@ -3626,6 +3776,18 @@ class BookingBranchSplitData(BookingBranchMoveData):
     black: int = 0
     pallet: int = 0
 
+class BookingBranchActualData(BaseModel):
+    target_booking: str
+    wave_no: str
+    branch_code: str
+    m: int = 0
+    red: int = 0
+    blue: int = 0
+    green: int = 0
+    black: int = 0
+    pallet: int = 0
+    emp_id: Optional[str] = None
+
 class DocumentSummaryData(BaseModel):
     wave: str
     booking: Optional[str] = None
@@ -3650,6 +3812,8 @@ class DocumentSummaryBatchData(BaseModel):
     # False = snapshot ยอดอัตโนมัติจากหน้าจอ (ใช้ซิงก์รายงานเท่านั้น)
     # True = ผู้ใช้แก้ยอด/ซ่อนสาขาเอง จึงค่อยบันทึกเป็น override ถาวร
     persist_overrides: bool = False
+    # Shipping-document edits store actual quantities per Booking and aggregate them to Member Data.
+    booking_actuals: bool = False
     # Explicit opt-in after a verified document open; this touches only Delivery report.
     sync_report: bool = False
     reason: Optional[str] = None
@@ -3761,6 +3925,251 @@ def get_booking_branch_splits(force_refresh: bool = False) -> dict:
         except Exception as exc:
             print(f"BOOKING SPLIT READ ERROR: {exc}")
             return {key: dict(row) for key, row in booking_splits_cache["data"].items()}
+
+
+ACTUAL_FIELDS = ("m", "red", "blue", "green", "black", "pallet")
+ACTUAL_BASELINE_COLUMNS = {
+    "m": "Baseline_M", "red": "Baseline_Red", "blue": "Baseline_Blue",
+    "green": "Baseline_Green", "black": "Baseline_Black", "pallet": "Baseline_Pallet",
+}
+ACTUAL_VALUE_COLUMNS = {
+    "m": "Actual_M", "red": "Actual_Red", "blue": "Actual_Blue",
+    "green": "Actual_Green", "black": "Actual_Black", "pallet": "Actual_Pallet",
+}
+
+
+def _booking_actual_key(wave, branch, booking):
+    wave_digits = re.sub(r"\D", "", str(wave or ""))
+    return (str(int(wave_digits)) if wave_digits else "",
+            str(branch or "").strip().upper(),
+            re.sub(r"\s+", "", str(booking or "").strip().upper()))
+
+
+def get_booking_branch_actuals(force_refresh: bool = False) -> dict:
+    now = time.time()
+    with booking_actuals_cache_lock:
+        if not force_refresh and booking_actuals_cache["expires_at"] > now:
+            return {key: dict(row) for key, row in booking_actuals_cache["data"].items()}
+    rows = read_uat_event_records("Booking Branch Actuals", force=force_refresh)
+    latest = {}
+    for row in reversed(rows):
+        key = _booking_actual_key(row.get("Wave_Number"), row.get("Branch_Code"), row.get("Booking_No"))
+        if all(key) and key not in latest:
+            latest[key] = row
+    with booking_actuals_cache_lock:
+        booking_actuals_cache.update({"data": latest, "expires_at": time.time() + BOOKING_METADATA_CACHE_TTL_SECONDS})
+        return {key: dict(row) for key, row in latest.items()}
+
+
+def _actual_pair_context(wave: str, branch: str, target_booking: str = "",
+                         monitoring_rows: Optional[dict] = None, actuals: Optional[dict] = None,
+                         history: Optional[dict] = None) -> dict:
+    wave_key, branch_key = _booking_actual_key(wave, branch, "")[:2]
+    pair_records = {
+        key[2]: row for key, row in (actuals or get_booking_branch_actuals()).items()
+        if key[0] == wave_key and key[1] == branch_key
+    }
+    monitor_row = (monitoring_rows or {}).get((wave_key, branch_key)) or {}
+    source = next((str(row.get("Source_Booking") or "").strip().upper()
+                   for row in pair_records.values() if row.get("Source_Booking")), "")
+    if not source:
+        assignment = get_booking_branch_assignments().get((wave_key, branch_key)) or {}
+        source = str(assignment.get("Assigned_Booking") or "").strip().upper()
+    if not source:
+        source = str(monitor_row.get("booking") or "").strip().upper()
+    if not source:
+        source = get_wave_monitoring_booking(wave_key, branch_key)
+    if not source:
+        assignment = get_booking_branch_assignments().get((wave_key, branch_key)) or {}
+        source = str(assignment.get("Previous_Booking") or "").strip().upper()
+
+    baseline_row = next(iter(pair_records.values()), None)
+    history = history if history is not None else load_member_history()
+    member_row = history.get((wave_key, branch_key)) or {}
+    if baseline_row:
+        baseline = {field: _history_int(baseline_row.get(ACTUAL_BASELINE_COLUMNS[field])) for field in ACTUAL_FIELDS}
+    elif member_row:
+        baseline_summary = _member_history_report_summary(member_row)
+        baseline = {field: _history_int(baseline_summary.get(field)) for field in ACTUAL_FIELDS}
+    else:
+        baseline = {field: 0 for field in ACTUAL_FIELDS}
+
+    reserved = {field: 0 for field in ACTUAL_FIELDS}
+    for booking_key, row in pair_records.items():
+        if booking_key == re.sub(r"\s+", "", str(target_booking or "").strip().upper()):
+            continue
+        for field in ACTUAL_FIELDS:
+            reserved[field] += _history_int(row.get(ACTUAL_VALUE_COLUMNS[field]))
+    normalized_target = re.sub(r"\s+", "", str(target_booking or "").strip().upper())
+    normalized_source = re.sub(r"\s+", "", source)
+    if normalized_source and normalized_source not in pair_records and normalized_source != normalized_target:
+        # Until the native Booking explicitly records its actual load, its full
+        # source amount remains assigned to it. This prevents a second Booking
+        # from silently duplicating boxes the first truck has not released.
+        for field in ACTUAL_FIELDS:
+            reserved[field] += baseline[field]
+    available = {field: max(0, baseline[field] - reserved[field]) for field in ACTUAL_FIELDS}
+    return {
+        "wave": wave_key, "branch": branch_key, "source_booking": source,
+        "monitoring_row": monitor_row, "member_row": member_row,
+        "baseline": baseline, "records": pair_records, "available": available,
+    }
+
+
+def persist_booking_branch_actuals(summaries: list, emp_id: str, reason: str = "") -> list:
+    """Append actual Booking allocations after enforcing per-category source limits."""
+    if not summaries:
+        return []
+    with booking_actual_write_lock:
+        latest = get_booking_branch_actuals(force_refresh=True)
+        history = load_member_history()
+        now_iso = _uat_now_iso()
+        events = []
+        pairs = []
+        pending = {}
+        for summary in summaries:
+            wave, branch, booking = _booking_actual_key(
+                summary.get("wave"), summary.get("branch"), summary.get("booking")
+            )
+            if not wave or not branch or not booking or branch in INVALID_BRANCH_STRINGS:
+                raise HTTPException(status_code=400, detail="ข้อมูล Wave, Booking หรือสาขาไม่ครบ")
+            pair_key = (wave, branch)
+            if pair_key not in pending:
+                context = _actual_pair_context(
+                    wave, branch, booking, actuals=latest, history=history
+                )
+                if not context["records"] and summary.get("booking"):
+                    context["source_booking"] = str(summary.get("booking") or "").strip().upper()
+                if not context["source_booking"]:
+                    context["source_booking"] = str(summary.get("booking") or "").strip().upper()
+                if not context["source_booking"]:
+                    raise HTTPException(status_code=409, detail=f"ไม่พบ Booking ต้นทางของ {branch} ใน Wave {wave}")
+                pending[pair_key] = context
+            context = pending[pair_key]
+            source = context["source_booking"]
+            if booking != re.sub(r"\s+", "", source):
+                source_key = _booking_actual_key(wave, branch, source)[2]
+                if source_key not in context["records"]:
+                    raise HTTPException(status_code=409, detail=f"กรุณาบันทึกยอดจริงของ Booking {source} ก่อนเพิ่มสาขานี้เข้า Booking อื่น")
+            current_key = (wave, branch, booking)
+            is_hidden = bool(summary.get("is_hidden"))
+            requested = {field: 0 if is_hidden else _history_int(summary.get(field)) for field in ACTUAL_FIELDS}
+            other_reserved = {field: 0 for field in ACTUAL_FIELDS}
+            for other_booking, record in context["records"].items():
+                if other_booking == booking:
+                    continue
+                for field in ACTUAL_FIELDS:
+                    other_reserved[field] += _history_int(record.get(ACTUAL_VALUE_COLUMNS[field]))
+            for field in ACTUAL_FIELDS:
+                remaining = max(0, context["baseline"][field] - other_reserved[field])
+                if requested[field] > remaining:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f"{branch} / Wave {wave}: ยอด {field} {requested[field]} เกินยอดที่ยังจัดสรรได้ {remaining}"
+                    )
+            event = {
+                "Event_ID": str(uuid.uuid4()), "Wave_Number": wave, "Branch_Code": branch,
+                "Source_Booking": source, "Booking_No": booking,
+                "Branch_Name": str(summary.get("branch_name") or context["member_row"].get("branch_name") or branch),
+                "BU": member_data_bu(summary.get("bu") or context["member_row"].get("bu")),
+                "Label_Count": _history_int(summary.get("label_count") or context["member_row"].get("label_count")),
+                **{ACTUAL_BASELINE_COLUMNS[field]: context["baseline"][field] for field in ACTUAL_FIELDS},
+                **{ACTUAL_VALUE_COLUMNS[field]: requested[field] for field in ACTUAL_FIELDS},
+                "Is_Hidden": 1 if is_hidden else 0,
+                "Emp_ID": str(emp_id or "").strip(), "Reason": str(reason or "").strip(),
+                "Created_At": now_iso,
+            }
+            events.append(event)
+            latest[current_key] = event
+            context["records"][booking] = event
+            if pair_key not in pairs:
+                pairs.append(pair_key)
+        append_uat_event_rows("Booking Branch Actuals", events)
+        with booking_actuals_cache_lock:
+            booking_actuals_cache.update({"data": latest, "expires_at": time.time() + BOOKING_METADATA_CACHE_TTL_SECONDS})
+        return pairs
+
+
+def reconcile_booking_actual_member_data(pairs: list, actuals: Optional[dict] = None,
+                                         history: Optional[dict] = None) -> int:
+    """Repair Member Data from the durable actual ledger when values differ."""
+    if not pairs:
+        return 0
+    with booking_actual_write_lock:
+        actuals = actuals if actuals is not None else get_booking_branch_actuals(force_refresh=True)
+        history = history if history is not None else load_member_history()
+        member_summaries = []
+        for wave, branch in dict.fromkeys(pairs):
+            context = _actual_pair_context(wave, branch, actuals=actuals, history=history)
+            records = context["records"]
+            if not records:
+                continue
+            member_row = context["member_row"]
+            aggregate = {
+                "wave": wave, "branch": branch,
+                "branch_name": str(next(iter(records.values())).get("Branch_Name") or branch),
+                "bu": member_data_bu(next(iter(records.values())).get("BU") or member_row.get("bu")),
+                "label_count": max([_history_int(row.get("Label_Count")) for row in records.values()]
+                                    + [_history_int(member_row.get("label_count"))]),
+            }
+            for field in ACTUAL_FIELDS:
+                aggregate[field] = sum(_history_int(row.get(ACTUAL_VALUE_COLUMNS[field])) for row in records.values())
+            aggregate["total"] = sum(aggregate[field] for field in REPORT_BOX_FIELDS)
+            aggregate["allow_zero_update"] = True
+            same = member_row and all(
+                _history_int(member_row.get(field)) == _history_int(aggregate.get(field))
+                for field in (*ACTUAL_FIELDS, "total")
+            )
+            if not same:
+                member_summaries.append(aggregate)
+        if member_summaries:
+            write_member_history_summaries(member_summaries)
+        return len(member_summaries)
+
+
+def sync_booking_actual_pairs(pairs: list):
+    """Recompute Member Data from actual Booking totals and reconcile report rows."""
+    if not pairs:
+        return
+    reconcile_booking_actual_member_data(pairs)
+    actuals = get_booking_branch_actuals(force_refresh=True)
+    history = load_member_history()
+    report_summaries = []
+    for wave, branch in dict.fromkeys(pairs):
+        context = _actual_pair_context(wave, branch, actuals=actuals, history=history)
+        records = context["records"]
+        if not records:
+            continue
+        member_row = context["member_row"]
+        aggregate = {
+            "wave": wave, "branch": branch,
+            "branch_name": str(next(iter(records.values())).get("Branch_Name") or branch),
+            "bu": member_data_bu(next(iter(records.values())).get("BU") or member_row.get("bu")),
+            "label_count": max([_history_int(row.get("Label_Count")) for row in records.values()]
+                                + [_history_int(member_row.get("label_count"))]),
+        }
+        for field in ACTUAL_FIELDS:
+            aggregate[field] = sum(_history_int(row.get(ACTUAL_VALUE_COLUMNS[field])) for row in records.values())
+        aggregate["total"] = sum(aggregate[field] for field in REPORT_BOX_FIELDS)
+        aggregate["allow_zero_update"] = True
+        for booking_key, row in records.items():
+            candidate = {
+                "wave": wave, "branch": branch,
+                "booking": str(row.get("Booking_No") or booking_key).strip().upper(),
+                "branch_name": str(row.get("Branch_Name") or aggregate["branch_name"]),
+                "bu": member_data_bu(row.get("BU") or aggregate["bu"]),
+                "label_count": _history_int(row.get("Label_Count") or aggregate["label_count"]),
+                **{field: _history_int(row.get(ACTUAL_VALUE_COLUMNS[field])) for field in ACTUAL_FIELDS},
+                "is_hidden": str(row.get("Is_Hidden") or "").strip().lower() in ("1", "true", "yes"),
+                "allow_zero_update": True, "booking_actual": True,
+            }
+            candidate["total"] = sum(candidate[field] for field in REPORT_BOX_FIELDS)
+            if candidate["total"] <= 0:
+                candidate["is_hidden"] = True
+            report_summaries.append(candidate)
+    if report_summaries:
+        sync_uat_delivery_report_summaries(report_summaries)
+    request_uat_report_reconcile(force=True)
 
 
 def _build_booking_split_report_summaries(wave: str, branch: str, source: str, target: str,
@@ -4666,7 +5075,8 @@ def sync_document_summary_reports(summaries: list):
         raise RuntimeError(" | ".join(failures))
 
 
-def sync_document_summary_reports_background(base_summaries: list, affected_split_sources: list):
+def sync_document_summary_reports_background(base_summaries: list, affected_split_sources: list,
+                                             booking_actual_pairs: Optional[list] = None):
     """Finish the two Google Sheet upserts after the save response is sent.
 
     The document override event and in-memory overlay are the authoritative
@@ -4677,6 +5087,11 @@ def sync_document_summary_reports_background(base_summaries: list, affected_spli
     queue keeps writes ordered while allowing the operator to continue.
     """
     with document_summary_sync_lock:
+        if booking_actual_pairs:
+            try:
+                sync_booking_actual_pairs(booking_actual_pairs)
+            except Exception as exc:
+                print(f"🚨 Background actual Booking report sync pending: {exc}")
         report_summaries = copy.deepcopy(base_summaries or [])
         for source_booking, split_wave, split_branch in dict.fromkeys(affected_split_sources or []):
             if not source_booking:
@@ -4749,20 +5164,29 @@ def save_document_summary(data: DocumentSummaryBatchData, background_tasks: Back
         })
 
     affected_split_sources = []
+    booking_actual_pairs = []
+    legacy_split_items = []
     if data.persist_overrides:
         # The frontend sends dirty branches only. Persist zero so old totals cannot return later.
         persistent_items = normalized
         for item in persistent_items:
             item["allow_zero_update"] = True
+        if data.booking_actuals:
+            actual_items = [item for item in persistent_items if not item.get("booking_split")]
+            legacy_split_items = [item for item in persistent_items if item.get("booking_split")]
+            booking_actual_pairs = persist_booking_branch_actuals(
+                actual_items, emp_id, data.reason or "MANUAL_TOTAL_SAVE"
+            )
         # If this is the target side of a split, update the allocation record
         # itself. Otherwise refresh/print would rebuild the old split amount.
         # Normal edits/hide actions do not need to read the split-event Sheet.
         # Avoiding that forced Google read removes the main source of the old
         # 20–45 second save delay.  Only a real split target can affect the
         # allocation ledger.
-        if any(item.get("booking_split") for item in persistent_items):
+        split_items = legacy_split_items if data.booking_actuals else persistent_items
+        if any(item.get("booking_split") for item in split_items):
             affected_split_sources = persist_target_booking_split_edits(
-                persistent_items, emp_id, data.reason or "MANUAL_TOTAL_SAVE"
+                split_items, emp_id, data.reason or "MANUAL_TOTAL_SAVE"
             )
         # Apply the edit to the live web overlay first. A temporary Google auth
         # outage must never make the UI snap back to the calculated old total.
@@ -4789,12 +5213,13 @@ def save_document_summary(data: DocumentSummaryBatchData, background_tasks: Back
     # รายงานใช้ยอดล่าสุดที่หน้าเอกสารแสดงเสมอ ไม่รอให้สาขาปิดจบก่อน
     # The expensive Google Sheet read/sort is queued below, after the overlay
     # has been accepted, so a slow free-tier request cannot fail the save.
-    report_summaries = list(normalized)
+    report_summaries = list(legacy_split_items if data.booking_actuals else normalized)
     if data.persist_overrides:
         background_tasks.add_task(
             sync_document_summary_reports_background,
             copy.deepcopy(report_summaries),
             list(affected_split_sources),
+            list(booking_actual_pairs),
         )
         report_sync = "queued"
         sheet_warning = override_sheet_error
@@ -4812,6 +5237,7 @@ def save_document_summary(data: DocumentSummaryBatchData, background_tasks: Back
         "updated": len(report_summaries),
         "report_sync": report_sync,
         "persist_overrides": bool(data.persist_overrides),
+        "booking_actuals": bool(data.booking_actuals and booking_actual_pairs),
         "sheet_warning": sheet_warning if data.persist_overrides else None,
     }
 
@@ -4831,6 +5257,38 @@ def reset_document_overrides(data: ResetDocumentOverridesData, background_tasks:
 
     waves_to_clear = list(dict.fromkeys(waves_to_clear))
     if waves_to_clear:
+        actual_pairs = []
+        if data.booking:
+            booking_key = re.sub(r"\s+", "", str(data.booking).strip().upper())
+            actuals = get_booking_branch_actuals(force_refresh=True)
+            actual_reset_summaries = []
+            for (wave, branch, actual_booking), record in actuals.items():
+                if wave not in waves_to_clear or actual_booking != booking_key:
+                    continue
+                source_key = _booking_actual_key(wave, branch, record.get("Source_Booking"))[2]
+                values = {}
+                for field in ACTUAL_FIELDS:
+                    if actual_booking == source_key:
+                        allocated_elsewhere = sum(
+                            _history_int(other.get(ACTUAL_VALUE_COLUMNS[field]))
+                            for other_key, other in actuals.items()
+                            if other_key[0] == wave and other_key[1] == branch and other_key[2] != booking_key
+                        )
+                        values[field] = max(0, _history_int(record.get(ACTUAL_BASELINE_COLUMNS[field])) - allocated_elsewhere)
+                    else:
+                        values[field] = 0
+                actual_reset_summaries.append({
+                    "wave": wave, "booking": str(record.get("Booking_No") or data.booking).strip().upper(),
+                    "branch": branch, "branch_name": str(record.get("Branch_Name") or branch),
+                    "bu": member_data_bu(record.get("BU")), "label_count": _history_int(record.get("Label_Count")),
+                    **values, "total": sum(values[field] for field in REPORT_BOX_FIELDS),
+                    "is_hidden": actual_booking != source_key,
+                })
+            if actual_reset_summaries:
+                actual_pairs = persist_booking_branch_actuals(
+                    actual_reset_summaries, data.emp_id or "", "RESET_TO_SCANNER_TOTALS"
+                )
+
         def tombstone_sheet_overrides(waves, emp):
             now_iso = _uat_now_iso()
             rows = [{
@@ -4860,6 +5318,8 @@ def reset_document_overrides(data: ResetDocumentOverridesData, background_tasks:
                 for cache_key in [key for key in document_overrides_overlay if key[0] == w]:
                     document_overrides_overlay.pop(cache_key, None)
         queue_wave_totals_reconciliation(waves_to_clear, delay_seconds=0.5)
+        if actual_pairs:
+            background_tasks.add_task(sync_booking_actual_pairs, actual_pairs)
 
     return {"status": "success", "cleared_waves": waves_to_clear}
 
@@ -5169,6 +5629,112 @@ def get_wave_branch_options(wave_no: str):
         options.append(row)
     options.sort(key=lambda item: item["branch_code"])
     return {"status": "success", "wave_no": wave_clean, "branches": options}
+
+
+@app.get("/api/booking-branch-lookup")
+def lookup_booking_branch_actual(branch_code: str, target_booking: str):
+    """Find current, dated Wave rows for an inline branch add; this route is read-only."""
+    branch = str(branch_code or "").strip().upper()
+    target = re.sub(r"\s+", "", str(target_booking or "").strip().upper())
+    if not branch or not target:
+        raise HTTPException(status_code=400, detail="กรุณาระบุรหัสสาขาและ Booking ปลายทาง")
+    if branch in INVALID_BRANCH_STRINGS:
+        raise HTTPException(status_code=400, detail="รหัสสาขาไม่ถูกต้อง")
+    try:
+        monitoring_rows = load_fresh_wave_monitoring_report_rows()
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"อ่าน Wave_Monitoring ล่าสุดไม่ได้: {str(exc)[:180]}")
+    actuals = get_booking_branch_actuals(force_refresh=True)
+    history = load_member_history()
+    options = []
+    for (wave, monitored_branch), monitor in monitoring_rows.items():
+        if monitored_branch != branch:
+            continue
+        context = _actual_pair_context(wave, branch, target, monitoring_rows, actuals, history)
+        source_key = _booking_actual_key(wave, branch, context["source_booking"])[2]
+        target_record = context["records"].get(target)
+        can_add = bool(source_key and source_key != target and not target_record)
+        member_row = context["member_row"]
+        options.append({
+            "wave_no": wave,
+            "branch_code": branch,
+            "branch_name": str(member_row.get("branch_name") or branch),
+            "bu": member_data_bu(member_row.get("bu")),
+            "label_count": _history_int(member_row.get("label_count")),
+            "source_booking": context["source_booking"],
+            "target_already_has_branch": bool(target_record),
+            "is_target_source": source_key == target,
+            "can_add": can_add and any(context["available"].values()),
+            "baseline": context["baseline"],
+            "available": context["available"],
+            "existing_actual": ({field: _history_int(target_record.get(ACTUAL_VALUE_COLUMNS[field]))
+                                  for field in ACTUAL_FIELDS} if target_record else None),
+            "pick_date": monitor.get("pick_date").isoformat() if hasattr(monitor.get("pick_date"), "isoformat") else str(monitor.get("pick_date") or ""),
+        })
+    options.sort(key=lambda item: (item["wave_no"], item["source_booking"]))
+    if not options:
+        raise HTTPException(status_code=404, detail=f"ไม่พบสาขา {branch} ใน Wave_Monitoring ปัจจุบันที่มีวันที่ครบ")
+    return {"status": "success", "target_booking": target, "branch_code": branch, "branches": options}
+
+
+@app.post("/api/booking-branch-actual")
+def add_booking_branch_actual(data: BookingBranchActualData, background_tasks: BackgroundTasks):
+    target = re.sub(r"\s+", "", str(data.target_booking or "").strip().upper())
+    wave, branch, _ = _booking_actual_key(data.wave_no, data.branch_code, target)
+    if not target or not wave or not branch or branch in INVALID_BRANCH_STRINGS:
+        raise HTTPException(status_code=400, detail="ข้อมูล Booking, Wave หรือสาขาไม่ถูกต้อง")
+    try:
+        monitoring_rows = load_fresh_wave_monitoring_report_rows()
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"อ่าน Wave_Monitoring ล่าสุดไม่ได้: {str(exc)[:180]}")
+    monitoring_row = monitoring_rows.get((wave, branch))
+    if not monitoring_row:
+        raise HTTPException(status_code=409, detail="Wave/สาขานี้ไม่อยู่ใน Wave_Monitoring ปัจจุบัน จึงยังเพิ่มเข้ารายงานไม่ได้")
+    actuals = get_booking_branch_actuals(force_refresh=True)
+    context = _actual_pair_context(wave, branch, target, monitoring_rows, actuals, load_member_history())
+    source = context["source_booking"]
+    if not source:
+        raise HTTPException(status_code=409, detail="ไม่พบ Booking ต้นทางของสาขานี้")
+    source_key = _booking_actual_key(wave, branch, source)[2]
+    if source_key == target:
+        raise HTTPException(status_code=409, detail=f"สาขา {branch} อยู่ใน Booking {data.target_booking} แล้ว ให้แก้ยอดที่แถวเดิม")
+    if target in context["records"]:
+        raise HTTPException(status_code=409, detail=f"สาขา {branch} มีอยู่ใน Booking นี้แล้ว ให้แก้ยอดที่แถวเดิม")
+    requested = {field: _history_int(getattr(data, field)) for field in ACTUAL_FIELDS}
+    if sum(requested[field] for field in REPORT_BOX_FIELDS) <= 0:
+        raise HTTPException(status_code=400, detail="กรุณาใส่ยอดกล่องที่จะนำไปอย่างน้อย 1 กล่อง")
+    if source_key not in context["records"]:
+        raise HTTPException(status_code=409, detail=f"กรุณาปรับและบันทึกยอดจริงของ Booking {source} ก่อนเพิ่มสาขาไป Booking อื่น")
+    for field in ACTUAL_FIELDS:
+        if requested[field] > context["available"][field]:
+            raise HTTPException(status_code=409, detail=f"ยอด {field} เกินยอดที่ยังจัดสรรได้ {context['available'][field]}")
+    member_row = context["member_row"]
+    summary = {
+        "wave": wave, "booking": target, "branch": branch,
+        "branch_name": str(member_row.get("branch_name") or branch),
+        "bu": member_data_bu(member_row.get("bu")),
+        "label_count": _history_int(member_row.get("label_count")),
+        **requested, "total": sum(requested[field] for field in REPORT_BOX_FIELDS),
+        "is_hidden": False, "allow_zero_update": True,
+    }
+    pairs = persist_booking_branch_actuals([summary], str(data.emp_id or "").strip(), "ADD_BOOKING_BRANCH")
+    now_iso = _uat_now_iso()
+    with document_overrides_lock:
+        scope = _document_override_scope_key(wave, target)
+        document_overrides_overlay.setdefault(scope, {})[branch] = {
+            **{field: summary[field] for field in (*REPORT_BOX_FIELDS, "total", "pallet")},
+            "is_hidden": False, "emp_id": str(data.emp_id or "").strip(), "updated_at": now_iso,
+            "branch_name": summary["branch_name"], "bu": summary["bu"], "booking": target,
+            "label_count": summary["label_count"],
+        }
+    try:
+        record_document_overrides([summary], str(data.emp_id or "").strip(), "ADD_BOOKING_BRANCH")
+    except Exception as exc:
+        print(f"⚠️ Actual branch was recorded; document override mirror pending: {str(exc)[:180]}")
+    background_tasks.add_task(sync_booking_actual_pairs, pairs)
+    return {"status": "success", "wave_no": wave, "branch_code": branch,
+            "target_booking": target, "allocated": requested, "report_sync": "queued"}
+
 
 @app.post("/api/move-booking-branch")
 def move_booking_branch(data: BookingBranchMoveData):
