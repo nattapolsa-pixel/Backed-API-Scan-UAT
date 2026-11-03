@@ -30,7 +30,7 @@
 | `APP_ENV` | `uat` | แสดงบน `/api/health` |
 | `SCAN_FEATURE_ENABLED` | `false` | hold การสแกน → 423 (ต้องตรงกับ `SCAN_FEATURE_ENABLED` ใน `index.html`) |
 | `SCAN_DEMO_ONLY` | `true` | ถ้าเปิดสแกน จะแก้เฉพาะ memory ไม่เขียน Sheet |
-| `APP_VERSION` | `1.9.13-free` | เวอร์ชัน API; เวอร์ชันเว็บแยกกันและส่ง `app_version`/`api_version` คนละช่อง |
+| `APP_VERSION` | `1.9.15-free` | เวอร์ชัน API; เวอร์ชันเว็บแยกกันและส่ง `app_version`/`api_version` คนละช่อง |
 | `UAT_DATABASE_SPREADSHEET_ID` | `1RJcs…` | ที่เก็บ event log รวม Debug Events และยอดจริงแยก Booking |
 | `GOOGLE_SERVICE_ACCOUNT_JSON` | (secret) | สิทธิ์เขียน Sheets |
 
@@ -38,6 +38,8 @@
 
 ## Release notes
 
+- **Frontend 1.9.15-free / API 1.9.15-free (2026-11-03):** add branches by code and actual quantities using the open document context, limit lookup to that document's Waves, and allow quantities above inspected totals with a clear warning. Keep the API restriction scoped to the add-branch action; other actual-quantity saves still enforce allocation limits. Continue syncing Member Data and the UAT Delivery report from the recorded per-Booking actuals.
+- **Frontend 1.9.14-free (2026-11-03):** allow the add-branch panel when the current Booking was resolved from a Wave lookup.
 - **Frontend 1.9.13-free / API 1.9.13-free (2026-11-02):** add branches by code and record actual quantities per Booking; cap additions by the remaining source quantity per box type, aggregate actual Booking quantities into Member Data, and sync each Booking's actual row to the UAT Delivery report.
 - **Frontend 1.9.9-free (2026-10-15):** after verified opening of the shipping document, queue a Delivery report-only snapshot; the shortage/excess document remains read-only.
 - **API 1.9.12-free (2026-10-15):** remove existing UAT Delivery report rows unless all three required dates parse, then rebuild only records with dates confirmed by the current `Wave_Monitoring` source.

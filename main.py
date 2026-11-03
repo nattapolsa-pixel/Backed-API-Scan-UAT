@@ -53,7 +53,7 @@ if not os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
 # Google Sheets is the only data source. Credentials are loaded lazily by
 # get_sheets_session(), so a cold start never waits on an auth round-trip.
 APP_ENV = os.environ.get("APP_ENV", "uat").strip().lower()
-APP_VERSION = os.environ.get("APP_VERSION", "1.9.13-free").strip()
+APP_VERSION = os.environ.get("APP_VERSION", "1.9.15-free").strip()
 EMPLOYEE_LOOKUP_URL = "https://script.google.com/macros/s/AKfycbybmW6N7TxfsHqEa-Fx6ayy8M8xfjKGmTYO27izmbEoLJmQRrFD3i9c0XogP0fG6tlG/exec"
 
 # รายชื่อพนักงานสำหรับช่อง "เจ้าหน้าที่" บนใบคุมส่งสินค้า
@@ -4016,8 +4016,9 @@ def _actual_pair_context(wave: str, branch: str, target_booking: str = "",
     }
 
 
-def persist_booking_branch_actuals(summaries: list, emp_id: str, reason: str = "") -> list:
-    """Append actual Booking allocations after enforcing per-category source limits."""
+def persist_booking_branch_actuals(summaries: list, emp_id: str, reason: str = "",
+                                  allow_overage: bool = False) -> list:
+    """Append actual Booking allocations, optionally recording excess with a warning."""
     if not summaries:
         return []
     with booking_actual_write_lock:
@@ -4063,10 +4064,21 @@ def persist_booking_branch_actuals(summaries: list, emp_id: str, reason: str = "
             for field in ACTUAL_FIELDS:
                 remaining = max(0, context["baseline"][field] - other_reserved[field])
                 if requested[field] > remaining:
-                    raise HTTPException(
-                        status_code=409,
-                        detail=f"{branch} / Wave {wave}: ยอด {field} {requested[field]} เกินยอดที่ยังจัดสรรได้ {remaining}"
-                    )
+                    if not allow_overage:
+                        raise HTTPException(
+                            status_code=409,
+                            detail=f"{branch} / Wave {wave}: ยอด {field} {requested[field]} เกินยอดที่ยังจัดสรรได้ {remaining}"
+                        )
+                if allow_overage:
+                    excess = max(0, other_reserved[field] + requested[field] - context["baseline"][field])
+                    if excess:
+                        summary.setdefault("_actual_overages", {})[field] = {
+                            "entered": requested[field],
+                            "inspected": context["baseline"][field],
+                            "allocated_before": other_reserved[field],
+                            "allocated_after": other_reserved[field] + requested[field],
+                            "excess": excess,
+                        }
             event = {
                 "Event_ID": str(uuid.uuid4()), "Wave_Number": wave, "Branch_Code": branch,
                 "Source_Booking": source, "Booking_No": booking,
@@ -5632,7 +5644,7 @@ def get_wave_branch_options(wave_no: str):
 
 
 @app.get("/api/booking-branch-lookup")
-def lookup_booking_branch_actual(branch_code: str, target_booking: str):
+def lookup_booking_branch_actual(branch_code: str, target_booking: str, wave_no: str = ""):
     """Find current, dated Wave rows for an inline branch add; this route is read-only."""
     branch = str(branch_code or "").strip().upper()
     target = re.sub(r"\s+", "", str(target_booking or "").strip().upper())
@@ -5640,6 +5652,13 @@ def lookup_booking_branch_actual(branch_code: str, target_booking: str):
         raise HTTPException(status_code=400, detail="กรุณาระบุรหัสสาขาและ Booking ปลายทาง")
     if branch in INVALID_BRANCH_STRINGS:
         raise HTTPException(status_code=400, detail="รหัสสาขาไม่ถูกต้อง")
+    requested_waves = set()
+    for item in re.split(r"[,;]", str(wave_no or "")):
+        digits = re.sub(r"\D", "", item)
+        if digits:
+            requested_waves.add(str(int(digits)))
+    if not requested_waves:
+        raise HTTPException(status_code=400, detail="ไม่พบ Wave ของเอกสารปัจจุบัน กรุณาเปิดเอกสารใหม่แล้วลองอีกครั้ง")
     try:
         monitoring_rows = load_fresh_wave_monitoring_report_rows()
     except Exception as exc:
@@ -5648,12 +5667,18 @@ def lookup_booking_branch_actual(branch_code: str, target_booking: str):
     history = load_member_history()
     options = []
     for (wave, monitored_branch), monitor in monitoring_rows.items():
-        if monitored_branch != branch:
+        if monitored_branch != branch or wave not in requested_waves:
             continue
         context = _actual_pair_context(wave, branch, target, monitoring_rows, actuals, history)
         source_key = _booking_actual_key(wave, branch, context["source_booking"])[2]
         target_record = context["records"].get(target)
-        can_add = bool(source_key and source_key != target and not target_record)
+        source_record_ready = bool(source_key and source_key in context["records"])
+        can_add = bool(source_record_ready and source_key != target and not target_record)
+        allocated_other = {
+            field: sum(_history_int(row.get(ACTUAL_VALUE_COLUMNS[field]))
+                       for booking_key, row in context["records"].items() if booking_key != target)
+            for field in ACTUAL_FIELDS
+        }
         member_row = context["member_row"]
         options.append({
             "wave_no": wave,
@@ -5661,17 +5686,18 @@ def lookup_booking_branch_actual(branch_code: str, target_booking: str):
             "branch_name": str(member_row.get("branch_name") or branch),
             "bu": member_data_bu(member_row.get("bu")),
             "label_count": _history_int(member_row.get("label_count")),
-            "source_booking": context["source_booking"],
             "target_already_has_branch": bool(target_record),
             "is_target_source": source_key == target,
-            "can_add": can_add and any(context["available"].values()),
+            "source_record_ready": source_record_ready,
+            "can_add": can_add,
             "baseline": context["baseline"],
             "available": context["available"],
+            "allocated": allocated_other,
             "existing_actual": ({field: _history_int(target_record.get(ACTUAL_VALUE_COLUMNS[field]))
                                   for field in ACTUAL_FIELDS} if target_record else None),
             "pick_date": monitor.get("pick_date").isoformat() if hasattr(monitor.get("pick_date"), "isoformat") else str(monitor.get("pick_date") or ""),
         })
-    options.sort(key=lambda item: (item["wave_no"], item["source_booking"]))
+    options.sort(key=lambda item: item["wave_no"])
     if not options:
         raise HTTPException(status_code=404, detail=f"ไม่พบสาขา {branch} ใน Wave_Monitoring ปัจจุบันที่มีวันที่ครบ")
     return {"status": "success", "target_booking": target, "branch_code": branch, "branches": options}
@@ -5694,7 +5720,7 @@ def add_booking_branch_actual(data: BookingBranchActualData, background_tasks: B
     context = _actual_pair_context(wave, branch, target, monitoring_rows, actuals, load_member_history())
     source = context["source_booking"]
     if not source:
-        raise HTTPException(status_code=409, detail="ไม่พบ Booking ต้นทางของสาขานี้")
+        raise HTTPException(status_code=409, detail="ข้อมูลยอดตรวจตั้งต้นของสาขานี้ยังไม่พร้อม จึงยังบันทึกยอดจริงไม่ได้")
     source_key = _booking_actual_key(wave, branch, source)[2]
     if source_key == target:
         raise HTTPException(status_code=409, detail=f"สาขา {branch} อยู่ใน Booking {data.target_booking} แล้ว ให้แก้ยอดที่แถวเดิม")
@@ -5704,10 +5730,7 @@ def add_booking_branch_actual(data: BookingBranchActualData, background_tasks: B
     if sum(requested[field] for field in REPORT_BOX_FIELDS) <= 0:
         raise HTTPException(status_code=400, detail="กรุณาใส่ยอดกล่องที่จะนำไปอย่างน้อย 1 กล่อง")
     if source_key not in context["records"]:
-        raise HTTPException(status_code=409, detail=f"กรุณาปรับและบันทึกยอดจริงของ Booking {source} ก่อนเพิ่มสาขาไป Booking อื่น")
-    for field in ACTUAL_FIELDS:
-        if requested[field] > context["available"][field]:
-            raise HTTPException(status_code=409, detail=f"ยอด {field} เกินยอดที่ยังจัดสรรได้ {context['available'][field]}")
+        raise HTTPException(status_code=409, detail="ข้อมูลยอดตรวจตั้งต้นของสาขานี้ยังไม่พร้อม จึงยังบันทึกยอดจริงไม่ได้")
     member_row = context["member_row"]
     summary = {
         "wave": wave, "booking": target, "branch": branch,
@@ -5717,7 +5740,9 @@ def add_booking_branch_actual(data: BookingBranchActualData, background_tasks: B
         **requested, "total": sum(requested[field] for field in REPORT_BOX_FIELDS),
         "is_hidden": False, "allow_zero_update": True,
     }
-    pairs = persist_booking_branch_actuals([summary], str(data.emp_id or "").strip(), "ADD_BOOKING_BRANCH")
+    pairs = persist_booking_branch_actuals(
+        [summary], str(data.emp_id or "").strip(), "ADD_BOOKING_BRANCH", allow_overage=True
+    )
     now_iso = _uat_now_iso()
     with document_overrides_lock:
         scope = _document_override_scope_key(wave, target)
@@ -5733,7 +5758,8 @@ def add_booking_branch_actual(data: BookingBranchActualData, background_tasks: B
         print(f"⚠️ Actual branch was recorded; document override mirror pending: {str(exc)[:180]}")
     background_tasks.add_task(sync_booking_actual_pairs, pairs)
     return {"status": "success", "wave_no": wave, "branch_code": branch,
-            "target_booking": target, "allocated": requested, "report_sync": "queued"}
+            "target_booking": target, "allocated": requested,
+            "warnings": summary.get("_actual_overages", {}), "report_sync": "queued"}
 
 
 @app.post("/api/move-booking-branch")
