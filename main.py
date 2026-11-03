@@ -53,7 +53,7 @@ if not os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
 # Google Sheets is the only data source. Credentials are loaded lazily by
 # get_sheets_session(), so a cold start never waits on an auth round-trip.
 APP_ENV = os.environ.get("APP_ENV", "uat").strip().lower()
-APP_VERSION = os.environ.get("APP_VERSION", "1.9.20-free").strip()
+APP_VERSION = os.environ.get("APP_VERSION", "1.9.21-free").strip()
 EMPLOYEE_LOOKUP_URL = "https://script.google.com/macros/s/AKfycbybmW6N7TxfsHqEa-Fx6ayy8M8xfjKGmTYO27izmbEoLJmQRrFD3i9c0XogP0fG6tlG/exec"
 
 # รายชื่อพนักงานสำหรับช่อง "เจ้าหน้าที่" บนใบคุมส่งสินค้า
@@ -3007,6 +3007,22 @@ def build_member_history_items(wave_no: str) -> list:
         if component_total == 0 and row["total"] > 0:
             values[0] = ("M", "None", "Carton", row["total"])
         pallet_nos = list(range(1, row["pallet"] + 1))
+        if not any(qty > 0 for _, _, _, qty in values):
+            # Keep a real zero-quantity Member Data branch visible in the
+            # complete document instead of silently dropping it from the list.
+            items.append({
+                "lpn": f"SUMMARY-{wave}-{row['branch']}-EMPTY", "zone": "HISTORY",
+                "branch": row["branch"], "branch_name": row["branch_name"] or row["branch"],
+                "status": "Scanned", "total_qty": 0, "qty": 0, "scan_type": "Carton",
+                "owner": row["bu"], "color": "None", "color_breakdown": [],
+                "pallet_breakdown": [], "pallet_no": 0, "branch_pallet_nos": pallet_nos,
+                "pallet_color": "", "branch_submitted_pallet_nos": pallet_nos,
+                "branch_closed_at": f"{row['date']} {row['time']}".strip(),
+                "branch_closed_by": "Member Data", "wave_no": f"{int(wave):010d}",
+                "historical_summary": True, "historical_label_count": row["label_count"],
+                "historical_date": row["date"],
+            })
+            continue
         for category, color, scan_type, qty in values:
             if qty <= 0:
                 continue
@@ -3474,10 +3490,9 @@ def get_booking_data_internal(booking_no: str, force_refresh: bool = False) -> d
     booking_clean = booking_no.strip().upper()
     wave_force_refresh = force_refresh
     if force_refresh:
-        # Refresh the large Member Data sheet once before fan-out. Refreshing
-        # per Wave is slower and can expose different snapshots of the same read
-        # while the Sheet is still being written.
-        load_member_history(force=True)
+        # Refresh Booking metadata once, then re-read only the Waves in this
+        # Booking. A full Member Data download for one refresh was slow and
+        # could exhaust the Free API worker's memory.
         load_booking_wave_sheet_meta(force=True)
         wave_force_refresh = False
     assignments = get_booking_branch_assignments(force_refresh=force_refresh)
@@ -3509,15 +3524,26 @@ def get_booking_data_internal(booking_no: str, force_refresh: bool = False) -> d
     # 0.1 CPU instance without overlapping any real I/O.
     for wave in waves:
         try:
+            if force_refresh:
+                refresh_member_wave_now(wave)
             wave_data = get_wave_data_internal(wave, wave_force_refresh)
             wave_results.append(merge_member_history(apply_local_overlay(wave, wave_data), wave))
         except HTTPException as e:
             # A stale/failed branch-move record can reference a foreign Wave
-            # that is not part of this Booking's real mapping. It must not
-            # make confirmation of the newly selected Wave fail with the
-            # unrelated old Wave number.
-            if wave not in native_waves and e.status_code in (404, 503):
-                print(f"⚠️ Ignoring unavailable transferred Wave {wave} ({e.status_code}) while loading Booking {booking_clean}")
+            # that is not part of this Booking's real mapping. Persisted actuals
+            # can also be the only surviving source while Member Data catches up.
+            has_booking_actual = any(
+                actual_key[0] == wave
+                and actual_key[2] == re.sub(r"\s+", "", booking_clean)
+                for actual_key in actuals
+            )
+            if e.status_code in (404, 503) and (wave not in native_waves or has_booking_actual):
+                if has_booking_actual:
+                    wave_results.append({
+                        "wave_no": f"{int(wave):010d}", "booking_no": booking_clean,
+                        "license_plate": "", "lpn_list": [], "zone_summary": [],
+                    })
+                print(f"⚠️ Preserving saved Booking actuals for unavailable Wave {wave} ({e.status_code})")
                 continue
             raise
         except Exception as e:
@@ -3656,7 +3682,74 @@ def get_booking_data_internal(booking_no: str, force_refresh: bool = False) -> d
                         wave_has_items = True
         if wave_has_items:
             waves_included.add(wave_data_overlaid["wave_no"])
-        
+
+    # A durable actual allocation can outlive the Member Data row it was
+    # created from (or arrive before that row). Always materialize the saved
+    # Booking allocation so reloads show the same branch and cannot appear
+    # "already added" while missing from the document.
+    normalized_booking = re.sub(r"\s+", "", booking_clean)
+    visible_actual_pairs = {
+        (str(int(re.sub(r"\D", "", str(item.get("wave_no") or "")))),
+         str(item.get("branch") or "").strip().upper())
+        for item in lpn_list
+        if re.sub(r"\D", "", str(item.get("wave_no") or "")) and item.get("branch")
+    }
+    for (actual_wave, actual_branch, actual_booking), actual in actuals.items():
+        if actual_booking != normalized_booking or (actual_wave, actual_branch) in visible_actual_pairs:
+            continue
+        actual_totals = {
+            field: _history_int(actual.get(ACTUAL_VALUE_COLUMNS[field]))
+            for field in ACTUAL_FIELDS
+        }
+        actual_summary = {
+            **actual_totals,
+            "total": sum(actual_totals[field] for field in REPORT_BOX_FIELDS),
+            "is_hidden": str(actual.get("Is_Hidden") or "").strip().lower() in ("1", "true", "yes"),
+            "source_booking": str(actual.get("Source_Booking") or "").strip().upper(),
+            "booking": booking_clean,
+        }
+        wave_padded = f"{int(actual_wave):010d}"
+        pallet_nos = list(range(1, actual_totals["pallet"] + 1))
+        components = [
+            ("m", "Carton", "None"),
+            ("red", "TOTE", "Red"),
+            ("blue", "TOTE", "Blue"),
+            ("green", "TOTE", "Green"),
+            ("black", "TOTE", "Black"),
+        ]
+        positive_components = [component for component in components if actual_totals[component[0]] > 0]
+        if not positive_components:
+            positive_components = [("m", "Carton", "None")]
+        for index, (field, scan_type, color) in enumerate(positive_components):
+            qty = actual_totals[field]
+            row_item = {
+                "lpn": f"ACTUAL-{actual_wave}-{actual_branch}-{field.upper()}",
+                "zone": "TRANSFER",
+                "branch": actual_branch,
+                "branch_name": str(actual.get("Branch_Name") or actual_branch),
+                "status": "Scanned",
+                "total_qty": qty,
+                "qty": qty,
+                "scan_type": scan_type,
+                "owner": member_data_bu(actual.get("BU")),
+                "color": color,
+                "color_breakdown": ([{"color": color, "qty": qty, "type": scan_type}] if qty else []),
+                "pallet_breakdown": [],
+                "pallet_no": 0,
+                "branch_pallet_nos": pallet_nos,
+                "pallet_color": "",
+                "branch_submitted_pallet_nos": pallet_nos,
+                "branch_closed_at": str(actual.get("Updated_At") or actual.get("Created_At") or ""),
+                "branch_closed_by": str(actual.get("Emp_ID") or "Booking actual"),
+                "wave_no": wave_padded,
+                "historical_summary": True,
+            }
+            if index == 0:
+                row_item["booking_actual_summary"] = actual_summary
+            lpn_list.append(row_item)
+        waves_included.add(wave_padded)
+        visible_actual_pairs.add((actual_wave, actual_branch))
+
     zones_calc = {}
     for item in lpn_list:
         z = item.get("zone") or "N/A"
@@ -5440,38 +5533,76 @@ def clear_device_states(data: DeviceStateData):
 
 # 🚀 [API 1] โหลดข้อมูล Wave
 # 🚀 [API 1] โหลดข้อมูล Wave
+def expected_branches_for_wave(wave_no: str) -> set:
+    """Expected Wave branches from the dated Wave_Monitoring snapshot."""
+    digits = re.sub(r"\D", "", str(wave_no or ""))
+    if not digits:
+        return set()
+    wave = str(int(digits))
+    _, _, expected_map = load_wave_monitoring_pick_dates(force=False)
+    return {
+        str(branch or "").strip().upper()
+        for (booking, expected_wave), branches in expected_map.items()
+        if expected_wave == wave
+        for branch in branches
+        if str(branch or "").strip()
+    }
+
+
+def missing_wave_branches(wave_no: str, wave_data: dict, expected: set = None) -> list:
+    expected = expected if expected is not None else expected_branches_for_wave(wave_no)
+    actual = {
+        str(item.get("branch") or "").strip().upper()
+        for item in wave_data.get("lpn_list") or []
+        if str(item.get("branch") or "").strip()
+    }
+    return sorted(expected - actual)
+
+
+def load_complete_wave(wave_no: str, force_refresh: bool = False) -> dict:
+    """Wait for a complete monitored Wave; never return a cached partial set."""
+    expected = expected_branches_for_wave(wave_no)
+    last_error = None
+    missing = sorted(expected)
+    for attempt in range(3):
+        if force_refresh or attempt > 0:
+            refresh_member_wave_now(wave_no)
+        try:
+            raw_data = get_wave_data_internal(wave_no, force_refresh=False)
+        except HTTPException as exc:
+            last_error = exc
+            if exc.status_code not in (404, 503):
+                raise
+            if not expected and exc.status_code == 404:
+                if attempt < 2:
+                    time.sleep(1.0)
+                    continue
+                raise
+        else:
+            result = merge_member_history(apply_local_overlay(wave_no, raw_data), wave_no)
+            missing = missing_wave_branches(wave_no, result, expected)
+            if not missing:
+                return result
+            last_error = HTTPException(status_code=409, detail="Wave ยังโหลดสาขาได้ไม่ครบ")
+        if attempt < 2:
+            time.sleep(1.0)
+
+    if expected and missing:
+        details = ",".join(missing[:12])
+        raise HTTPException(
+            status_code=409,
+            detail=f"ข้อมูล Wave {wave_no} ยังมาไม่ครบ ขาด {len(missing)} สาขา ({details}) ระบบยังไม่เปิดข้อมูลบางส่วน",
+        )
+    if last_error:
+        raise last_error
+    raise HTTPException(status_code=503, detail=f"โหลดข้อมูล Wave {wave_no} ไม่สำเร็จ กรุณาลองใหม่")
+
+
 @app.get("/api/check-wave")
 def check_wave(wave_no: str, force: bool = False):
     try:
         request_uat_report_reconcile()
-        # ปุ่มรีเฟรชคือการบอกว่า "ยอดบนจอไม่ครบ" จึงอ่าน Wave นี้ตรงจากชีตก่อนตอบ
-        # (~300 ไบต์) ไม่ใช่รอโหลดเต็ม 144k แถวที่ทำงานอยู่เบื้องหลัง
-        if force:
-            refresh_member_wave_now(wave_no)
-        # การค้นหาปกติใช้ cache ที่ warm ไว้ ส่วนปุ่มรีเฟรชส่ง force=true เมื่อต้องอ่าน
-        # Google Sheets ใหม่จริง ๆ การบังคับ force ทุกครั้งทำให้โหลด Member Data 39k+ แถวซ้ำ
-        try:
-            raw_data = get_wave_data_internal(wave_no, force_refresh=force)
-        except HTTPException as exc:
-            if exc.status_code not in (404, 503):
-                raise
-            # A Wave can be added to Member Data after the Free instance has
-            # warmed its 10-minute cache. Re-read once before reporting 404;
-            # this avoids a false "server unavailable" modal for new rows.
-            load_member_history(force=True)
-            try:
-                raw_data = get_wave_data_internal(wave_no, force_refresh=False)
-            except HTTPException:
-                history_items = build_member_history_items(wave_no)
-                if not history_items:
-                    raise
-                raw_data = {
-                    "wave_no": f"{int(str(wave_no).strip()):010d}", "booking_no": "",
-                    "license_plate": "", "lpn_list": history_items, "zone_summary": []
-                }
-        # Apply the in-memory scan overlays dynamically
-        overlaid_data = apply_local_overlay(wave_no, raw_data)
-        result = merge_member_history(overlaid_data, wave_no)
+        result = load_complete_wave(wave_no, force_refresh=force)
         # 1 Wave อยู่ได้หลาย Booking: ส่งตัวเลือกกลับไปให้หน้าเว็บถาม ไม่เดาให้
         result["booking_options"] = [
             str(item.get("booking") or "").strip().upper()
@@ -5485,12 +5616,21 @@ def check_wave(wave_no: str, force: bool = False):
         print(f"🚨 CHECK WAVE ERROR: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
+
 # 🚀 [API 1.5] โหลดข้อมูล Booking
 def ensure_booking_source_complete(booking_no: str, booking_data: dict):
-    """Return planned branches missing from this Booking's complete data view."""
+    """Return monitored branches missing from the Booking's visible data view."""
     booking = re.sub(r"\s+", "", str(booking_no or "").upper())
     _, _, expected_map = load_wave_monitoring_pick_dates(force=False)
     actual_records = get_booking_branch_actuals()
+    assignments = get_booking_branch_assignments()
+    visible_by_wave = {}
+    for item in booking_data.get("lpn_list") or []:
+        digits = re.sub(r"\D", "", str(item.get("wave_no") or ""))
+        branch = str(item.get("branch") or "").strip().upper()
+        if digits and branch:
+            visible_by_wave.setdefault(str(int(digits)), set()).add(branch)
+
     missing = []
     for raw_wave in booking_data.get("waves") or []:
         digits = re.sub(r"\D", "", str(raw_wave or ""))
@@ -5500,19 +5640,14 @@ def ensure_booking_source_complete(booking_no: str, booking_data: dict):
         expected = set(expected_map.get((booking, wave)) or set())
         if not expected:
             continue
-        actual = {
-            str(item.get("branch") or "").strip().upper()
-            for item in build_member_history_items(wave)
-            if str(item.get("branch") or "").strip()
-        }
-        # Saved manual corrections are complete, durable branch records even
-        # while the large Member Data import is delayed.
+        actual = set(visible_by_wave.get(wave) or set())
         actual.update(get_document_overrides_for_wave(wave, booking).keys())
-        actual.update(
-            actual_branch
-            for (actual_wave, actual_branch, actual_booking) in actual_records
-            if actual_wave == wave and actual_booking == booking
-        )
+        for branch in list(expected):
+            assignment = assignments.get((wave, str(branch).strip().upper())) or {}
+            assigned_booking = re.sub(r"\s+", "", str(assignment.get("Assigned_Booking") or "").upper())
+            target_has_actual = (wave, str(branch).strip().upper(), booking) in actual_records
+            if assigned_booking and assigned_booking != booking and not target_has_actual:
+                expected.discard(branch)
         absent = sorted(expected - actual)
         if absent:
             missing.append({"wave": wave, "missing": absent, "expected": len(expected), "actual": len(actual)})
@@ -5521,12 +5656,12 @@ def ensure_booking_source_complete(booking_no: str, booking_data: dict):
             f"Wave {item['wave']} ขาด {len(item['missing'])} สาขา ({','.join(item['missing'][:5])})"
             for item in missing
         )
-        print(f"⚠️ UAT Booking [{booking}] info: {details}")
+        print(f"⚠️ UAT Booking [{booking}] incomplete: {details}")
     return missing
 
 
 def load_complete_booking(booking_no: str, force_refresh: bool = False) -> dict:
-    """Retry only missing Waves once, then fail closed instead of serving a partial Booking."""
+    """Retry only missing Waves, then fail closed instead of serving a partial Booking."""
     booking_data = get_booking_data_internal(booking_no, force_refresh=force_refresh)
     missing = ensure_booking_source_complete(booking_no, booking_data)
     if missing:
@@ -5541,38 +5676,42 @@ def load_complete_booking(booking_no: str, force_refresh: bool = False) -> dict:
         )
         raise HTTPException(
             status_code=503,
-            detail=f"ข้อมูล Booking {booking_no} ยังมาไม่ครบ ({details}) กรุณาลองเปิดเอกสารใหม่อีกครั้ง",
+            detail=f"ข้อมูล Booking {booking_no} ยังมาไม่ครบ ({details}) ระบบยังไม่ส่งเอกสารบางส่วน",
         )
     return booking_data
-
 
 
 @app.get("/api/check-booking")
 def check_booking(booking_no: str, force: bool = False):
     try:
         request_uat_report_reconcile()
-        try:
-            return load_complete_booking(booking_no, force_refresh=force)
-        except HTTPException as first_error:
-            if first_error.status_code not in (404, 409):
-                raise
-            # Member Data is populated progressively. Re-read one consistent
-            # snapshot before declaring a multi-Wave Booking incomplete.
-            time.sleep(1.0)
+        last_error = None
+        for attempt in range(3):
             try:
-                return load_complete_booking(booking_no, force_refresh=True)
-            except HTTPException as retry_error:
-                if retry_error.status_code in (404, 409):
-                    raise HTTPException(
-                        status_code=409,
-                        detail=str(retry_error.detail),
-                    )
-                raise
+                # A normal retry refreshes only metadata and the missing Waves.
+                # Do not force-reload the full Member Data sheet to fix one gap.
+                if attempt and last_error and last_error.status_code == 404:
+                    get_booking_waves_mapping(booking_no, force_refresh=True)
+                return load_complete_booking(
+                    booking_no,
+                    force_refresh=(force and attempt == 0),
+                )
+            except HTTPException as exc:
+                last_error = exc
+                incomplete = exc.status_code == 503 and "ยังมาไม่ครบ" in str(exc.detail)
+                if exc.status_code not in (404, 409) and not incomplete:
+                    raise
+                if attempt < 2:
+                    time.sleep(1.5)
+        if last_error:
+            raise HTTPException(status_code=409, detail=str(last_error.detail))
+        raise HTTPException(status_code=503, detail=f"โหลดข้อมูล Booking {booking_no} ไม่สำเร็จ")
     except HTTPException:
         raise
     except Exception as e:
         print(f"🚨 CHECK BOOKING ERROR: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.get("/api/booking-branch-preview")
 def preview_booking_branch(wave_no: str, branch_code: str):
