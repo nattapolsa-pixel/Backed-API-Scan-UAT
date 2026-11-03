@@ -53,7 +53,7 @@ if not os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
 # Google Sheets is the only data source. Credentials are loaded lazily by
 # get_sheets_session(), so a cold start never waits on an auth round-trip.
 APP_ENV = os.environ.get("APP_ENV", "uat").strip().lower()
-APP_VERSION = os.environ.get("APP_VERSION", "1.9.17-free").strip()
+APP_VERSION = os.environ.get("APP_VERSION", "1.9.18-free").strip()
 EMPLOYEE_LOOKUP_URL = "https://script.google.com/macros/s/AKfycbybmW6N7TxfsHqEa-Fx6ayy8M8xfjKGmTYO27izmbEoLJmQRrFD3i9c0XogP0fG6tlG/exec"
 
 # รายชื่อพนักงานสำหรับช่อง "เจ้าหน้าที่" บนใบคุมส่งสินค้า
@@ -5645,19 +5645,18 @@ def get_wave_branch_options(wave_no: str):
 
 
 @app.get("/api/booking-branch-lookup")
-def lookup_booking_branch_actual(branch_code: str, target_booking: str, wave_no: str = ""):
-    """Find current, dated Wave rows by branch code; target Booking stays implicit in the open document."""
+def lookup_booking_branch_actual(branch_code: str, target_booking: str, wave_no: str):
+    """Find one branch in the operator-selected current dated Wave."""
     branch = str(branch_code or "").strip().upper()
     target = re.sub(r"\s+", "", str(target_booking or "").strip().upper())
-    if not branch or not target:
-        raise HTTPException(status_code=400, detail="กรุณาระบุรหัสสาขาและ Booking ปลายทาง")
+    wave_digits = re.sub(r"\D", "", str(wave_no or ""))
+    if not branch or not target or not wave_digits:
+        raise HTTPException(status_code=400, detail="กรุณาระบุเลข Wave รหัสสาขา และเปิดเอกสารปลายทางก่อน")
+    if len(wave_digits) > 12:
+        raise HTTPException(status_code=400, detail="เลข Wave ไม่ถูกต้อง")
     if branch in INVALID_BRANCH_STRINGS:
         raise HTTPException(status_code=400, detail="รหัสสาขาไม่ถูกต้อง")
-    requested_waves = set()
-    for item in re.split(r"[,;]", str(wave_no or "")):
-        digits = re.sub(r"\D", "", item)
-        if digits:
-            requested_waves.add(str(int(digits)))
+    requested_wave = str(int(wave_digits))
     try:
         monitoring_rows = load_fresh_wave_monitoring_report_rows()
     except Exception as exc:
@@ -5666,7 +5665,7 @@ def lookup_booking_branch_actual(branch_code: str, target_booking: str, wave_no:
     history = load_member_history()
     options = []
     for (wave, monitored_branch), monitor in monitoring_rows.items():
-        if monitored_branch != branch:
+        if wave != requested_wave or monitored_branch != branch:
             continue
         context = _actual_pair_context(wave, branch, target, monitoring_rows, actuals, history)
         source_key = _booking_actual_key(wave, branch, context["source_booking"])[2]
@@ -5692,7 +5691,6 @@ def lookup_booking_branch_actual(branch_code: str, target_booking: str, wave_no:
             "label_count": _history_int(member_row.get("label_count")),
             "target_already_has_branch": bool(target_record),
             "is_target_source": source_key == target,
-            "current_document_wave": wave in requested_waves,
             "source_booking_available": bool(source_key),
             "can_add": can_add,
             "baseline": context["baseline"],
@@ -5702,10 +5700,10 @@ def lookup_booking_branch_actual(branch_code: str, target_booking: str, wave_no:
                                   for field in ACTUAL_FIELDS} if target_record else None),
             "pick_date": monitor.get("pick_date").isoformat() if hasattr(monitor.get("pick_date"), "isoformat") else str(monitor.get("pick_date") or ""),
         })
-    options.sort(key=lambda item: (not item["current_document_wave"], item["wave_no"]))
     if not options:
-        raise HTTPException(status_code=404, detail=f"ไม่พบสาขา {branch} ใน Wave_Monitoring ปัจจุบันที่มีวันที่ครบ")
-    return {"status": "success", "target_booking": target, "branch_code": branch, "branches": options}
+        raise HTTPException(status_code=404, detail=f"ไม่พบสาขา {branch} ใน Wave {requested_wave} ที่มีวันที่ครบใน Wave_Monitoring ปัจจุบัน")
+    return {"status": "success", "target_booking": target, "wave_no": requested_wave,
+            "branch_code": branch, "branches": options}
 
 
 @app.post("/api/booking-branch-actual")
