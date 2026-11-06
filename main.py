@@ -53,7 +53,7 @@ if not os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
 # Google Sheets is the only data source. Credentials are loaded lazily by
 # get_sheets_session(), so a cold start never waits on an auth round-trip.
 APP_ENV = os.environ.get("APP_ENV", "uat").strip().lower()
-APP_VERSION = os.environ.get("APP_VERSION", "1.9.23-free").strip()
+APP_VERSION = os.environ.get("APP_VERSION", "1.9.24-free").strip()
 EMPLOYEE_LOOKUP_URL = "https://script.google.com/macros/s/AKfycbybmW6N7TxfsHqEa-Fx6ayy8M8xfjKGmTYO27izmbEoLJmQRrFD3i9c0XogP0fG6tlG/exec"
 
 # รายชื่อพนักงานสำหรับช่อง "เจ้าหน้าที่" บนใบคุมส่งสินค้า
@@ -5568,10 +5568,11 @@ def missing_wave_branches(wave_no: str, wave_data: dict, expected: set = None) -
 
 
 def load_complete_wave(wave_no: str, force_refresh: bool = False) -> dict:
-    """Wait for a complete monitored Wave; never return a cached partial set."""
+    """Load a Wave and report monitored branches still missing after refresh attempts."""
     expected = expected_branches_for_wave(wave_no)
     last_error = None
     missing = sorted(expected)
+    result = None
     for attempt in range(3):
         if force_refresh or attempt > 0:
             refresh_member_wave_now(wave_no)
@@ -5590,11 +5591,22 @@ def load_complete_wave(wave_no: str, force_refresh: bool = False) -> dict:
             result = merge_member_history(apply_local_overlay(wave_no, raw_data), wave_no)
             missing = missing_wave_branches(wave_no, result, expected)
             if not missing:
+                result["branch_completeness_warnings"] = []
                 return result
             last_error = HTTPException(status_code=409, detail="Wave ยังโหลดสาขาได้ไม่ครบ")
         if attempt < 2:
             time.sleep(1.0)
 
+    if result is not None and expected and missing:
+        digits = re.sub(r"\D", "", str(wave_no or ""))
+        result["branch_completeness_warnings"] = [{
+            "wave": str(int(digits)) if digits else str(wave_no or ""),
+            "missing": missing,
+            "expected": len(expected),
+            "actual": len(expected) - len(missing),
+        }]
+        print(f"⚠️ UAT Wave [{wave_no}] returned with {len(missing)} monitored branches missing")
+        return result
     if expected and missing:
         details = ",".join(missing[:12])
         raise HTTPException(
@@ -5656,9 +5668,10 @@ def ensure_booking_source_complete(booking_no: str, booking_data: dict):
             target_has_actual = (wave, str(branch).strip().upper(), booking) in actual_records
             if assigned_booking and assigned_booking != booking and not target_has_actual:
                 expected.discard(branch)
+        actual_count = len(expected & actual)
         absent = sorted(expected - actual)
         if absent:
-            missing.append({"wave": wave, "missing": absent, "expected": len(expected), "actual": len(actual)})
+            missing.append({"wave": wave, "missing": absent, "expected": len(expected), "actual": actual_count})
     if missing:
         details = "; ".join(
             f"Wave {item['wave']} ขาด {len(item['missing'])} สาขา ({','.join(item['missing'][:5])})"
@@ -5669,7 +5682,7 @@ def ensure_booking_source_complete(booking_no: str, booking_data: dict):
 
 
 def load_complete_booking(booking_no: str, force_refresh: bool = False) -> dict:
-    """Retry only missing Waves, then fail closed instead of serving a partial Booking."""
+    """Retry missing Waves once, then return available data with completeness warnings."""
     booking_data = get_booking_data_internal(booking_no, force_refresh=force_refresh)
     missing = ensure_booking_source_complete(booking_no, booking_data)
     if missing:
@@ -5682,10 +5695,8 @@ def load_complete_booking(booking_no: str, force_refresh: bool = False) -> dict:
             f"Wave {item['wave']} ขาด {','.join(item['missing'][:8])}"
             for item in missing
         )
-        raise HTTPException(
-            status_code=503,
-            detail=f"ข้อมูล Booking {booking_no} ยังมาไม่ครบ ({details}) ระบบยังไม่ส่งเอกสารบางส่วน",
-        )
+        print(f"⚠️ UAT Booking [{booking_no}] returned with incomplete monitored branches: {details}")
+    booking_data["branch_completeness_warnings"] = missing
     return booking_data
 
 
