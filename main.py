@@ -53,7 +53,7 @@ if not os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
 # Google Sheets is the only data source. Credentials are loaded lazily by
 # get_sheets_session(), so a cold start never waits on an auth round-trip.
 APP_ENV = os.environ.get("APP_ENV", "uat").strip().lower()
-APP_VERSION = os.environ.get("APP_VERSION", "1.9.29-free").strip()
+APP_VERSION = os.environ.get("APP_VERSION", "1.9.30-free").strip()
 EMPLOYEE_LOOKUP_URL = "https://script.google.com/macros/s/AKfycbybmW6N7TxfsHqEa-Fx6ayy8M8xfjKGmTYO27izmbEoLJmQRrFD3i9c0XogP0fG6tlG/exec"
 
 # รายชื่อพนักงานสำหรับช่อง "เจ้าหน้าที่" บนใบคุมส่งสินค้า
@@ -4251,6 +4251,20 @@ def persist_booking_branch_actuals(summaries: list, emp_id: str, reason: str = "
                     raise HTTPException(status_code=409, detail=f"กรุณาบันทึกยอดจริงของ Booking {source} ก่อนเพิ่มสาขานี้เข้า Booking อื่น")
             current_key = (wave, branch, booking)
             is_hidden = bool(summary.get("is_hidden"))
+            edited_fields = summary.get("edited_fields")
+            if edited_fields is not None:
+                edited_fields = set(edited_fields)
+                current_record = context["records"].get(booking)
+                latest_override = None
+                if current_record is None:
+                    latest_override = (get_document_overrides_for_wave(wave, booking) or {}).get(branch) or {}
+                for field in ACTUAL_FIELDS:
+                    if field in edited_fields:
+                        continue
+                    if current_record is not None:
+                        summary[field] = _history_int(current_record.get(ACTUAL_VALUE_COLUMNS[field]))
+                    elif latest_override.get(field) is not None:
+                        summary[field] = _history_int(latest_override[field])
             requested = {field: 0 if is_hidden else _history_int(summary.get(field)) for field in ACTUAL_FIELDS}
             other_reserved = {field: 0 for field in ACTUAL_FIELDS}
             for other_booking, record in context["records"].items():
@@ -4290,6 +4304,11 @@ def persist_booking_branch_actuals(summaries: list, emp_id: str, reason: str = "
                             "allocated_before": other_reserved[field],
                             "allocated_after": other_reserved[field] + requested[field],
                         }
+            # Keep the sheet override/report payload aligned with the final
+            # merged Booking actual, including values retained from another device.
+            for field in ACTUAL_FIELDS:
+                summary[field] = requested[field]
+            summary["total"] = sum(requested[field] for field in REPORT_BOX_FIELDS)
             event = {
                 "Event_ID": str(uuid.uuid4()), "Wave_Number": wave, "Branch_Code": branch,
                 "Source_Booking": source, "Booking_No": booking,
@@ -4462,6 +4481,13 @@ def persist_target_booking_split_edits(summaries: list, emp_id: str, reason: str
             # a target allocation row may be edited directly here.
             continue
         source = str(current.get("Source_Booking") or "").strip().upper()
+        edited_fields = item.get("edited_fields")
+        if edited_fields is not None:
+            edited_fields = set(edited_fields)
+            for field, column in split_value_columns.items():
+                if field not in edited_fields:
+                    item[field] = _history_int(current.get(column))
+            item["total"] = sum(_history_int(item.get(field)) for field in REPORT_BOX_FIELDS)
         if not item.get("is_hidden"):
             warning_fields = item.get("edited_fields")
             if warning_fields is None:

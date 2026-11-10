@@ -38,6 +38,7 @@
 
 ## Release notes
 
+- **Frontend 1.9.29-free / API 1.9.30-free (2026-11-10):** when a device edits only selected quantity fields, preserve all untouched fields from the latest Booking actual or split record so a stale device cannot overwrite newer values.
 - **Frontend 1.9.29-free / API 1.9.29-free (2026-11-10):** shorten the successful count-variance alert to a one-line summary and report only fields the operator actually edited, avoiding long lists of untouched fields such as pallet count.
 - **Frontend 1.9.28-free / API 1.9.28-free (2026-11-10):** save manually counted Booking totals even when a box type is over or under the system's remaining allocation. Return a per-branch/Wave warning with the entered amount, expected remaining amount, and variance; show the warning after saving without blocking the operator-entered actual.
 - **Frontend 1.9.27-free / API 1.9.26-free (2026-11-10):** persist committed quantity edits on Enter/change and print from the latest editor values; keep in-progress branch edits and hide/restore choices during shared-state refreshes.
