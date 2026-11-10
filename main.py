@@ -53,7 +53,7 @@ if not os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
 # Google Sheets is the only data source. Credentials are loaded lazily by
 # get_sheets_session(), so a cold start never waits on an auth round-trip.
 APP_ENV = os.environ.get("APP_ENV", "uat").strip().lower()
-APP_VERSION = os.environ.get("APP_VERSION", "1.9.26-free").strip()
+APP_VERSION = os.environ.get("APP_VERSION", "1.9.28-free").strip()
 EMPLOYEE_LOOKUP_URL = "https://script.google.com/macros/s/AKfycbybmW6N7TxfsHqEa-Fx6ayy8M8xfjKGmTYO27izmbEoLJmQRrFD3i9c0XogP0fG6tlG/exec"
 
 # รายชื่อพนักงานสำหรับช่อง "เจ้าหน้าที่" บนใบคุมส่งสินค้า
@@ -4214,7 +4214,7 @@ def _actual_pair_context(wave: str, branch: str, target_booking: str = "",
 
 def persist_booking_branch_actuals(summaries: list, emp_id: str, reason: str = "",
                                   allow_overage: bool = False) -> list:
-    """Append actual Booking allocations, optionally recording excess with a warning."""
+    """Append actual Booking allocations, optionally recording count differences as warnings."""
     if not summaries:
         return []
     with booking_actual_write_lock:
@@ -4274,6 +4274,17 @@ def persist_booking_branch_actuals(summaries: list, emp_id: str, reason: str = "
                             "allocated_before": other_reserved[field],
                             "allocated_after": other_reserved[field] + requested[field],
                             "excess": excess,
+                        }
+                    if not is_hidden and requested[field] != remaining:
+                        difference = requested[field] - remaining
+                        summary.setdefault("_actual_warnings", {})[field] = {
+                            "entered": requested[field],
+                            "expected": remaining,
+                            "difference": abs(difference),
+                            "direction": "over" if difference > 0 else "short",
+                            "inspected": context["baseline"][field],
+                            "allocated_before": other_reserved[field],
+                            "allocated_after": other_reserved[field] + requested[field],
                         }
             event = {
                 "Event_ID": str(uuid.uuid4()), "Wave_Number": wave, "Branch_Code": branch,
@@ -4433,6 +4444,8 @@ def persist_target_booking_split_edits(summaries: list, emp_id: str, reason: str
     splits = get_booking_branch_splits(force_refresh=True)
     rows = []
     affected_sources = []
+    split_value_columns = {"m": "M_Count", "red": "Red_Count", "blue": "Blue_Count",
+                           "green": "Green_Count", "black": "Black_Count", "pallet": "Pallet_Count"}
     now_iso = _uat_now_iso()
     for item in summaries or []:
         if not item.get("booking_split"):
@@ -4445,6 +4458,22 @@ def persist_target_booking_split_edits(summaries: list, emp_id: str, reason: str
             # a target allocation row may be edited directly here.
             continue
         source = str(current.get("Source_Booking") or "").strip().upper()
+        if not item.get("is_hidden"):
+            for field, column in split_value_columns.items():
+                expected = _history_int(current.get(column))
+                entered = _history_int(item.get(field))
+                if entered == expected:
+                    continue
+                difference = entered - expected
+                item.setdefault("_actual_warnings", {})[field] = {
+                    "entered": entered,
+                    "expected": expected,
+                    "difference": abs(difference),
+                    "direction": "over" if difference > 0 else "short",
+                    "inspected": expected,
+                    "allocated_before": 0,
+                    "allocated_after": entered,
+                }
         rows.append({
             "Event_ID": str(uuid.uuid4()), "Wave_Number": key[0], "Branch_Code": key[1],
             "Source_Booking": source, "Target_Booking": key[2],
@@ -5375,6 +5404,7 @@ def save_document_summary(data: DocumentSummaryBatchData, background_tasks: Back
     affected_split_sources = []
     booking_actual_pairs = []
     legacy_split_items = []
+    count_warnings = []
     if data.persist_overrides:
         # The frontend sends dirty branches only. Persist zero so old totals cannot return later.
         persistent_items = normalized
@@ -5384,8 +5414,17 @@ def save_document_summary(data: DocumentSummaryBatchData, background_tasks: Back
             actual_items = [item for item in persistent_items if not item.get("booking_split")]
             legacy_split_items = [item for item in persistent_items if item.get("booking_split")]
             booking_actual_pairs = persist_booking_branch_actuals(
-                actual_items, emp_id, data.reason or "MANUAL_TOTAL_SAVE"
+                actual_items, emp_id, data.reason or "MANUAL_TOTAL_SAVE", allow_overage=True
             )
+            count_warnings.extend([
+                {
+                    "wave": item["wave"],
+                    "booking": item["booking"],
+                    "branch": item["branch"],
+                    "fields": copy.deepcopy(item.get("_actual_warnings") or {}),
+                }
+                for item in actual_items if item.get("_actual_warnings")
+            ])
         # If this is the target side of a split, update the allocation record
         # itself. Otherwise refresh/print would rebuild the old split amount.
         # Normal edits/hide actions do not need to read the split-event Sheet.
@@ -5397,6 +5436,15 @@ def save_document_summary(data: DocumentSummaryBatchData, background_tasks: Back
             affected_split_sources = persist_target_booking_split_edits(
                 split_items, emp_id, data.reason or "MANUAL_TOTAL_SAVE"
             )
+        count_warnings.extend([
+            {
+                "wave": item["wave"],
+                "booking": item["booking"],
+                "branch": item["branch"],
+                "fields": copy.deepcopy(item.get("_actual_warnings") or {}),
+            }
+            for item in split_items if item.get("_actual_warnings")
+        ])
         # Apply the edit to the live web overlay first. A temporary Google auth
         # outage must never make the UI snap back to the calculated old total.
         with document_overrides_lock:
@@ -5447,6 +5495,7 @@ def save_document_summary(data: DocumentSummaryBatchData, background_tasks: Back
         "report_sync": report_sync,
         "persist_overrides": bool(data.persist_overrides),
         "booking_actuals": bool(data.booking_actuals and booking_actual_pairs),
+        "warnings": count_warnings,
         "sheet_warning": sheet_warning if data.persist_overrides else None,
     }
 

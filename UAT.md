@@ -38,6 +38,8 @@
 
 ## Release notes
 
+- **Frontend 1.9.28-free / API 1.9.28-free (2026-11-10):** save manually counted Booking totals even when a box type is over or under the system's remaining allocation. Return a per-branch/Wave warning with the entered amount, expected remaining amount, and variance; show the warning after saving without blocking the operator-entered actual.
+- **Frontend 1.9.27-free / API 1.9.26-free (2026-11-10):** persist committed quantity edits on Enter/change and print from the latest editor values; keep in-progress branch edits and hide/restore choices during shared-state refreshes.
 - **Frontend 1.9.26-free / API 1.9.26-free (2026-11-10):** preserve in-progress branch quantity edits across shared-state refreshes, commit numeric fields explicitly on Enter/change, and keep the operator's latest hide/restore choice until it is acknowledged by the server so printed totals and hidden branches match the edited document.
 - **Frontend 1.9.25-free / API 1.9.25-free (2026-11-06):** link a no-vehicle parent Booking to its `/1`, `/2` truck Bookings from `Booking & Wave`; let operators allocate each branch's quantities to a child Booking in Pro Scanner and persist per-vehicle allocations in `Booking Branch Splits`. Child Bookings show only their saved allocations, parent totals show the unassigned remainder, and child Bookings cannot bypass allocation through whole-branch moves or Booking actuals.
 - **Frontend 1.9.24-free / API 1.9.24-free (2026-11-06):** return available Wave/Booking data when monitored branches are missing, identify the missing branch codes, and let operators continue to print after acknowledging the warning. True lookup/network failures still block document opening.
