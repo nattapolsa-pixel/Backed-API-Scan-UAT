@@ -53,7 +53,7 @@ if not os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
 # Google Sheets is the only data source. Credentials are loaded lazily by
 # get_sheets_session(), so a cold start never waits on an auth round-trip.
 APP_ENV = os.environ.get("APP_ENV", "uat").strip().lower()
-APP_VERSION = os.environ.get("APP_VERSION", "1.9.28-free").strip()
+APP_VERSION = os.environ.get("APP_VERSION", "1.9.29-free").strip()
 EMPLOYEE_LOOKUP_URL = "https://script.google.com/macros/s/AKfycbybmW6N7TxfsHqEa-Fx6ayy8M8xfjKGmTYO27izmbEoLJmQRrFD3i9c0XogP0fG6tlG/exec"
 
 # รายชื่อพนักงานสำหรับช่อง "เจ้าหน้าที่" บนใบคุมส่งสินค้า
@@ -4001,6 +4001,7 @@ class DocumentSummaryData(BaseModel):
     is_hidden: Optional[bool] = False
     is_closed: Optional[bool] = False
     booking_split: Optional[bool] = False
+    edited_fields: Optional[List[str]] = None
 
 class DocumentSummaryBatchData(BaseModel):
     summaries: List[DocumentSummaryData]
@@ -4275,7 +4276,10 @@ def persist_booking_branch_actuals(summaries: list, emp_id: str, reason: str = "
                             "allocated_after": other_reserved[field] + requested[field],
                             "excess": excess,
                         }
-                    if not is_hidden and requested[field] != remaining:
+                    warning_fields = summary.get("edited_fields")
+                    if warning_fields is None:
+                        warning_fields = ACTUAL_FIELDS
+                    if not is_hidden and field in warning_fields and requested[field] != remaining:
                         difference = requested[field] - remaining
                         summary.setdefault("_actual_warnings", {})[field] = {
                             "entered": requested[field],
@@ -4459,7 +4463,12 @@ def persist_target_booking_split_edits(summaries: list, emp_id: str, reason: str
             continue
         source = str(current.get("Source_Booking") or "").strip().upper()
         if not item.get("is_hidden"):
+            warning_fields = item.get("edited_fields")
+            if warning_fields is None:
+                warning_fields = ACTUAL_FIELDS
             for field, column in split_value_columns.items():
+                if field not in warning_fields:
+                    continue
                 expected = _history_int(current.get(column))
                 entered = _history_int(item.get(field))
                 if entered == expected:
@@ -5398,6 +5407,10 @@ def save_document_summary(data: DocumentSummaryBatchData, background_tasks: Back
             "is_hidden": is_hidden,
             "is_closed": bool(getattr(item, "is_closed", False)),
             "booking_split": bool(getattr(item, "booking_split", False)),
+            "edited_fields": (
+                None if getattr(item, "edited_fields", None) is None
+                else [field for field in item.edited_fields if field in ACTUAL_FIELDS]
+            ),
             **values
         })
 

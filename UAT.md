@@ -38,6 +38,7 @@
 
 ## Release notes
 
+- **Frontend 1.9.29-free / API 1.9.29-free (2026-11-10):** shorten the successful count-variance alert to a one-line summary and report only fields the operator actually edited, avoiding long lists of untouched fields such as pallet count.
 - **Frontend 1.9.28-free / API 1.9.28-free (2026-11-10):** save manually counted Booking totals even when a box type is over or under the system's remaining allocation. Return a per-branch/Wave warning with the entered amount, expected remaining amount, and variance; show the warning after saving without blocking the operator-entered actual.
 - **Frontend 1.9.27-free / API 1.9.26-free (2026-11-10):** persist committed quantity edits on Enter/change and print from the latest editor values; keep in-progress branch edits and hide/restore choices during shared-state refreshes.
 - **Frontend 1.9.26-free / API 1.9.26-free (2026-11-10):** preserve in-progress branch quantity edits across shared-state refreshes, commit numeric fields explicitly on Enter/change, and keep the operator's latest hide/restore choice until it is acknowledged by the server so printed totals and hidden branches match the edited document.
