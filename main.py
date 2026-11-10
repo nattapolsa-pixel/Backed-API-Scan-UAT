@@ -53,7 +53,7 @@ if not os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
 # Google Sheets is the only data source. Credentials are loaded lazily by
 # get_sheets_session(), so a cold start never waits on an auth round-trip.
 APP_ENV = os.environ.get("APP_ENV", "uat").strip().lower()
-APP_VERSION = os.environ.get("APP_VERSION", "1.9.24-free").strip()
+APP_VERSION = os.environ.get("APP_VERSION", "1.9.26-free").strip()
 EMPLOYEE_LOOKUP_URL = "https://script.google.com/macros/s/AKfycbybmW6N7TxfsHqEa-Fx6ayy8M8xfjKGmTYO27izmbEoLJmQRrFD3i9c0XogP0fG6tlG/exec"
 
 # รายชื่อพนักงานสำหรับช่อง "เจ้าหน้าที่" บนใบคุมส่งสินค้า
@@ -763,6 +763,74 @@ def normalize_booking_key(value: str) -> str:
     """Canonical comparison key for Booking values copied from Sheets."""
     return re.sub(r"[^A-Z0-9]", "", str(value or "").upper())
 
+
+def _booking_has_assigned_vehicle(meta: dict) -> bool:
+    """Whether Booking & Wave has a usable plate for this Booking."""
+    plate = re.sub(r"\s+", "", str((meta or {}).get("plate") or "")).upper()
+    return plate not in {"", ".", "-", "0", "N/A", "NA", "NONE", "NULL", "TBD",
+                         "NO VEHICLE", "NO TRUCK", "ไม่มีรถ", "ไม่ระบุ"}
+
+
+def _booking_split_child_summary(entry: dict) -> dict:
+    return {
+        "booking": str(entry.get("booking") or "").strip().upper(),
+        "sequence": max(0, _history_int(entry.get("split_sequence"))),
+        "waves": list(entry.get("waves") or []),
+        "vehicle_type": str(entry.get("vehicle_type") or ""),
+        "carrier": str(entry.get("carrier") or ""),
+        "sender": str(entry.get("sender") or ""),
+        "plate": str(entry.get("plate") or ""),
+    }
+
+
+def _derive_booking_split_families(booking_map: dict) -> None:
+    """Link a no-vehicle parent to `/1`, `/2` child Booking rows by Wave set.
+
+    Booking & Wave remains the source of truth for parent/child IDs and vehicle
+    metadata. Per-branch quantities are persisted separately in the existing
+    Booking Branch Splits event ledger.
+    """
+    entries = {str(entry.get("booking") or "").upper(): entry
+               for entry in booking_map.values() if entry.get("booking")}
+    parents_by_waves = {}
+    children_by_waves = {}
+    for entry in entries.values():
+        waves = tuple(sorted({str(wave) for wave in entry.get("waves") or []}, key=lambda value: int(value)))
+        if not waves:
+            continue
+        entry["booking_split_family"] = None
+        sequence = max(0, _history_int(entry.get("split_sequence")))
+        if sequence > 0 and _booking_has_assigned_vehicle(entry):
+            children_by_waves.setdefault(waves, []).append(entry)
+        elif sequence == 0 and not _booking_has_assigned_vehicle(entry):
+            parents_by_waves.setdefault(waves, []).append(entry)
+
+    for waves, children in children_by_waves.items():
+        parents = parents_by_waves.get(waves) or []
+        # Shared Wave sets can occur independently. Only infer lineage when one
+        # no-vehicle Booking is an unambiguous parent for this exact Wave set.
+        if len(parents) != 1:
+            continue
+        parent = parents[0]
+        children.sort(key=lambda item: (max(0, _history_int(item.get("split_sequence"))),
+                                        str(item.get("booking") or "")))
+        child_summaries = [_booking_split_child_summary(item) for item in children]
+        parent["booking_split_family"] = {
+            "role": "parent",
+            "parent_booking": str(parent.get("booking") or "").strip().upper(),
+            "sequence": 0,
+            "waves": list(waves),
+            "children": child_summaries,
+        }
+        for child in children:
+            child["booking_split_family"] = {
+                "role": "child",
+                "parent_booking": str(parent.get("booking") or "").strip().upper(),
+                "sequence": max(0, _history_int(child.get("split_sequence"))),
+                "waves": list(waves),
+                "children": child_summaries,
+            }
+
 def load_booking_wave_sheet_meta(force: bool = False) -> tuple:
     now = time.time()
     requested_at = now
@@ -780,7 +848,7 @@ def load_booking_wave_sheet_meta(force: bool = False) -> tuple:
         booking_map = {}
         wave_map = {}
         try:
-            tq = "SELECT K, L, P, Q, R WHERE K IS NOT NULL OR L IS NOT NULL"
+            tq = "SELECT K, L, O, P, Q, R WHERE K IS NOT NULL OR L IS NOT NULL"
             url = f"https://docs.google.com/spreadsheets/d/{BOOKING_WAVE_SHEET_ID}/gviz/tq?gid={BOOKING_WAVE_SHEET_GID}&tqx=out:json&tq={urllib.parse.quote(tq)}"
             text = fetch_gviz_text(url)
             m = re.search(r"google\.visualization\.Query\.setResponse\((.*)\);", text, re.DOTALL)
@@ -797,10 +865,12 @@ def load_booking_wave_sheet_meta(force: bool = False) -> tuple:
 
                     b = get_val(0)
                     w = get_val(1)
-                    carrier = get_val(2)
-                    sender = get_val(3)
-                    plate = get_val(4)
+                    vehicle_type = get_val(2)
+                    carrier = get_val(3)
+                    sender = get_val(4)
+                    plate = get_val(5)
                     waves = [str(int(x)) for x in re.findall(r"\b\d{5,}\b", w)]
+                    split_match = re.search(r"/\s*(\d+)\s*$", w)
                     clean_b = re.sub(r"\s+", "", b.upper())
                     compact_b = clean_b.replace("-", "")
                     canonical_b = normalize_booking_key(clean_b)
@@ -808,6 +878,8 @@ def load_booking_wave_sheet_meta(force: bool = False) -> tuple:
                     entry = {
                         "booking": clean_b,
                         "waves": waves,
+                        "split_sequence": int(split_match.group(1)) if split_match else 0,
+                        "vehicle_type": vehicle_type,
                         "carrier": carrier,
                         "sender": sender,
                         "plate": plate,
@@ -828,6 +900,8 @@ def load_booking_wave_sheet_meta(force: bool = False) -> tuple:
                             entries = wave_map.setdefault(wave_key, [])
                             if not any(item.get("booking") == clean_b for item in entries):
                                 entries.append(entry)
+
+            _derive_booking_split_families(booking_map)
 
             with booking_wave_sheet_lock:
                 booking_wave_sheet_cache["bookings"] = booking_map
@@ -3457,8 +3531,10 @@ def fetch_booking_waves(booking_no: str) -> dict:
     return {
         "waves": list(sheet_meta.get("waves") or []),
         "license_plate": str(sheet_meta.get("plate") or ""),
+        "vehicle_type": str(sheet_meta.get("vehicle_type") or ""),
         "carrier": str(sheet_meta.get("carrier") or ""),
         "sender": str(sheet_meta.get("sender") or ""),
+        "booking_split_family": copy.deepcopy(sheet_meta.get("booking_split_family")),
     }
 
 def get_booking_waves_mapping(booking_no: str, force_refresh: bool = False) -> dict:
@@ -3517,6 +3593,7 @@ def get_booking_data_internal(booking_no: str, force_refresh: bool = False) -> d
         if re.sub(r"\D", "", str(wave or ""))
     ))
     license_plate = mapping["license_plate"]
+    split_family = mapping.get("booking_split_family") or None
     native_waves = {
         str(int(re.sub(r"\D", "", str(wave))))
         for wave in (mapping.get("waves") or [])
@@ -3562,6 +3639,12 @@ def get_booking_data_internal(booking_no: str, force_refresh: bool = False) -> d
         wave_key = str(int(str(wave_data_overlaid["wave_no"]).strip()))
         native_booking = str(wave_data_overlaid.get("booking_no") or "").strip().upper()
         is_native_wave = (wave_key in native_waves) or (bool(native_booking) and native_booking == booking_clean)
+        # A truck Booking can list the same Wave as its no-truck parent. Its
+        # Wave mapping identifies the job, while Booking Branch Splits identify
+        # the quantities assigned to this truck. Never treat a child as a
+        # second native source of the full Wave quantities.
+        if split_family and split_family.get("role") == "child":
+            is_native_wave = False
         items_by_branch = {}
         for item in wave_data_overlaid.get("lpn_list", []):
             items_by_branch.setdefault(str(item.get("branch") or "").strip().upper(), []).append(item)
@@ -3792,8 +3875,10 @@ def get_booking_data_internal(booking_no: str, force_refresh: bool = False) -> d
     return {
         "booking_no": booking_no,
         "license_plate": license_plate,
+        "vehicle_type": str(mapping.get("vehicle_type") or ""),
         "carrier": str(mapping.get("carrier") or ""),
         "sender": str(mapping.get("sender") or ""),
+        "booking_split_family": copy.deepcopy(split_family),
         "waves": list(waves_included),
         "lpn_list": lpn_list,
         "zone_summary": list(zones_calc.values()),
@@ -5799,10 +5884,14 @@ def get_wave_for_branch_move(wave_no: str) -> dict:
 
 
 @app.get("/api/wave-branch-options")
-def get_wave_branch_options(wave_no: str):
+def get_wave_branch_options(wave_no: str, target_booking: str = ""):
     wave_clean = str(int(str(wave_no).strip()))
     data = apply_local_overlay(wave_clean, get_wave_for_branch_move(wave_clean))
     assignments = get_booking_branch_assignments()
+    target_clean = re.sub(r"\s+", "", str(target_booking or "").strip().upper())
+    target_mapping = get_booking_waves_mapping(target_clean) if target_clean else {}
+    target_family = target_mapping.get("booking_split_family") or {}
+    split_records = get_booking_branch_splits() if target_family.get("role") == "child" else {}
     grouped = {}
     for item in data.get("lpn_list", []):
         branch = str(item.get("branch") or "").strip().upper()
@@ -5830,6 +5919,25 @@ def get_wave_branch_options(wave_no: str):
         row["pallet_count"] = len(row.pop("pallet_nos"))
         summary = summarize_branch_for_member_data(data, branch)
         row["totals"] = {field: int(summary.get(field) or 0) for field in ("m", "red", "blue", "green", "black", "pallet")}
+        if target_family.get("role") == "child":
+            columns = {"m": "M_Count", "red": "Red_Count", "blue": "Blue_Count",
+                       "green": "Green_Count", "black": "Black_Count", "pallet": "Pallet_Count"}
+            prior = [split for (split_wave, split_branch, split_target), split in split_records.items()
+                     if split_wave == wave_clean and split_branch == branch
+                     and _uat_event_is_active(split.get("Is_Active", True))]
+            row["source_booking"] = str(target_family.get("parent_booking") or native_booking).strip().upper()
+            row["target_split_totals"] = {
+                field: sum(_history_int(split.get(column)) for split in prior
+                           if re.sub(r"\s+", "", str(split_target or "").upper()) == target_clean)
+                for field, column in columns.items()
+            }
+            row["remaining_totals"] = {
+                field: max(0, row["totals"][field] - sum(
+                    _history_int(split.get(column)) for split in prior
+                    if re.sub(r"\s+", "", str(split_target or "").upper()) != target_clean
+                ))
+                for field, column in columns.items()
+            }
         row["is_closed"] = bool(row["closed_at"])
         options.append(row)
     options.sort(key=lambda item: item["branch_code"])
@@ -5913,6 +6021,14 @@ def add_booking_branch_actual(data: BookingBranchActualData, background_tasks: B
     wave, branch, _ = _booking_actual_key(data.wave_no, data.branch_code, target)
     if not target or not wave or not branch or branch in INVALID_BRANCH_STRINGS:
         raise HTTPException(status_code=400, detail="ข้อมูล Booking, Wave หรือสาขาไม่ถูกต้อง")
+    try:
+        target_mapping = get_booking_waves_mapping(target)
+    except HTTPException:
+        # This route intentionally supports target Bookings that have not yet
+        # appeared in Booking & Wave; preserve that source-missing workflow.
+        target_mapping = {}
+    if (target_mapping.get("booking_split_family") or {}).get("role") == "child":
+        raise HTTPException(status_code=409, detail="Booking รถลูกต้องบันทึกยอดผ่านการแบ่งสาขาจาก Booking ต้นทาง เพื่อให้ยอดของแต่ละคันไม่ซ้ำกัน")
     history = load_member_history()
     if (wave, branch) not in history:
         refresh_member_wave_now(wave)
@@ -6020,7 +6136,9 @@ def move_booking_branch(data: BookingBranchMoveData):
     if previous == target:
         raise HTTPException(status_code=409, detail=f"สาขา {branch} อยู่ใน Booking {target} แล้ว")
     # ปลายทางต้องเป็น Booking จริงที่มีอยู่ เพื่อป้องกันพิมพ์ผิดแล้วสาขาหายจากเอกสาร
-    get_booking_waves_mapping(target, force_refresh=True)
+    target_mapping = get_booking_waves_mapping(target, force_refresh=True)
+    if (target_mapping.get("booking_split_family") or {}).get("role") == "child":
+        raise HTTPException(status_code=409, detail="Booking รถลูกต้องแบ่งยอดผ่านรายการจัดสาขา เพื่อเก็บยอดของรถแต่ละคันและคงยอดคงเหลือของ Booking ต้นทาง")
     append_uat_event_rows("Booking Branch Moves", [{
         "Event_ID": str(uuid.uuid4()), "Wave_Number": wave_clean, "Branch_Code": branch,
         "Previous_Booking": previous, "Assigned_Booking": target, "Reason": reason,
@@ -6092,6 +6210,11 @@ def split_booking_branch(data: BookingBranchSplitData):
         raise HTTPException(status_code=409, detail=f"สาขา {branch} อยู่ใน Booking {target} แล้ว")
     if not source:
         raise HTTPException(status_code=409, detail=f"ไม่พบ Booking ต้นทางของสาขา {branch} ใน Wave {wave_clean}")
+    target_mapping = get_booking_waves_mapping(target, force_refresh=True)
+    target_family = target_mapping.get("booking_split_family") or {}
+    if (target_family.get("role") == "child"
+            and normalize_booking_key(source) != normalize_booking_key(target_family.get("parent_booking"))):
+        raise HTTPException(status_code=409, detail=f"Booking รถลูก {target} ผูกกับต้นทาง {target_family.get('parent_booking')} แต่สาขานี้อยู่ใน {source}")
     requested = {field: max(0, int(getattr(data, field) or 0)) for field in
                  ("m", "red", "blue", "green", "black", "pallet")}
     if sum(requested[field] for field in ("m", "red", "blue", "green", "black")) <= 0:
@@ -6113,7 +6236,6 @@ def split_booking_branch(data: BookingBranchSplitData):
             ))
             if value > remaining:
                 raise HTTPException(status_code=409, detail=f"ยอด {field} ที่แบ่ง ({value}) มากกว่ายอดคงเหลือ ({remaining})")
-        get_booking_waves_mapping(target, force_refresh=True)
         split_event = {
             "Event_ID": str(uuid.uuid4()), "Wave_Number": wave_clean, "Branch_Code": branch,
             "Source_Booking": source, "Target_Booking": target,

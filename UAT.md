@@ -30,7 +30,7 @@
 | `APP_ENV` | `uat` | แสดงบน `/api/health` |
 | `SCAN_FEATURE_ENABLED` | `false` | hold การสแกน → 423 (ต้องตรงกับ `SCAN_FEATURE_ENABLED` ใน `index.html`) |
 | `SCAN_DEMO_ONLY` | `true` | ถ้าเปิดสแกน จะแก้เฉพาะ memory ไม่เขียน Sheet |
-| `APP_VERSION` | `1.9.24-free` | เวอร์ชัน API; เวอร์ชันเว็บแยกกันและส่ง `app_version`/`api_version` คนละช่อง |
+| `APP_VERSION` | `1.9.26-free` | เวอร์ชัน API; เวอร์ชันเว็บแยกกันและส่ง `app_version`/`api_version` คนละช่อง |
 | `UAT_DATABASE_SPREADSHEET_ID` | `1RJcs…` | ที่เก็บ event log รวม Debug Events และยอดจริงแยก Booking |
 | `GOOGLE_SERVICE_ACCOUNT_JSON` | (secret) | สิทธิ์เขียน Sheets |
 
@@ -38,6 +38,8 @@
 
 ## Release notes
 
+- **Frontend 1.9.26-free / API 1.9.26-free (2026-11-10):** preserve in-progress branch quantity edits across shared-state refreshes, commit numeric fields explicitly on Enter/change, and keep the operator's latest hide/restore choice until it is acknowledged by the server so printed totals and hidden branches match the edited document.
+- **Frontend 1.9.25-free / API 1.9.25-free (2026-11-06):** link a no-vehicle parent Booking to its `/1`, `/2` truck Bookings from `Booking & Wave`; let operators allocate each branch's quantities to a child Booking in Pro Scanner and persist per-vehicle allocations in `Booking Branch Splits`. Child Bookings show only their saved allocations, parent totals show the unassigned remainder, and child Bookings cannot bypass allocation through whole-branch moves or Booking actuals.
 - **Frontend 1.9.24-free / API 1.9.24-free (2026-11-06):** return available Wave/Booking data when monitored branches are missing, identify the missing branch codes, and let operators continue to print after acknowledging the warning. True lookup/network failures still block document opening.
 - **Frontend 1.9.23-free / API 1.9.23-free (2026-11-03):** allow a Member Data Wave/branch to be added to the selected Booking when no source Booking can be resolved; record the operator-entered actual directly and preserve the Report date gate.
 - **Frontend 1.9.22-free / API 1.9.22-free (2026-11-03):** determine Wave/branch existence from Member Data, not date-qualified Wave_Monitoring rows. Preserve unambiguous source Booking metadata when Monitor dates are missing; keep Delivery Report rows gated on complete dates and show the saved Booking branch while report dates are pending.
