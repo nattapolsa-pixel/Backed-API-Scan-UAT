@@ -53,7 +53,7 @@ if not os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
 # Google Sheets is the only data source. Credentials are loaded lazily by
 # get_sheets_session(), so a cold start never waits on an auth round-trip.
 APP_ENV = os.environ.get("APP_ENV", "uat").strip().lower()
-APP_VERSION = os.environ.get("APP_VERSION", "1.9.31-free").strip()
+APP_VERSION = os.environ.get("APP_VERSION", "1.9.32-free").strip()
 EMPLOYEE_LOOKUP_URL = "https://script.google.com/macros/s/AKfycbybmW6N7TxfsHqEa-Fx6ayy8M8xfjKGmTYO27izmbEoLJmQRrFD3i9c0XogP0fG6tlG/exec"
 
 # รายชื่อพนักงานสำหรับช่อง "เจ้าหน้าที่" บนใบคุมส่งสินค้า
@@ -1218,7 +1218,15 @@ def load_tms_report_date_rows(force: bool = False) -> dict:
                         or not any(complete_status in status for complete_status in TMS_REPORT_STATUS_COMPLETE)):
                     continue
 
-                booking_meta = get_booking_waves_mapping(booking)
+                try:
+                    booking_meta = get_booking_waves_mapping(booking)
+                except HTTPException as exc:
+                    if exc.status_code == 404:
+                        # TMS can retain historical or corrected Booking rows
+                        # that no longer exist in Booking & Wave. They cannot
+                        # safely identify a report row, so skip only that row.
+                        continue
+                    raise
                 booking_waves = {
                     str(int(re.sub(r"\D", "", str(value))))
                     for value in (booking_meta.get("waves") or [])
@@ -1939,13 +1947,37 @@ def _member_history_report_summary(row: dict) -> dict:
     return normalize_report_summary(summary)
 
 
-def _build_uat_delivery_report_candidates(wave_monitoring_rows: Optional[dict] = None) -> list:
+def _build_uat_delivery_report_candidates(
+    wave_monitoring_rows: Optional[dict] = None,
+    existing_report_keys: Optional[set] = None,
+) -> list:
     """Build candidates from Wave_Monitoring plus safe recent TMS history."""
     history = load_member_history()
-    if not history:
-        return []
     if wave_monitoring_rows is None:
         wave_monitoring_rows = load_uat_report_date_sources()
+    # A cold Render worker may have no full Member Data snapshot yet, or the
+    # full export may be temporarily incomplete. Restore only missing, recent
+    # TMS pairs by reading their individual Waves instead of downloading the
+    # entire 144k-row sheet or abandoning the report repair.
+    existing_pairs = {
+        (str(key[1]), str(key[2]).strip().upper())
+        for key in (existing_report_keys or set())
+        if len(key) >= 3
+    }
+    missing_tms_pairs = {
+        pair for pair, source in wave_monitoring_rows.items()
+        if (source or {}).get("date_source") == "TMS_HISTORY"
+        and pair not in existing_pairs
+        and pair not in history
+    }
+    if missing_tms_pairs:
+        for wave in sorted({pair[0] for pair in missing_tms_pairs}):
+            for row in fetch_member_history_rows_for_wave(wave):
+                pair = (str(row.get("wave") or ""), str(row.get("branch") or "").strip().upper())
+                if pair in missing_tms_pairs:
+                    history[pair] = row
+    if not history:
+        return []
     assignments = {}
     for (move_wave, move_branch), move in get_booking_branch_assignments().items():
         wave_digits = re.sub(r"\D", "", str(move_wave or ""))
@@ -2071,7 +2103,7 @@ def reconcile_uat_delivery_report(force: bool = False) -> dict:
             reconcile_booking_actual_member_data(actual_all_pairs, actual_records)
         except Exception as exc:
             print(f"⚠️ Member Data actual-allocation repair pending: {str(exc)[:180]}")
-        candidates = _build_uat_delivery_report_candidates(wave_monitoring_rows)
+        candidates = _build_uat_delivery_report_candidates(wave_monitoring_rows, existing_keys)
         upserts = []
         deletions = []
         actual_pairs = {(key[0], key[1]) for key in actual_records if (key[0], key[1]) in wave_monitoring_rows}
