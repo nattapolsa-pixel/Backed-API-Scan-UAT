@@ -31,7 +31,7 @@
 | `APP_ENV` | `uat` | แสดงบน `/api/health` |
 | `SCAN_FEATURE_ENABLED` | `false` | hold การสแกน → 423 (ต้องตรงกับ `SCAN_FEATURE_ENABLED` ใน `index.html`) |
 | `SCAN_DEMO_ONLY` | `true` | ถ้าเปิดสแกน จะแก้เฉพาะ memory ไม่เขียน Sheet |
-| `APP_VERSION` | `1.9.32-free` | เวอร์ชัน API; เวอร์ชันเว็บแยกกันและส่ง `app_version`/`api_version` คนละช่อง |
+| `APP_VERSION` | `1.9.33-free` | เวอร์ชัน API; เวอร์ชันเว็บแยกกันและส่ง `app_version`/`api_version` คนละช่อง |
 | `UAT_DATABASE_SPREADSHEET_ID` | `1RJcs…` | ที่เก็บ event log รวม Debug Events และยอดจริงแยก Booking |
 | `GOOGLE_SERVICE_ACCOUNT_JSON` | (secret) | สิทธิ์เขียน Sheets |
 
@@ -39,6 +39,7 @@
 
 ## Release notes
 
+- **Frontend 1.9.30-free / API 1.9.33-free (2026-11-12):** detect truck-child Bookings in `Booking & Wave` while the parent still has unallocated branch quantities in Pro Scanner. Show a short warning before printing, with an explicit option to continue; never block printing.
 - **API 1.9.32-free (2026-11-12):** skip TMS rows whose Booking no longer exists in `Booking & Wave`, and read an individual Wave from Member Data when the full cold-start export is incomplete, so one unrelated row or a cold cache does not stop recent report recovery.
 - **API 1.9.31-free (2026-11-12):** restore missing completed Delivery Report rows for recent Waves after they roll out of `Wave_Monitoring`, using the branch's structured TMS load date and completed status. Prefer fresh Monitoring dates, keep existing historical row dates unchanged, and skip ambiguous multi-Wave matches.
 - **Frontend 1.9.29-free / API 1.9.30-free (2026-11-10):** when a device edits only selected quantity fields, preserve all untouched fields from the latest Booking actual or split record so a stale device cannot overwrite newer values.

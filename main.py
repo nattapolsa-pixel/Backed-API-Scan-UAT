@@ -53,7 +53,7 @@ if not os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
 # Google Sheets is the only data source. Credentials are loaded lazily by
 # get_sheets_session(), so a cold start never waits on an auth round-trip.
 APP_ENV = os.environ.get("APP_ENV", "uat").strip().lower()
-APP_VERSION = os.environ.get("APP_VERSION", "1.9.32-free").strip()
+APP_VERSION = os.environ.get("APP_VERSION", "1.9.33-free").strip()
 EMPLOYEE_LOOKUP_URL = "https://script.google.com/macros/s/AKfycbybmW6N7TxfsHqEa-Fx6ayy8M8xfjKGmTYO27izmbEoLJmQRrFD3i9c0XogP0fG6tlG/exec"
 
 # รายชื่อพนักงานสำหรับช่อง "เจ้าหน้าที่" บนใบคุมส่งสินค้า
@@ -4301,6 +4301,71 @@ def get_booking_branch_splits(force_refresh: bool = False) -> dict:
             return {key: dict(row) for key, row in booking_splits_cache["data"].items()}
 
 
+def booking_split_reconciliation_warnings(booking_data: dict, parent_data: Optional[dict] = None) -> list:
+    """Warn when TMS has truck child Bookings but the parent still has unallocated branches."""
+    family = (booking_data or {}).get("booking_split_family") or {}
+    children = [item for item in family.get("children") or [] if str(item.get("booking") or "").strip()]
+    if not children:
+        return []
+
+    parent_booking = str(family.get("parent_booking") or "").strip().upper()
+    if not parent_booking:
+        if family.get("role") != "parent":
+            return []
+        parent_booking = str((booking_data or {}).get("booking_no") or "").strip().upper()
+    if not parent_booking:
+        return []
+
+    try:
+        # The parent view carries the remaining quantities after durable child splits.
+        # Reading it also makes this check work when the user opened a child Booking.
+        if parent_data is None:
+            parent_data = get_booking_data_internal(parent_booking)
+    except Exception as exc:
+        # This is only a print warning. A temporary split-check read must not block printing.
+        print(f"⚠️ Booking split print warning unavailable for {parent_booking}: {str(exc)[:160]}")
+        return []
+
+    grouped = {}
+    document_overrides = parent_data.get("document_overrides") or {}
+    for item in parent_data.get("lpn_list") or []:
+        wave_digits = re.sub(r"\D", "", str(item.get("wave_no") or ""))
+        branch = str(item.get("branch") or "").strip().upper()
+        if not wave_digits or not branch:
+            continue
+        wave = str(int(wave_digits))
+        grouped.setdefault((wave, branch), []).append(item)
+
+    pending = []
+    for (wave, branch), items in sorted(grouped.items()):
+        override = (get_document_overrides_for_wave(wave, parent_booking).get(branch)
+                    or document_overrides.get(branch) or {})
+        remaining_summary = next((item.get("booking_split_summary") for item in items
+                                  if isinstance(item.get("booking_split_summary"), dict)), None)
+        if remaining_summary is None:
+            remaining_summary = next((item.get("booking_actual_summary") for item in items
+                                      if isinstance(item.get("booking_actual_summary"), dict)), None)
+        if override.get("is_hidden") or (remaining_summary and remaining_summary.get("is_hidden")):
+            continue
+        # No saved split/actual snapshot means the full branch is still only
+        # attached to the no-vehicle parent, even if the branch is not scanned yet.
+        remaining = sum(max(0, _history_int(remaining_summary.get(field)))
+                        for field in ("m", "red", "blue", "green", "black", "pallet")) if remaining_summary else 1
+        if remaining > 0:
+            pending.append({"wave": wave, "branch": branch})
+
+    if not pending:
+        return []
+    child_bookings = sorted({str(item.get("booking") or "").strip().upper() for item in children})
+    return [{
+        "code": "TMS_CHILD_BOOKING_UNALLOCATED",
+        "parent_booking": parent_booking,
+        "child_bookings": child_bookings,
+        "missing_branch_count": len(pending),
+        "missing_branches": pending,
+    }]
+
+
 ACTUAL_FIELDS = ("m", "red", "blue", "green", "black", "pallet")
 ACTUAL_BASELINE_COLUMNS = {
     "m": "Baseline_M", "red": "Baseline_Red", "blue": "Baseline_Blue",
@@ -5973,6 +6038,22 @@ def check_wave(wave_no: str, force: bool = False):
     try:
         request_uat_report_reconcile()
         result = load_complete_wave(wave_no, force_refresh=force)
+        result["booking_split_warnings"] = []
+        wave_booking = str(result.get("booking_no") or "").strip().upper()
+        if wave_booking:
+            try:
+                wave_meta = get_booking_waves_mapping(
+                    wave_booking,
+                    force_refresh=(force or not _booking_has_assigned_vehicle({"plate": result.get("license_plate")})),
+                )
+                family = wave_meta.get("booking_split_family")
+                if family:
+                    result["booking_split_warnings"] = booking_split_reconciliation_warnings({
+                        "booking_no": wave_booking,
+                        "booking_split_family": family,
+                    })
+            except Exception as exc:
+                print(f"⚠️ Wave split print warning unavailable for {wave_booking}: {str(exc)[:160]}")
         # 1 Wave อยู่ได้หลาย Booking: ส่งตัวเลือกกลับไปให้หน้าเว็บถาม ไม่เดาให้
         result["booking_options"] = [
             str(item.get("booking") or "").strip().upper()
@@ -6061,10 +6142,25 @@ def check_booking(booking_no: str, force: bool = False):
                 # Do not force-reload the full Member Data sheet to fix one gap.
                 if attempt and last_error and last_error.status_code == 404:
                     get_booking_waves_mapping(booking_no, force_refresh=True)
-                return load_complete_booking(
+                booking_data = load_complete_booking(
                     booking_no,
                     force_refresh=(force and attempt == 0),
                 )
+                if (not booking_data.get("booking_split_family")
+                        and not _booking_has_assigned_vehicle({"plate": booking_data.get("license_plate")})):
+                    refreshed_mapping = get_booking_waves_mapping(booking_no, force_refresh=True)
+                    if refreshed_mapping.get("booking_split_family"):
+                        booking_data["booking_split_family"] = refreshed_mapping["booking_split_family"]
+                parent_view = booking_data if (
+                    (booking_data.get("booking_split_family") or {}).get("role") == "parent"
+                    and normalize_booking_key(booking_data.get("booking_no")) == normalize_booking_key(
+                        (booking_data.get("booking_split_family") or {}).get("parent_booking")
+                    )
+                ) else None
+                booking_data["booking_split_warnings"] = booking_split_reconciliation_warnings(
+                    booking_data, parent_data=parent_view
+                )
+                return booking_data
             except HTTPException as exc:
                 last_error = exc
                 incomplete = exc.status_code == 503 and "ยังมาไม่ครบ" in str(exc.detail)
