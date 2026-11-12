@@ -53,7 +53,7 @@ if not os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
 # Google Sheets is the only data source. Credentials are loaded lazily by
 # get_sheets_session(), so a cold start never waits on an auth round-trip.
 APP_ENV = os.environ.get("APP_ENV", "uat").strip().lower()
-APP_VERSION = os.environ.get("APP_VERSION", "1.9.30-free").strip()
+APP_VERSION = os.environ.get("APP_VERSION", "1.9.31-free").strip()
 EMPLOYEE_LOOKUP_URL = "https://script.google.com/macros/s/AKfycbybmW6N7TxfsHqEa-Fx6ayy8M8xfjKGmTYO27izmbEoLJmQRrFD3i9c0XogP0fG6tlG/exec"
 
 # รายชื่อพนักงานสำหรับช่อง "เจ้าหน้าที่" บนใบคุมส่งสินค้า
@@ -754,10 +754,17 @@ def load_branch_report_map(force: bool = False) -> dict:
 
 BOOKING_WAVE_SHEET_ID = "1jOnJnnwlWZ491FEAFXAMgc7BftssHZcZp8x17LOQj6k"
 BOOKING_WAVE_SHEET_GID = "499980322"
+TMS_REPORT_SHEET_GID = "1498467065"
+TMS_REPORT_FALLBACK_DAYS = 14
+TMS_REPORT_DATE_CACHE_TTL_SECONDS = 5 * 60
+TMS_REPORT_STATUS_COMPLETE = ("ส่งเสร็จแล้ว", "ส่งสำเร็จ")
 booking_wave_sheet_cache = {"expires_at": 0.0, "bookings": {}, "waves": {}}
 booking_wave_sheet_lock = Lock()
 booking_wave_sheet_refresh_lock = Lock()
 BOOKING_WAVE_SHEET_CACHE_TTL_SECONDS = 10 * 60
+tms_report_date_cache = {"expires_at": 0.0, "data": {}}
+tms_report_date_cache_lock = Lock()
+tms_report_date_refresh_lock = Lock()
 
 def normalize_booking_key(value: str) -> str:
     """Canonical comparison key for Booking values copied from Sheets."""
@@ -1145,6 +1152,137 @@ def load_fresh_wave_monitoring_report_rows() -> dict:
             return copy.deepcopy(wave_monitoring_pick_date_cache.get("report_rows") or {})
 
 
+def load_tms_report_date_rows(force: bool = False) -> dict:
+    """Load recent completed Booking+Wave+branch dates for historical report recovery.
+
+    Wave_Monitoring remains authoritative while a Wave is active. Its rolling
+    window eventually drops completed Waves, so TMS's structured load date is
+    the bounded fallback for restoring a missing UAT report row during the
+    following two weeks. Multi-Wave bookings require an explicit Wave in the
+    branch's TMS note; ambiguous rows are deliberately skipped.
+    """
+    now = time.time()
+    with tms_report_date_cache_lock:
+        if not force and tms_report_date_cache["expires_at"] > now:
+            return copy.deepcopy(tms_report_date_cache["data"])
+
+    with tms_report_date_refresh_lock:
+        now = time.time()
+        with tms_report_date_cache_lock:
+            if not force and tms_report_date_cache["expires_at"] > now:
+                return copy.deepcopy(tms_report_date_cache["data"])
+
+        data = {}
+        ambiguous_pairs = set()
+        try:
+            url = (
+                f"https://docs.google.com/spreadsheets/d/{BOOKING_WAVE_SHEET_ID}"
+                f"/export?format=csv&gid={TMS_REPORT_SHEET_GID}"
+            )
+            reader = csv.reader(stream_gviz_lines(url, timeout=MEMBER_HISTORY_HTTP_TIMEOUT))
+            headers = [re.sub(r"\s+", " ", str(value or "").replace("↑", "").replace("↓", "")).strip().lower()
+                       for value in next(reader, [])]
+
+            def column_index(*names):
+                for name in names:
+                    normalized = re.sub(r"\s+", " ", name).strip().lower()
+                    if normalized in headers:
+                        return headers.index(normalized)
+                return None
+
+            booking_index = column_index("booking no")
+            branch_index = column_index("รหัสสาขา")
+            status_index = column_index("สถานนะแต่ละสถานที่", "สถานะแต่ละสถานที่")
+            pick_date_index = column_index("วันที่โหลด")
+            note_index = column_index("ประตู")
+            indexes = (booking_index, branch_index, status_index, pick_date_index, note_index)
+            if any(index is None for index in indexes):
+                raise RuntimeError("TMS report date columns are missing")
+
+            today = datetime.datetime.now(
+                datetime.timezone(datetime.timedelta(hours=7))
+            ).date()
+            earliest_date = today - datetime.timedelta(days=TMS_REPORT_FALLBACK_DAYS)
+            latest_date = today + datetime.timedelta(days=1)
+
+            for raw_row in reader:
+                required_width = max(indexes) + 1
+                row = list(raw_row) + [""] * max(0, required_width - len(raw_row))
+                booking = re.sub(r"\s+", "", str(row[booking_index] or "").strip().upper())
+                branch = str(row[branch_index] or "").strip().upper()
+                status = str(row[status_index] or "").strip()
+                note = str(row[note_index] or "")
+                pick_date = _parse_pick_date(row[pick_date_index])
+                if (not booking or not branch or not pick_date
+                        or pick_date < earliest_date or pick_date > latest_date
+                        or not any(complete_status in status for complete_status in TMS_REPORT_STATUS_COMPLETE)):
+                    continue
+
+                booking_meta = get_booking_waves_mapping(booking)
+                booking_waves = {
+                    str(int(re.sub(r"\D", "", str(value))))
+                    for value in (booking_meta.get("waves") or [])
+                    if re.sub(r"\D", "", str(value or ""))
+                }
+                if not booking_waves:
+                    continue
+                explicit_waves = {
+                    str(int(match)) for match in re.findall(r"(?i)wave\s*[:#-]?\s*(\d{5,})", note)
+                }
+                if explicit_waves:
+                    matched_waves = booking_waves & explicit_waves
+                    if len(matched_waves) != 1:
+                        continue
+                    wave = next(iter(matched_waves))
+                elif len(booking_waves) == 1:
+                    wave = next(iter(booking_waves))
+                else:
+                    continue
+
+                family = booking_meta.get("booking_split_family") or {}
+                report_booking = str(
+                    family.get("parent_booking") if family.get("role") == "child" else booking
+                ).strip().upper()
+                pair = (wave, branch)
+                candidate = {
+                    "booking": report_booking,
+                    "pick_date": pick_date,
+                    "date_source": "TMS_HISTORY",
+                }
+                previous = data.get(pair)
+                if previous and (
+                    previous.get("booking") != candidate["booking"]
+                    or previous.get("pick_date") != candidate["pick_date"]
+                ):
+                    data.pop(pair, None)
+                    ambiguous_pairs.add(pair)
+                    continue
+                if pair not in ambiguous_pairs:
+                    data[pair] = candidate
+        except Exception as exc:
+            print(f"⚠️ TMS historical report dates unavailable: {exc}")
+            with tms_report_date_cache_lock:
+                if tms_report_date_cache["data"]:
+                    tms_report_date_cache["expires_at"] = time.time() + 30
+                    return copy.deepcopy(tms_report_date_cache["data"])
+
+        with tms_report_date_cache_lock:
+            tms_report_date_cache.update({
+                "data": data,
+                "expires_at": time.time() + TMS_REPORT_DATE_CACHE_TTL_SECONDS,
+            })
+            return copy.deepcopy(data)
+
+
+def load_uat_report_date_sources() -> dict:
+    """Prefer fresh Wave_Monitoring dates, then add unambiguous recent TMS history."""
+    current_rows = load_fresh_wave_monitoring_report_rows()
+    date_sources = copy.deepcopy(current_rows)
+    for pair, row in load_tms_report_date_rows().items():
+        date_sources.setdefault(pair, row)
+    return date_sources
+
+
 def get_wave_monitoring_booking(wave_no: str, branch_code: str) -> str:
     """Return the Booking attached to a Wave+Branch in Wave_Monitoring."""
     waves = _wave_tokens(wave_no)
@@ -1365,12 +1503,16 @@ def write_uat_report_test_summaries(
     branch_map = load_branch_report_map()
     if wave_monitoring_rows is None:
         try:
-            wave_monitoring_rows = load_fresh_wave_monitoring_report_rows()
+            wave_monitoring_rows = load_uat_report_date_sources()
         except Exception as exc:
             # Existing complete rows can still receive quantity edits, but a
             # new row never relies on a stale Wave_Monitoring date snapshot.
             wave_monitoring_rows = {}
             print(f"⚠️ UAT report inserts paused: current Wave_Monitoring unavailable ({exc})")
+    else:
+        wave_monitoring_rows = copy.deepcopy(wave_monitoring_rows)
+        for pair, row in load_tms_report_date_rows().items():
+            wave_monitoring_rows.setdefault(pair, row)
     with delivery_report_lock:
         now = time.time()
         sort_pending = bool(uat_report_test_row_cache.get("sort_pending"))
@@ -1459,9 +1601,12 @@ def write_uat_report_test_summaries(
                 _history_int(summary.get("black")),
                 _history_int(summary.get("total")),
             ]]
-            if target_was_existing and not monitored_pick_date:
+            if target_was_existing and (
+                    not monitored_pick_date
+                    or (monitoring_row or {}).get("date_source") == "TMS_HISTORY"):
                 # Wave_Monitoring is replaced over time. Preserve dates and
-                # descriptive fields of complete history, changing amounts only.
+                # descriptive fields when updating completed history; TMS is
+                # only the fallback date source for missing rows.
                 batch_data.append({
                     "range": f"'{UAT_REPORT_TEST_SHEET_NAME}'!O{target_row}:T{target_row}",
                     "values": box_values,
@@ -1795,12 +1940,12 @@ def _member_history_report_summary(row: dict) -> dict:
 
 
 def _build_uat_delivery_report_candidates(wave_monitoring_rows: Optional[dict] = None) -> list:
-    """Build candidates only for dated Wave+branches still in Wave_Monitoring."""
+    """Build candidates from Wave_Monitoring plus safe recent TMS history."""
     history = load_member_history()
     if not history:
         return []
     if wave_monitoring_rows is None:
-        wave_monitoring_rows = load_fresh_wave_monitoring_report_rows()
+        wave_monitoring_rows = load_uat_report_date_sources()
     assignments = {}
     for (move_wave, move_branch), move in get_booking_branch_assignments().items():
         wave_digits = re.sub(r"\D", "", str(move_wave or ""))
@@ -1919,7 +2064,7 @@ def reconcile_uat_delivery_report(force: bool = False) -> dict:
         session = get_sheets_session()
         incomplete_dates_deleted = delete_uat_report_incomplete_date_rows(session)
         existing_keys = _read_uat_report_keys(session)
-        wave_monitoring_rows = load_fresh_wave_monitoring_report_rows()
+        wave_monitoring_rows = load_uat_report_date_sources()
         actual_records = get_booking_branch_actuals(force_refresh=True)
         actual_all_pairs = list(dict.fromkeys((key[0], key[1]) for key in actual_records))
         try:

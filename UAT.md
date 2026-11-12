@@ -8,6 +8,7 @@
 - Booking, Wave, Carrier, ชื่อคนส่ง, ทะเบียนรถ: `Booking & Wave` (`1jOnJnnwlWZ491FEAFXAMgc7BftssHZcZp8x17LOQj6k`)
 - จังหวัด/ภาคของสาขา: `ข้อมูลสาขา` (`18-gD0iSI3ivMijKQi54Ds-7Gm2p-LFyovjEs1MelrKQ`)
 - Planned Pick Date + สาขาที่คาดหวัง: `Wave_Monitoring` (`1TL-tj-BrvYM7i_wNHlA0x641_VOqfT9SLpmm2NZATOo`)
+- วันที่โหลดและสถานะส่งรายสาขาสำหรับกู้รายงาน Wave เก่าภายใน 14 วัน: `TMS` ใน `Booking & Wave` (`1jOnJnnwlWZ491FEAFXAMgc7BftssHZcZp8x17LOQj6k`); ใช้เฉพาะเมื่อ Wave หลุดจาก `Wave_Monitoring` และจับคู่ Booking/Wave/สาขาได้ชัดเจน
 - ข้อมูลที่ผู้ใช้แก้/ย้าย/แบ่ง/ปิดจบ ใน UAT: `1RJcsrbWnGO7gMiq9bhBR4bA9Twh1NjqP6816dXOW9DI`
 - สำเนารายงานสำหรับ UAT: `1Am1cC8ORHgRfbyA_kfBEWQpDQZlKm1Ii8-wsx39o4xQ`
 
@@ -30,7 +31,7 @@
 | `APP_ENV` | `uat` | แสดงบน `/api/health` |
 | `SCAN_FEATURE_ENABLED` | `false` | hold การสแกน → 423 (ต้องตรงกับ `SCAN_FEATURE_ENABLED` ใน `index.html`) |
 | `SCAN_DEMO_ONLY` | `true` | ถ้าเปิดสแกน จะแก้เฉพาะ memory ไม่เขียน Sheet |
-| `APP_VERSION` | `1.9.26-free` | เวอร์ชัน API; เวอร์ชันเว็บแยกกันและส่ง `app_version`/`api_version` คนละช่อง |
+| `APP_VERSION` | `1.9.31-free` | เวอร์ชัน API; เวอร์ชันเว็บแยกกันและส่ง `app_version`/`api_version` คนละช่อง |
 | `UAT_DATABASE_SPREADSHEET_ID` | `1RJcs…` | ที่เก็บ event log รวม Debug Events และยอดจริงแยก Booking |
 | `GOOGLE_SERVICE_ACCOUNT_JSON` | (secret) | สิทธิ์เขียน Sheets |
 
@@ -38,6 +39,7 @@
 
 ## Release notes
 
+- **API 1.9.31-free (2026-11-12):** restore missing completed Delivery Report rows for recent Waves after they roll out of `Wave_Monitoring`, using the branch's structured TMS load date and completed status. Prefer fresh Monitoring dates, keep existing historical row dates unchanged, and skip ambiguous multi-Wave matches.
 - **Frontend 1.9.29-free / API 1.9.30-free (2026-11-10):** when a device edits only selected quantity fields, preserve all untouched fields from the latest Booking actual or split record so a stale device cannot overwrite newer values.
 - **Frontend 1.9.29-free / API 1.9.29-free (2026-11-10):** shorten the successful count-variance alert to a one-line summary and report only fields the operator actually edited, avoiding long lists of untouched fields such as pallet count.
 - **Frontend 1.9.28-free / API 1.9.28-free (2026-11-10):** save manually counted Booking totals even when a box type is over or under the system's remaining allocation. Return a per-branch/Wave warning with the entered amount, expected remaining amount, and variance; show the warning after saving without blocking the operator-entered actual.
