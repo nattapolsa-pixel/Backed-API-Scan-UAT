@@ -53,7 +53,7 @@ if not os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
 # Google Sheets is the only data source. Credentials are loaded lazily by
 # get_sheets_session(), so a cold start never waits on an auth round-trip.
 APP_ENV = os.environ.get("APP_ENV", "uat").strip().lower()
-APP_VERSION = os.environ.get("APP_VERSION", "1.9.33-free").strip()
+APP_VERSION = os.environ.get("APP_VERSION", "1.9.34-free").strip()
 EMPLOYEE_LOOKUP_URL = "https://script.google.com/macros/s/AKfycbybmW6N7TxfsHqEa-Fx6ayy8M8xfjKGmTYO27izmbEoLJmQRrFD3i9c0XogP0fG6tlG/exec"
 
 # รายชื่อพนักงานสำหรับช่อง "เจ้าหน้าที่" บนใบคุมส่งสินค้า
@@ -210,7 +210,7 @@ MEMBER_HISTORY_HTTP_TIMEOUT = 45
 MEMBER_HISTORY_ERROR_BACKOFF_SECONDS = 60
 # A gzipped snapshot on the container's own disk survives a worker restart, so a
 # restarted worker answers from disk instead of re-downloading 39k rows.
-MEMBER_HISTORY_SNAPSHOT_PATH = os.path.join(tempfile.gettempdir(), "pro_scanner_member_history.json.gz")
+MEMBER_HISTORY_SNAPSHOT_PATH = os.path.join(tempfile.gettempdir(), "pro_scanner_member_history_unfiltered_v2.json.gz")
 MEMBER_HISTORY_SNAPSHOT_MAX_AGE_SECONDS = 6 * 60 * 60
 MEMBER_HISTORY_SNAPSHOT_TTL_SECONDS = 30
 # Member Data มี ~44,000 แถว และ instance มี RAM แค่ 512 MB (เคย OOM มาแล้วหลายรอบ)
@@ -2632,7 +2632,7 @@ def _history_int(value) -> int:
 _NON_DIGIT_RE = re.compile(r"\D")
 
 
-def _parse_member_history_rows(line_source) -> dict:
+def _parse_member_history_rows(line_source, recent_only: bool = False) -> dict:
     """Turn Member Data CSV lines into {(wave, branch): summary}.
 
     Takes an *iterator of lines*, never one big string. Measured on the real
@@ -2661,6 +2661,8 @@ def _parse_member_history_rows(line_source) -> dict:
     rows = csv.reader(line_source)
     next(rows, None)
     seen = 0
+    cutoff = ((datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=7))).date()
+               - datetime.timedelta(days=MEMBER_HISTORY_RECENT_DAYS)).isoformat() if recent_only else "")
     for row in rows:
         # Hand the CPU back periodically. Render Free gives this container 0.1 CPU
         # as a hard quota, and a ~144,000-iteration loop burns through it fast
@@ -2678,6 +2680,10 @@ def _parse_member_history_rows(line_source) -> dict:
             time.sleep(0.005)
         if len(row) < 16:
             row = list(row) + [""] * (16 - len(row))
+        if recent_only:
+            row_day = _member_history_row_date({"date": row[0]})
+            if row_day and row_day < cutoff:
+                continue
         wave_digits = _NON_DIGIT_RE.sub("", row[2])
         branch = str(row[3] or "").strip().upper()
         if not wave_digits or not branch:
@@ -2739,7 +2745,7 @@ def member_history_branches_by_date() -> dict:
         return {day: set(keys) for day, keys in source.items()}
 
 
-def _store_member_history(history: dict, ttl_seconds: float):
+def _store_member_history(history: dict, ttl_seconds: float, read_started_at: float = None):
     """Publish a loaded history plus the per-Wave index every read needs.
 
     Without the index, every Wave lookup scanned all ~39k rows; a Booking with
@@ -2766,17 +2772,24 @@ def _store_member_history(history: dict, ttl_seconds: float):
         # behind the transfer 404s. Fresh rows still win whenever the download
         # does contain that Wave.
         previous = member_history_cache.get("by_wave") or {}
-        for wave_key in list(member_history_direct_waves):
-            if wave_key in by_wave:
-                member_history_direct_waves.discard(wave_key)
+        for wave_key, direct_at in list(member_history_direct_waves.items()):
+            if wave_key in by_wave and (read_started_at is None or direct_at < read_started_at):
+                member_history_direct_waves.pop(wave_key, None)
                 continue
             kept = previous.get(wave_key)
             if not kept:
-                member_history_direct_waves.discard(wave_key)
+                member_history_direct_waves.pop(wave_key, None)
                 continue
-            by_wave[wave_key] = kept
+            if wave_key in by_wave:
+                # A direct read that finished after this export began can
+                # contain newer values or branches than the in-flight export.
+                merged = {row["branch"]: row for row in by_wave[wave_key]}
+                merged.update({row["branch"]: row for row in kept})
+                by_wave[wave_key] = list(merged.values())
+            else:
+                by_wave[wave_key] = kept
             for row in kept:
-                history.setdefault((row["wave"], row["branch"]), row)
+                history[(row["wave"], row["branch"])] = row
                 row_day = _member_history_row_date(row)
                 if row_day and row_day >= recent_cutoff:
                     by_date_keys.setdefault(row_day, set()).add((row["wave"], row["branch"]))
@@ -2906,21 +2919,26 @@ def _refresh_member_history(requested_at=None, must_download: bool = False) -> d
                     or (requested_at is not None and member_history_cache.get("loaded_at", 0) >= requested_at)
                 ):
                     return cached
+            # The gviz endpoint inherits the sheet's active filter and can
+            # return thousands of valid-looking rows while hiding whole Waves.
+            # The CSV export reads every row independently of that filter.
             url = (
                 f"https://docs.google.com/spreadsheets/d/{MEMBER_HISTORY_SPREADSHEET_ID}"
-                f"/gviz/tq?tqx=out:csv&gid={MEMBER_HISTORY_GID}"
+                f"/export?format=csv&gid={MEMBER_HISTORY_GID}"
             )
             try:
                 started = time.time()
+                # Keep the recent working window in memory on the 512 MB
+                # service. Older Waves remain available through direct reads.
                 history = _parse_member_history_rows(
-                    stream_gviz_lines(url, timeout=MEMBER_HISTORY_HTTP_TIMEOUT)
+                    stream_gviz_lines(url, timeout=MEMBER_HISTORY_HTTP_TIMEOUT), recent_only=True
                 )
                 if len(history) < MEMBER_HISTORY_MIN_VALID_ROWS:
                     raise ValueError(
                         f"Member Data response was incomplete ({len(history)} rows; "
                         f"expected at least {MEMBER_HISTORY_MIN_VALID_ROWS}); keeping the last known-good cache"
                     )
-                _store_member_history(history, MEMBER_HISTORY_CACHE_TTL_SECONDS)
+                _store_member_history(history, MEMBER_HISTORY_CACHE_TTL_SECONDS, read_started_at=started)
                 _save_member_history_snapshot(history)
                 print(f"✅ Member Data loaded: {len(history)} branch summaries in {time.time() - started:.1f}s")
                 return history
@@ -3047,7 +3065,7 @@ MEMBER_HISTORY_READ_ERROR_TTL_SECONDS = 120
 member_history_wave_read_error = {}
 # Waves resolved one at a time are normally rows appended to the sheet after the
 # last full download started, so a completed refresh must not drop them.
-member_history_direct_waves = set()
+member_history_direct_waves = {}
 # gviz answers a rejected or throttled query with HTTP 200, Content-Type
 # text/csv and a ONE-LINE JSON error body. _parse_member_history_rows() skips
 # its first line as the header, so that body used to be swallowed whole: a live
@@ -3064,8 +3082,46 @@ MEMBER_HISTORY_DIRECT_READ_RETRY_DELAY = 0.3
 # หลังการโหลดเต็มครั้งล่าสุดจึงหายไปจากหน้าจอจนกว่าจะโหลดเต็มรอบใหม่ (นานได้ถึง
 # 10 นาที หรือ 6 ชั่วโมงถ้าฟื้นจาก snapshot) ระหว่างนั้นหน้างานเห็นยอดไม่ครบ
 # การอ่าน Wave เดียวมีค่าใช้จ่ายราว 300 ไบต์ จึงตรวจซ้ำให้เป็นระยะได้
-MEMBER_HISTORY_WAVE_REVALIDATE_SECONDS = 90
+MEMBER_HISTORY_WAVE_REVALIDATE_SECONDS = 30
 member_history_wave_checked_at = {}
+# Only the Wave column is indexed; row contents are fetched fresh on demand.
+# Sharing a short-lived index prevents several simultaneous Booking requests
+# from downloading the same column repeatedly.
+member_history_wave_row_index = {"expires_at": 0.0, "rows": {}}
+member_history_wave_row_index_lock = Lock()
+
+
+def _member_history_rows_via_sheets(wave_key: str) -> dict:
+    """Read all physical rows of a Wave, including rows hidden by sheet filters."""
+    with member_history_wave_row_index_lock:
+        if member_history_wave_row_index["expires_at"] <= time.time():
+            values = _sheet_values(get_sheets_session(), MEMBER_HISTORY_SPREADSHEET_ID, "'Member Data'!C2:C")
+            if len(values) < MEMBER_HISTORY_MIN_VALID_ROWS:
+                raise ValueError("Member Data Wave index is incomplete")
+            index = {}
+            for row_number, cells in enumerate(values, start=2):
+                digits = re.sub(r"\D", "", str(cells[0] if cells else ""))
+                if digits:
+                    index.setdefault(str(int(digits)), []).append(row_number)
+            del values
+            member_history_wave_row_index.update({"rows": index, "expires_at": time.time() + 15})
+        row_numbers = list(member_history_wave_row_index["rows"].get(wave_key) or [])
+    if not row_numbers:
+        return {}
+    base = f"https://sheets.googleapis.com/v4/spreadsheets/{MEMBER_HISTORY_SPREADSHEET_ID}/values:batchGet"
+    lines = io.StringIO(newline="")
+    writer = csv.writer(lines)
+    writer.writerow(["header"] * 16)
+    session = get_sheets_session()
+    for start in range(0, len(row_numbers), 100):
+        ranges = [("ranges", f"'Member Data'!A{row}:P{row}") for row in row_numbers[start:start + 100]]
+        response = session.get(base, params=ranges, timeout=SHEETS_HTTP_TIMEOUT)
+        response.raise_for_status()
+        for item in response.json().get("valueRanges") or []:
+            for row in item.get("values") or []:
+                writer.writerow(row)
+    lines.seek(0)
+    return _parse_member_history_rows(lines)
 
 
 def _member_history_csv_lines(url: str, timeout: int):
@@ -3117,10 +3173,8 @@ def member_history_read_error_for_wave(wave) -> str:
 def fetch_member_history_rows_for_wave(wave: str) -> list:
     """Read one Wave's rows straight from Member Data and fold them into the cache.
 
-    The WAVE column stores both zero-padded ('0000033707') and bare ('62259')
-    forms, so the query matches either. Measured cost: ~300 bytes on the wire and
-    2.7-3.7s of Google query time for the 2-5 rows a Wave actually has - against
-    4 MB / 27 MB / a dead worker for the full reload this replaces.
+    The Wave index normalizes padded and bare numbers, and the Sheets API reads
+    physical rows regardless of any filter currently active in the spreadsheet.
     """
     wave_key = str(wave).strip()
     if not wave_key.isdigit():
@@ -3131,16 +3185,8 @@ def fetch_member_history_rows_for_wave(wave: str) -> list:
     if now - missed_at < MEMBER_HISTORY_WAVE_MISS_TTL_SECONDS:
         return []
 
-    padded = f"{int(wave_key):010d}"
-    query = f"select * where C = '{wave_key}' or C = '{padded}'"
-    url = (
-        f"https://docs.google.com/spreadsheets/d/{MEMBER_HISTORY_SPREADSHEET_ID}"
-        f"/gviz/tq?tqx=out:csv&gid={MEMBER_HISTORY_GID}&tq={urllib.parse.quote(query)}"
-    )
     try:
-        found = _parse_member_history_rows(
-            _member_history_csv_lines(url, GVIZ_HTTP_TIMEOUT_SECONDS)
-        )
+        found = _member_history_rows_via_sheets(wave_key)
     except Exception as exc:
         # Never cache a miss here: the Wave may well exist and Google simply did
         # not answer. Callers report "try again" instead of "not found".
@@ -3175,7 +3221,7 @@ def fetch_member_history_rows_for_wave(wave: str) -> list:
             # download alone (see _store_member_history).
             if len(member_history_direct_waves) > 256:
                 member_history_direct_waves.clear()
-            member_history_direct_waves.add(wave_key)
+            member_history_direct_waves[wave_key] = time.time()
             # build_member_history_items() memoises per (wave, generation), so the
             # generation must move or it would keep serving the empty list it just
             # cached for this Wave.
@@ -3230,7 +3276,18 @@ def refresh_member_wave_now(wave_no) -> bool:
     with member_history_lock:
         member_history_wave_checked_at[wave_key] = time.time()
     _revalidate_member_wave(wave_key)
-    return True
+    return not bool(member_history_read_error_for_wave(wave_key))
+
+
+def refresh_member_wave_if_due(wave_no):
+    digits = re.sub(r"\D", "", str(wave_no or ""))
+    if not digits:
+        return
+    wave_key = str(int(digits))
+    with member_history_lock:
+        last_checked = float(member_history_wave_checked_at.get(wave_key) or 0)
+    if time.time() - last_checked >= MEMBER_HISTORY_WAVE_REVALIDATE_SECONDS:
+        refresh_member_wave_now(wave_key)
 
 
 def member_history_rows_for_wave(wave: str) -> list:
@@ -5984,6 +6041,8 @@ def missing_wave_branches(wave_no: str, wave_data: dict, expected: set = None) -
 
 def load_complete_wave(wave_no: str, force_refresh: bool = False) -> dict:
     """Load a Wave and report monitored branches still missing after refresh attempts."""
+    if not force_refresh:
+        refresh_member_wave_if_due(wave_no)
     expected = expected_branches_for_wave(wave_no)
     last_error = None
     missing = sorted(expected)
@@ -6037,6 +6096,9 @@ def load_complete_wave(wave_no: str, force_refresh: bool = False) -> dict:
 def check_wave(wave_no: str, force: bool = False):
     try:
         request_uat_report_reconcile()
+        if force:
+            with member_history_wave_row_index_lock:
+                member_history_wave_row_index["expires_at"] = 0.0
         result = load_complete_wave(wave_no, force_refresh=force)
         result["booking_split_warnings"] = []
         wave_booking = str(result.get("booking_no") or "").strip().upper()
@@ -6083,7 +6145,8 @@ def ensure_booking_source_complete(booking_no: str, booking_data: dict):
             visible_by_wave.setdefault(str(int(digits)), set()).add(branch)
 
     missing = []
-    for raw_wave in booking_data.get("waves") or []:
+    mapped_waves = get_booking_waves_mapping(booking_no).get("waves") or []
+    for raw_wave in dict.fromkeys(list(mapped_waves) + list(booking_data.get("waves") or [])):
         digits = re.sub(r"\D", "", str(raw_wave or ""))
         if not digits:
             continue
@@ -6114,6 +6177,12 @@ def ensure_booking_source_complete(booking_no: str, booking_data: dict):
 
 def load_complete_booking(booking_no: str, force_refresh: bool = False) -> dict:
     """Retry missing Waves once, then return available data with completeness warnings."""
+    if not force_refresh:
+        mapping = get_booking_waves_mapping(booking_no)
+        for raw_wave in mapping.get("waves") or []:
+            # The first open after the throttle window sees newly appended rows
+            # now, rather than showing a stale snapshot until the next request.
+            refresh_member_wave_if_due(raw_wave)
     booking_data = get_booking_data_internal(booking_no, force_refresh=force_refresh)
     missing = ensure_booking_source_complete(booking_no, booking_data)
     if missing:
@@ -6135,6 +6204,9 @@ def load_complete_booking(booking_no: str, force_refresh: bool = False) -> dict:
 def check_booking(booking_no: str, force: bool = False):
     try:
         request_uat_report_reconcile()
+        if force:
+            with member_history_wave_row_index_lock:
+                member_history_wave_row_index["expires_at"] = 0.0
         last_error = None
         for attempt in range(3):
             try:
