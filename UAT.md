@@ -31,7 +31,7 @@
 | `APP_ENV` | `uat` | แสดงบน `/api/health` |
 | `SCAN_FEATURE_ENABLED` | `false` | hold การสแกน → 423 (ต้องตรงกับ `SCAN_FEATURE_ENABLED` ใน `index.html`) |
 | `SCAN_DEMO_ONLY` | `true` | ถ้าเปิดสแกน จะแก้เฉพาะ memory ไม่เขียน Sheet |
-| `APP_VERSION` | `1.9.35-free` | เวอร์ชัน API; เวอร์ชันเว็บแยกกันและส่ง `app_version`/`api_version` คนละช่อง |
+| `APP_VERSION` | `1.9.36-free` | เวอร์ชัน API; เวอร์ชันเว็บแยกกันและส่ง `app_version`/`api_version` คนละช่อง |
 | `UAT_DATABASE_SPREADSHEET_ID` | `1RJcs…` | ที่เก็บ event log รวม Debug Events และยอดจริงแยก Booking |
 | `GOOGLE_SERVICE_ACCOUNT_JSON` | (secret) | สิทธิ์เขียน Sheets |
 
@@ -39,6 +39,7 @@
 
 ## Release notes
 
+- **Frontend 1.9.33-free / API 1.9.36-free (2026-11-19):** select multiple branches across Waves for a truck, start with the remaining quantities, edit each branch and save in one batch. The API checks the latest saved target and available amounts before one ledger append; reporting updates in the background. Existing legacy split records remain editable one branch at a time.
 - **Frontend 1.9.32-free / API 1.9.35-free (2026-11-19):** open truck allocation directly for empty child Bookings, fix the allocation dialog and Wave selection, and store new truck allocations in the shared actual ledger so each truck and the Delivery report retain the entered amounts. Warn and allow confirmed differences from remaining quantities.
 - **Frontend 1.9.31-free / API 1.9.34-free (2026-11-16):** read Member Data without the sheet's active filter; refresh the requested Waves directly when opening a Booking and provide a refresh button on the document. Preserve direct reads completed during a full refresh and warn for missing mapped Waves.
 - **Frontend 1.9.30-free / API 1.9.33-free (2026-11-12):** detect truck-child Bookings in `Booking & Wave` while the parent still has unallocated branch quantities in Pro Scanner. Show a short warning before printing, with an explicit option to continue; never block printing.

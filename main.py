@@ -53,7 +53,7 @@ if not os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
 # Google Sheets is the only data source. Credentials are loaded lazily by
 # get_sheets_session(), so a cold start never waits on an auth round-trip.
 APP_ENV = os.environ.get("APP_ENV", "uat").strip().lower()
-APP_VERSION = os.environ.get("APP_VERSION", "1.9.35-free").strip()
+APP_VERSION = os.environ.get("APP_VERSION", "1.9.36-free").strip()
 EMPLOYEE_LOOKUP_URL = "https://script.google.com/macros/s/AKfycbybmW6N7TxfsHqEa-Fx6ayy8M8xfjKGmTYO27izmbEoLJmQRrFD3i9c0XogP0fG6tlG/exec"
 
 # รายชื่อพนักงานสำหรับช่อง "เจ้าหน้าที่" บนใบคุมส่งสินค้า
@@ -4207,6 +4207,27 @@ class BookingBranchSplitData(BookingBranchMoveData):
     pallet: int = 0
     allow_overage: bool = False
 
+class BookingBranchSplitBatchItem(BaseModel):
+    wave_no: str
+    branch_code: str
+    m: int = 0
+    red: int = 0
+    blue: int = 0
+    green: int = 0
+    black: int = 0
+    pallet: int = 0
+    expected_target_exists: Optional[bool] = None
+    expected_target: Optional[dict[str, int]] = None
+    expected_available: Optional[dict[str, int]] = None
+
+class BookingBranchSplitBatchData(BaseModel):
+    target_booking: str
+    emp_id: str
+    reason: str = "SPLIT_BOOKING_TO_TRUCK"
+    note: Optional[str] = None
+    allow_overage: bool = False
+    branches: List[BookingBranchSplitBatchItem]
+
 class BookingBranchActualData(BaseModel):
     target_booking: str
     wave_no: str
@@ -6369,6 +6390,7 @@ def get_wave_branch_options(wave_no: str, target_booking: str = ""):
             prior = [split for (split_wave, split_branch, split_target), split in split_records.items()
                      if split_wave == wave_clean and split_branch == branch
                      and _uat_event_is_active(split.get("Is_Active", True))]
+            row["legacy_split"] = bool(prior)
             row["source_booking"] = str(target_family.get("parent_booking") or native_booking).strip().upper()
             row["target_split_totals"] = {
                 field: sum(_history_int(split.get(column)) for split in prior
@@ -6386,8 +6408,9 @@ def get_wave_branch_options(wave_no: str, target_booking: str = ""):
                 actual_booking: actual for (actual_wave, actual_branch, actual_booking), actual in actual_records.items()
                 if actual_wave == wave_clean and actual_branch == branch
             }
+            row["target_has_actual"] = target_clean in pair_actuals
             if pair_actuals and not prior:
-                source_key = re.sub(r"\s+", "", str(family_source or "").upper())
+                source_key = re.sub(r"\s+", "", str(row["source_booking"]).upper())
                 source_record = pair_actuals.get(source_key)
                 target_record = pair_actuals.get(target_clean)
                 baseline_row = next(iter(pair_actuals.values()))
@@ -6656,6 +6679,100 @@ def move_booking_branch(data: BookingBranchMoveData):
     return {"status": "success", "message": "ย้ายสาขาเรียบร้อย", "previous_booking": previous,
             "target_booking": target, "preview": preview, "target_view": target_view,
             "refresh_pending": bool(refresh_warning)}
+
+@app.post("/api/split-booking-branches")
+def split_booking_branches(data: BookingBranchSplitBatchData, background_tasks: BackgroundTasks):
+    """Save several truck allocations in one durable actual-ledger append."""
+    target = re.sub(r"\s+", "", str(data.target_booking or "").upper())
+    emp_id = str(data.emp_id or "").strip()
+    reason = str(data.reason or "").strip()
+    if not target or not emp_id or not reason or not data.branches or len(data.branches) > 100:
+        raise HTTPException(status_code=400, detail="กรุณาเลือก 1–100 สาขาและระบุผู้บันทึก")
+    mapping = get_booking_waves_mapping(target, force_refresh=True)
+    family = mapping.get("booking_split_family") or {}
+    if family.get("role") != "child" or not family.get("parent_booking"):
+        raise HTTPException(status_code=409, detail="ไม่พบ Booking ต้นทางของรถคันนี้ กรุณาเปิด Booking อีกครั้ง")
+    source = str(family["parent_booking"]).strip().upper()
+    source_key = re.sub(r"\s+", "", source)
+    previews = []
+    seen = set()
+    for item in data.branches:
+        wave_text = str(item.wave_no or "").strip()
+        branch = str(item.branch_code or "").strip().upper()
+        if not wave_text.isdigit() or not branch or branch in INVALID_BRANCH_STRINGS:
+            raise HTTPException(status_code=400, detail="เลข Wave หรือรหัสสาขาไม่ถูกต้อง")
+        wave = str(int(wave_text))
+        pair = (wave, branch)
+        if pair in seen:
+            raise HTTPException(status_code=400, detail=f"สาขา {branch} ซ้ำใน Wave {wave}")
+        seen.add(pair)
+        requested = {field: int(getattr(item, field) or 0) for field in ACTUAL_FIELDS}
+        if any(value < 0 for value in requested.values()) or sum(requested[field] for field in REPORT_BOX_FIELDS) <= 0:
+            raise HTTPException(status_code=400, detail=f"กรุณาระบุยอดกล่องของ {branch} ใน Wave {wave}")
+        preview = preview_booking_branch(wave, branch, target_booking=target)
+        if normalize_booking_key(preview.get("current_booking")) != normalize_booking_key(source):
+            raise HTTPException(status_code=409, detail=f"{branch} / Wave {wave} ไม่ได้อยู่ใน Booking ต้นทางนี้")
+        previews.append((wave, branch, requested, preview, item))
+    with booking_split_write_lock:
+        splits = get_booking_branch_splits(force_refresh=True)
+        legacy_pairs = {(wave, branch) for (wave, branch, _), row in splits.items()
+                        if _uat_event_is_active(row.get("Is_Active", True))}
+        for wave, branch, _, _, _ in previews:
+            if (wave, branch) in legacy_pairs:
+                raise HTTPException(status_code=409, detail=f"{branch} / Wave {wave} มียอดแบ่งแบบเดิม กรุณาใช้การจัดทีละสาขาสำหรับรายการนี้")
+        with booking_actual_write_lock:
+            latest = get_booking_branch_actuals(force_refresh=True)
+            assignments = get_booking_branch_assignments(force_refresh=True)
+            by_pair = {}
+            for (wave, branch, booking), row in latest.items():
+                if (wave, branch) in seen:
+                    by_pair.setdefault((wave, branch), {})[booking] = row
+            summaries = []
+            for wave, branch, requested, preview, item in previews:
+                assigned = str((assignments.get((wave, branch)) or {}).get("Assigned_Booking") or "").strip().upper()
+                if assigned and normalize_booking_key(assigned) != normalize_booking_key(source):
+                    raise HTTPException(status_code=409, detail=f"{branch} / Wave {wave} ถูกย้ายไป Booking อื่น กรุณาค้นหาใหม่")
+                records = by_pair.get((wave, branch), {})
+                if any(re.sub(r"\s+", "", str(row.get("Source_Booking") or "").upper()) not in ("", source_key)
+                       for row in records.values()):
+                    raise HTTPException(status_code=409, detail=f"{branch} / Wave {wave} มียอดจาก Booking ต้นทางอื่น")
+                source_record = records.get(source_key)
+                target_record = records.get(target)
+                if item.expected_target_exists is not None and bool(target_record) != item.expected_target_exists:
+                    raise HTTPException(status_code=409, detail=f"{branch} / Wave {wave} มียอดเปลี่ยนจากอีกเครื่อง กรุณาเลือกสาขาใหม่")
+                if item.expected_target is not None and any(
+                    _history_int((target_record or {}).get(ACTUAL_VALUE_COLUMNS[field])) != int(item.expected_target.get(field, 0))
+                    for field in ACTUAL_FIELDS
+                ):
+                    raise HTTPException(status_code=409, detail=f"{branch} / Wave {wave} มียอดเปลี่ยนจากอีกเครื่อง กรุณาเลือกสาขาใหม่")
+                baseline = next(iter(records.values()), None)
+                remaining = {}
+                for field in ACTUAL_FIELDS:
+                    previous_target = _history_int((target_record or {}).get(ACTUAL_VALUE_COLUMNS[field]))
+                    if source_record:
+                        available = _history_int(source_record.get(ACTUAL_VALUE_COLUMNS[field])) + previous_target
+                    else:
+                        base = _history_int(baseline.get(ACTUAL_BASELINE_COLUMNS[field])) if baseline else _history_int((preview.get("totals") or {}).get(field))
+                        others = sum(_history_int(row.get(ACTUAL_VALUE_COLUMNS[field])) for key, row in records.items()
+                                     if key not in (source_key, target))
+                        available = max(0, base - others)
+                    if item.expected_available is not None and available != int(item.expected_available.get(field, 0)):
+                        raise HTTPException(status_code=409, detail=f"{branch} / Wave {wave} มียอดคงเหลือเปลี่ยน กรุณาค้นหาและเลือกสาขาใหม่")
+                    if requested[field] > available and not data.allow_overage:
+                        raise HTTPException(status_code=409, detail=f"{branch} / Wave {wave}: ยอด {field} เกินยอดคงเหลือ กรุณารีเฟรชและตรวจสอบ")
+                    remaining[field] = max(0, available - requested[field])
+                common = {"wave": wave, "branch": branch, "branch_name": preview.get("branch_name") or branch,
+                          "bu": preview.get("bu"), "label_count": preview.get("label_count", 0)}
+                source_hidden = str((source_record or {}).get("Is_Hidden") or "").strip().lower() in ("1", "true", "yes")
+                summaries.extend([
+                    {**common, "booking": source, **remaining, "is_hidden": source_hidden and not any(remaining.values())},
+                    {**common, "booking": target, **requested, "is_hidden": False},
+                ])
+            pairs = persist_booking_branch_actuals(summaries, emp_id, reason, allow_overage=True)
+    background_tasks.add_task(sync_booking_actual_pairs, pairs)
+    return {"status": "success", "target_booking": target, "source_booking": source,
+            "updated": len(previews), "report_sync": "queued"}
+
 
 @app.post("/api/split-booking-branch")
 def split_booking_branch(data: BookingBranchSplitData, background_tasks: BackgroundTasks):
