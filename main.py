@@ -53,7 +53,7 @@ if not os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
 # Google Sheets is the only data source. Credentials are loaded lazily by
 # get_sheets_session(), so a cold start never waits on an auth round-trip.
 APP_ENV = os.environ.get("APP_ENV", "uat").strip().lower()
-APP_VERSION = os.environ.get("APP_VERSION", "1.9.36-free").strip()
+APP_VERSION = os.environ.get("APP_VERSION", "1.9.37-free").strip()
 EMPLOYEE_LOOKUP_URL = "https://script.google.com/macros/s/AKfycbybmW6N7TxfsHqEa-Fx6ayy8M8xfjKGmTYO27izmbEoLJmQRrFD3i9c0XogP0fG6tlG/exec"
 
 # รายชื่อพนักงานสำหรับช่อง "เจ้าหน้าที่" บนใบคุมส่งสินค้า
@@ -1532,7 +1532,7 @@ def write_uat_report_test_summaries(
             # Read existing Booking+Wave+Branch keys. Never normalize every
             # displayed date on each upsert; that rebuilt a 20k-row payload.
             existing = _sheet_values(session, UAT_REPORT_TEST_SPREADSHEET_ID,
-                                     f"'{UAT_REPORT_TEST_SHEET_NAME}'!A:T")
+                                     f"'{UAT_REPORT_TEST_SHEET_NAME}'!A:K")
             existing_map = {}
             existing_dates = {}
             last_data_row = 1
@@ -4733,7 +4733,10 @@ def sync_booking_actual_pairs(pairs: list):
             report_summaries.append(candidate)
     if report_summaries:
         sync_uat_delivery_report_summaries(report_summaries)
-    request_uat_report_reconcile(force=True)
+    # The exact affected report rows were synchronized above. Avoid launching
+    # an additional full-sheet repair after every allocation; the periodic
+    # reconciler still repairs missed rows after restarts or transient failures.
+    request_uat_report_reconcile()
 
 
 def _build_booking_split_report_summaries(wave: str, branch: str, source: str, target: str,
@@ -6769,9 +6772,18 @@ def split_booking_branches(data: BookingBranchSplitBatchData, background_tasks: 
                     {**common, "booking": target, **requested, "is_hidden": False},
                 ])
             pairs = persist_booking_branch_actuals(summaries, emp_id, reason, allow_overage=True)
+    # The ledger is already durable. Return a view built from it before report
+    # synchronization starts, so the browser can show the saved branches
+    # without an immediately competing reload. A read failure is not a failed
+    # save: the client can recover by reading the Booking again.
+    target_view = None
+    try:
+        target_view = get_booking_data_internal(target, force_refresh=False)
+    except Exception as exc:
+        print(f"⚠️ Batch allocation saved; target view pending: {str(exc)[:180]}")
     background_tasks.add_task(sync_booking_actual_pairs, pairs)
     return {"status": "success", "target_booking": target, "source_booking": source,
-            "updated": len(previews), "report_sync": "queued"}
+            "updated": len(previews), "report_sync": "queued", "target_view": target_view}
 
 
 @app.post("/api/split-booking-branch")
