@@ -53,7 +53,7 @@ if not os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
 # Google Sheets is the only data source. Credentials are loaded lazily by
 # get_sheets_session(), so a cold start never waits on an auth round-trip.
 APP_ENV = os.environ.get("APP_ENV", "uat").strip().lower()
-APP_VERSION = os.environ.get("APP_VERSION", "1.9.37-free").strip()
+APP_VERSION = os.environ.get("APP_VERSION", "1.9.38-free").strip()
 EMPLOYEE_LOOKUP_URL = "https://script.google.com/macros/s/AKfycbybmW6N7TxfsHqEa-Fx6ayy8M8xfjKGmTYO27izmbEoLJmQRrFD3i9c0XogP0fG6tlG/exec"
 
 # รายชื่อพนักงานสำหรับช่อง "เจ้าหน้าที่" บนใบคุมส่งสินค้า
@@ -6390,19 +6390,24 @@ def get_wave_branch_options(wave_no: str, target_booking: str = ""):
         if target_family.get("role") == "child":
             columns = {"m": "M_Count", "red": "Red_Count", "blue": "Blue_Count",
                        "green": "Green_Count", "black": "Black_Count", "pallet": "Pallet_Count"}
-            prior = [split for (split_wave, split_branch, split_target), split in split_records.items()
+            prior = [(split_target, split) for (split_wave, split_branch, split_target), split in split_records.items()
                      if split_wave == wave_clean and split_branch == branch
                      and _uat_event_is_active(split.get("Is_Active", True))]
             row["legacy_split"] = bool(prior)
             row["source_booking"] = str(target_family.get("parent_booking") or native_booking).strip().upper()
+            source_key = re.sub(r"\s+", "", row["source_booking"].upper())
+            row["target_has_legacy_split"] = any(
+                re.sub(r"\s+", "", str(split_target or "").upper()) == target_clean
+                for split_target, _ in prior
+            )
             row["target_split_totals"] = {
-                field: sum(_history_int(split.get(column)) for split in prior
+                field: sum(_history_int(split.get(column)) for split_target, split in prior
                            if re.sub(r"\s+", "", str(split_target or "").upper()) == target_clean)
                 for field, column in columns.items()
             }
             row["remaining_totals"] = {
                 field: max(0, row["totals"][field] - sum(
-                    _history_int(split.get(column)) for split in prior
+                    _history_int(split.get(column)) for split_target, split in prior
                     if re.sub(r"\s+", "", str(split_target or "").upper()) != target_clean
                 ))
                 for field, column in columns.items()
@@ -6412,8 +6417,16 @@ def get_wave_branch_options(wave_no: str, target_booking: str = ""):
                 if actual_wave == wave_clean and actual_branch == branch
             }
             row["target_has_actual"] = target_clean in pair_actuals
+            row["allocated_to_other"] = any(
+                re.sub(r"\s+", "", str(split_target or "").upper()) not in ("", target_clean, source_key)
+                and any(_history_int(split.get(columns[field])) > 0 for field in REPORT_BOX_FIELDS)
+                for split_target, split in prior
+            ) or any(
+                actual_booking not in (source_key, target_clean)
+                and any(_history_int(actual.get(ACTUAL_VALUE_COLUMNS[field])) > 0 for field in REPORT_BOX_FIELDS)
+                for actual_booking, actual in pair_actuals.items()
+            )
             if pair_actuals and not prior:
-                source_key = re.sub(r"\s+", "", str(row["source_booking"]).upper())
                 source_record = pair_actuals.get(source_key)
                 target_record = pair_actuals.get(target_clean)
                 baseline_row = next(iter(pair_actuals.values()))
